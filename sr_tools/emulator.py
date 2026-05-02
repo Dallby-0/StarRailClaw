@@ -8,6 +8,8 @@ import cv2
 import numpy as np
 import requests
 
+from .adb import resolve_adb_path
+
 
 class EmulatorError(RuntimeError):
     pass
@@ -41,9 +43,9 @@ def _decode_screencap_raw(data: bytes) -> np.ndarray:
 class EmulatorClient:
     """ADB-based emulator interaction with stable screenshot decode fallbacks."""
 
-    def __init__(self, serial: str, adb_path: str = "adb", timeout_s: int = 10) -> None:
+    def __init__(self, serial: str, adb_path: str | None = None, timeout_s: int = 10) -> None:
         self.serial = serial
-        self.adb_path = adb_path
+        self.adb_path = resolve_adb_path(adb_path)
         self.timeout_s = timeout_s
 
     def _run_adb(self, *args: str, binary: bool = True) -> bytes:
