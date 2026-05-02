@@ -21,7 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from sr_tools import EmulatorClient
-from sr_tools.adb import AdbNotFoundError, resolve_adb_path
+from sr_tools.adb import AdbDeviceNotFoundError, AdbNotFoundError, resolve_adb_path, resolve_target_serial
 from sr_tools.emulator import EmulatorError
 
 
@@ -396,7 +396,7 @@ def parse_args() -> argparse.Namespace:
     if not default_head.exists():
         default_head = models / "nanotrack_head.onnx"
     parser = argparse.ArgumentParser(description="NanoTrack GUI template based on emulator screenshots.")
-    parser.add_argument("--serial", required=True, help="ADB serial, e.g. 127.0.0.1:5555")
+    parser.add_argument("--serial", default=None, help="ADB serial, e.g. 127.0.0.1:5555 (optional)")
     parser.add_argument("--interval", type=float, default=0.1, help="Screenshot interval seconds.")
     parser.add_argument("--backbone", default=str(default_backbone))
     parser.add_argument("--neckhead", default=str(default_head))
@@ -416,10 +416,11 @@ def main() -> None:
         )
     try:
         adb_path = resolve_adb_path(args.adb_path)
-    except AdbNotFoundError as exc:
+        serial = resolve_target_serial(serial=args.serial, adb_path=adb_path, auto_connect=True)
+    except (AdbNotFoundError, AdbDeviceNotFoundError) as exc:
         raise SystemExit(str(exc)) from exc
     app = NanoTrackGui(
-        serial=args.serial,
+        serial=serial,
         backbone=args.backbone,
         neckhead=args.neckhead,
         interval_s=args.interval,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import re
 from dataclasses import dataclass
 from typing import Generator, Optional
 
@@ -60,6 +61,9 @@ class EmulatorClient:
             raise EmulatorError(f"ADB command failed: {' '.join(cmd)}\n{proc.stderr.decode('utf-8', 'ignore')}")
         return proc.stdout if binary else proc.stdout.decode("utf-8", "ignore").encode("utf-8")
 
+    def _run_adb_text(self, *args: str) -> str:
+        return self._run_adb(*args, binary=False).decode("utf-8", "ignore")
+
     def screenshot(self, prefer_png: bool = True) -> np.ndarray:
         if prefer_png:
             data = self._run_adb("shell", "screencap", "-p")
@@ -68,7 +72,19 @@ class EmulatorClient:
         return _decode_screencap_raw(data)
 
     def tap(self, x: int, y: int) -> None:
+        print(f"[adb][tap] serial={self.serial} final=({x},{y})")
         self._run_adb("shell", "input", "tap", str(x), str(y))
+
+    def screen_size(self) -> tuple[int, int] | None:
+        text = self._run_adb_text("shell", "wm", "size")
+        # Examples:
+        # Physical size: 1280x720
+        # Override size: 1280x720
+        matches = re.findall(r"(\d+)\s*x\s*(\d+)", text)
+        if not matches:
+            return None
+        w, h = matches[-1]
+        return int(w), int(h)
 
     def swipe(self, x1: int, y1: int, x2: int, y2: int, duration_ms: int = 120) -> None:
         self._run_adb(
