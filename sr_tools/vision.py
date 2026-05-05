@@ -310,3 +310,159 @@ def match_template_luma_multiscale(
     bottom_right = (top_left[0] + w, top_left[1] + h)
     similarity = float(np.clip(sim, 0.0, 1.0))
     return MatchResult(similarity=similarity, top_left=top_left, bottom_right=bottom_right)
+
+
+def _predict_point(record_pos: tuple[float, float], screen_resolution: tuple[int, int]) -> tuple[float, float]:
+    delta_x, delta_y = record_pos
+    screen_w, screen_h = screen_resolution
+    target_x = delta_x * screen_w + screen_w * 0.5
+    target_y = delta_y * screen_w + screen_h * 0.5
+    return target_x, target_y
+
+
+def _mstpl_pre_area_scope(
+    src_shape: tuple[int, int],
+    templ_shape: tuple[int, int],
+    record_pos: tuple[float, float],
+    resolution: tuple[int, int],
+    deviation: int = 150,
+) -> tuple[tuple[int, int, int, int], tuple[float, float]]:
+    src_h, src_w = src_shape
+    tpl_h, tpl_w = templ_shape
+    rec_w, rec_h = resolution
+    x, y = _predict_point(record_pos, (src_w, src_h))
+    predict_x_radius = max(int(tpl_w * src_w / rec_w), deviation)
+    predict_y_radius = max(int(tpl_h * src_h / rec_h), deviation)
+    area = (
+        max(int(round(x - predict_x_radius)), 0),
+        max(int(round(y - predict_y_radius)), 0),
+        min(int(round(x + predict_x_radius)), src_w),
+        min(int(round(y + predict_y_radius)), src_h),
+    )
+    new_resolution = (
+        rec_w * (area[3] - area[1]) / max(src_w, 1),
+        rec_h * (area[2] - area[0]) / max(src_h, 1),
+    )
+    return area, new_resolution
+
+
+def _mstpl_ratio_scope(
+    src_shape: tuple[int, int],
+    templ_shape: tuple[int, int],
+    resolution: tuple[float, float],
+    scale_step: float,
+) -> tuple[float, float]:
+    src_h, src_w = src_shape
+    tpl_h, tpl_w = templ_shape
+    rec_w, rec_h = resolution
+    rmin = min(src_h / rec_h, src_w / rec_w)
+    rmax = max(src_h / rec_h, src_w / rec_w)
+    ratio = max(tpl_h / src_h, tpl_w / src_w)
+    r_min = ratio * rmin
+    r_max = ratio * rmax
+    return max(r_min, scale_step), min(r_max, 0.99)
+
+
+def match_template_luma_mstpl(
+    image: np.ndarray,
+    template: np.ndarray,
+    threshold: float = 0.8,
+    rgb: bool = True,
+    record_pos: tuple[float, float] | None = None,
+    resolution: tuple[int, int] = (),
+    scale_max: int = 800,
+    scale_step: float = 0.005,
+) -> MatchResult:
+    """Airtest-like MSTPL (MultiScaleTemplateMatchingPre) matching."""
+    _ = scale_max  # Kept for API compatibility with Airtest mstpl.
+    if not resolution:
+        h, w = template.shape[:2]
+        return MatchResult(similarity=0.0, top_left=(0, 0), bottom_right=(w, h))
+
+    image_luma = _to_luma(image)
+    tpl_luma = _to_luma(template)
+    img_h, img_w = image_luma.shape[:2]
+    tpl_h, tpl_w = tpl_luma.shape[:2]
+    rec_w, rec_h = int(resolution[0]), int(resolution[1])
+
+    if rec_w < tpl_w or rec_h < tpl_h:
+        return MatchResult(similarity=0.0, top_left=(0, 0), bottom_right=(tpl_w, tpl_h))
+
+    work_luma = image_luma
+    offset_x, offset_y = 0, 0
+    work_resolution: tuple[float, float] = (float(rec_w), float(rec_h))
+    if record_pos is not None:
+        area, work_resolution = _mstpl_pre_area_scope(
+            src_shape=(img_h, img_w),
+            templ_shape=(tpl_h, tpl_w),
+            record_pos=record_pos,
+            resolution=(rec_w, rec_h),
+            deviation=150,
+        )
+        x1, y1, x2, y2 = area
+        if x2 - x1 < tpl_w or y2 - y1 < tpl_h:
+            return MatchResult(similarity=0.0, top_left=(0, 0), bottom_right=(tpl_w, tpl_h))
+        work_luma = work_luma[y1:y2, x1:x2]
+        offset_x, offset_y = x1, y1
+
+    if work_luma.shape[0] < tpl_h or work_luma.shape[1] < tpl_w:
+        return MatchResult(similarity=0.0, top_left=(0, 0), bottom_right=(tpl_w, tpl_h))
+
+    r_min, r_max = _mstpl_ratio_scope(
+        src_shape=work_luma.shape[:2],
+        templ_shape=tpl_luma.shape[:2],
+        resolution=work_resolution,
+        scale_step=float(scale_step),
+    )
+    if r_min <= 0 or r_max <= 0 or r_min > r_max:
+        return MatchResult(similarity=0.0, top_left=(0, 0), bottom_right=(tpl_w, tpl_h))
+
+    # Airtest mstpl: ratio loop with early return by timeout and threshold.
+    best = None
+    r = float(r_min)
+    t0 = cv2.getTickCount()
+    tick_freq = cv2.getTickFrequency()
+    while r <= r_max + 1e-12:
+        if tpl_h / work_luma.shape[0] >= tpl_w / work_luma.shape[1]:
+            tr = (work_luma.shape[0] * r) / tpl_h
+        else:
+            tr = (work_luma.shape[1] * r) / tpl_w
+        sw = max(int(tpl_w * tr), 1)
+        sh = max(int(tpl_h * tr), 1)
+        if sw > work_luma.shape[1] or sh > work_luma.shape[0] or min(sw, sh) <= 10:
+            r += scale_step
+            continue
+        scaled_tpl = cv2.resize(tpl_luma, (sw, sh), interpolation=cv2.INTER_AREA if tr < 1.0 else cv2.INTER_LINEAR)
+        src = work_luma.copy()
+        src[0, 0] = scaled_tpl[0, 0] = 0
+        src[0, 1] = scaled_tpl[0, 1] = 255
+        result = cv2.matchTemplate(src, scaled_tpl, cv2.TM_CCOEFF_NORMED)
+        _, sim, _, pt = cv2.minMaxLoc(result)
+        sim = float(sim)
+        if best is None or sim > best[0]:
+            best = (sim, pt, sw, sh)
+        elapsed = (cv2.getTickCount() - t0) / tick_freq
+        if elapsed > 1.0 and sim >= threshold:
+            break
+        r += scale_step
+
+    if best is None:
+        return MatchResult(similarity=0.0, top_left=(0, 0), bottom_right=(tpl_w, tpl_h))
+
+    sim, pt, sw, sh = best
+    top_left = (int(pt[0]) + offset_x, int(pt[1]) + offset_y)
+    bottom_right = (top_left[0] + int(sw), top_left[1] + int(sh))
+
+    # Airtest compatibility: optional rgb confidence validation on resized ROI.
+    if rgb:
+        x1, y1 = top_left
+        x2, y2 = bottom_right
+        roi = image[y1:y2, x1:x2]
+        if roi.size > 0:
+            tpl_for_color = cv2.resize(template, (roi.shape[1], roi.shape[0]), interpolation=cv2.INTER_AREA)
+            color_raw = compare_histogram(roi, tpl_for_color)
+            sim = float(np.clip((color_raw + 1.0) * 0.5, 0.0, 1.0))
+        else:
+            sim = 0.0
+    sim = float(np.clip(sim, 0.0, 1.0))
+    return MatchResult(similarity=sim, top_left=top_left, bottom_right=bottom_right)

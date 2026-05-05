@@ -24,6 +24,7 @@ from sr_tools.vision import (
     MatchResult,
     match_akaze_features,
     match_surf_features,
+    match_template_luma_mstpl,
     match_template_luma_color_fused,
     match_template_luma_multiscale,
 )
@@ -33,6 +34,8 @@ from sr_tools.vision import (
 class TemplateItem:
     name: str
     image: np.ndarray
+    record_pos: tuple[float, float]
+    resolution: tuple[int, int]
 
 
 class MatchTestGui:
@@ -73,6 +76,10 @@ class MatchTestGui:
         self.ms_min_scale_var = tk.StringVar(value="0.85")
         self.ms_max_scale_var = tk.StringVar(value="1.15")
         self.ms_num_scales_var = tk.StringVar(value="11")
+        self.mstpl_threshold_var = tk.StringVar(value="0.7")
+        self.mstpl_scale_step_var = tk.StringVar(value="0.005")
+        self.mstpl_scale_max_var = tk.StringVar(value="800")
+        self.mstpl_resolution_var = tk.StringVar(value="1280x720")
         tk.Label(side, textvariable=self.status_var, anchor="w", justify=tk.LEFT, wraplength=300).pack(fill=tk.X, pady=(0, 8))
 
         tk.Button(side, text="刷新截图", command=self.refresh_screenshot).pack(fill=tk.X, pady=2)
@@ -80,6 +87,7 @@ class MatchTestGui:
         tk.Button(side, text="删除选中模板", command=self.delete_selected_template).pack(fill=tk.X, pady=2)
         tk.Button(side, text="识别", command=self.run_match).pack(fill=tk.X, pady=2)
         tk.Button(side, text="多尺度识别", command=self.run_match_multiscale).pack(fill=tk.X, pady=2)
+        tk.Button(side, text="Airtest MSTPL识别", command=self.run_match_mstpl).pack(fill=tk.X, pady=2)
         tk.Button(side, text="AKAZE识别", command=self.run_match_akaze).pack(fill=tk.X, pady=2)
         tk.Button(side, text="SURF识别", command=self.run_match_surf).pack(fill=tk.X, pady=2)
         tk.Button(side, text="复位(清匹配框)", command=self.reset_overlays).pack(fill=tk.X, pady=(2, 8))
@@ -97,6 +105,18 @@ class MatchTestGui:
         tk.Label(side, text="模板列表").pack(anchor="w")
         self.template_list = tk.Listbox(side, height=20)
         self.template_list.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
+
+        tk.Label(side, text="MSTPL参数").pack(anchor="w", pady=(6, 0))
+        ms_pre_grid = tk.Frame(side)
+        ms_pre_grid.pack(fill=tk.X, pady=(2, 8))
+        tk.Label(ms_pre_grid, text="threshold").grid(row=0, column=0, sticky="w")
+        tk.Entry(ms_pre_grid, textvariable=self.mstpl_threshold_var, width=10).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        tk.Label(ms_pre_grid, text="scale_step").grid(row=1, column=0, sticky="w")
+        tk.Entry(ms_pre_grid, textvariable=self.mstpl_scale_step_var, width=10).grid(row=1, column=1, sticky="w", padx=(8, 0))
+        tk.Label(ms_pre_grid, text="scale_max").grid(row=2, column=0, sticky="w")
+        tk.Entry(ms_pre_grid, textvariable=self.mstpl_scale_max_var, width=10).grid(row=2, column=1, sticky="w", padx=(8, 0))
+        tk.Label(ms_pre_grid, text="resolution").grid(row=3, column=0, sticky="w")
+        tk.Entry(ms_pre_grid, textvariable=self.mstpl_resolution_var, width=10).grid(row=3, column=1, sticky="w", padx=(8, 0))
 
     def _fit_size(self, src_w: int, src_h: int, dst_w: int, dst_h: int) -> tuple[int, int, float]:
         scale = min(dst_w / max(1, src_w), dst_h / max(1, src_h))
@@ -176,11 +196,22 @@ class MatchTestGui:
             return
         x, y, w, h = self.selection
         crop = self.current_frame[y : y + h, x : x + w].copy()
+        fh, fw = self.current_frame.shape[:2]
+        cx = x + w / 2.0
+        cy = y + h / 2.0
+        record_pos = ((cx - fw * 0.5) / fw, (cy - fh * 0.5) / fw)
         idx = len(self.templates) + 1
         name = f"tpl_{idx:03d}_{w}x{h}"
-        self.templates.append(TemplateItem(name=name, image=crop))
+        self.templates.append(
+            TemplateItem(
+                name=name,
+                image=crop,
+                record_pos=(float(round(record_pos[0], 6)), float(round(record_pos[1], 6))),
+                resolution=(int(fw), int(fh)),
+            )
+        )
         self.template_list.insert(tk.END, name)
-        self.status_var.set(f"模板已加入: {name}")
+        self.status_var.set(f"模板已加入: {name} record_pos={self.templates[-1].record_pos} resolution={fw}x{fh}")
 
     def delete_selected_template(self) -> None:
         sel = self.template_list.curselection()
@@ -274,6 +305,54 @@ class MatchTestGui:
         self.status_var.set(
             f"多尺度识别完成: 共 {len(self.match_overlays)} 个模板 "
             f"(min={min_scale:g}, max={max_scale:g}, n={num_scales})"
+        )
+        self._refresh_canvas()
+
+    def run_match_mstpl(self) -> None:
+        if not self.templates:
+            messagebox.showwarning("Airtest MSTPL识别", "模板列表为空")
+            return
+        try:
+            threshold = float(self.mstpl_threshold_var.get().strip())
+            scale_step = float(self.mstpl_scale_step_var.get().strip())
+            scale_max = int(self.mstpl_scale_max_var.get().strip())
+            rw, rh = self.mstpl_resolution_var.get().strip().lower().split("x")
+            resolution = (int(rw), int(rh))
+        except ValueError:
+            messagebox.showwarning("Airtest MSTPL识别", "参数格式错误，请检查 threshold/scale_step/scale_max/resolution")
+            return
+        if scale_step <= 0:
+            messagebox.showwarning("Airtest MSTPL识别", "scale_step 必须 > 0")
+            return
+        if resolution[0] <= 0 or resolution[1] <= 0:
+            messagebox.showwarning("Airtest MSTPL识别", "resolution 必须为正整数，如 1280x720")
+            return
+
+        try:
+            frame = self.client.screenshot(prefer_png=True)
+        except (EmulatorError, FileNotFoundError) as exc:
+            messagebox.showerror("Airtest MSTPL识别失败", str(exc))
+            return
+        self.current_frame = frame
+        self.selection = None
+        self.match_overlays.clear()
+
+        for tpl in self.templates:
+            result = match_template_luma_mstpl(
+                frame,
+                tpl.image,
+                threshold=threshold,
+                rgb=True,
+                record_pos=tpl.record_pos,
+                resolution=resolution,
+                scale_max=scale_max,
+                scale_step=scale_step,
+            )
+            self.match_overlays.append((result, tpl.name))
+
+        self.status_var.set(
+            f"Airtest MSTPL识别完成: 共 {len(self.match_overlays)} 个模板 "
+            f"(threshold={threshold:g}, step={scale_step:g}, max={scale_max}, resolution={resolution[0]}x{resolution[1]})"
         )
         self._refresh_canvas()
 
