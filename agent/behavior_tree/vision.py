@@ -76,6 +76,44 @@ class VisionEngine:
                 f"[vision][ocr] error type={type(exc).__name__} message={exc} logical_rect={rect} real_rect={real_rect}"
             )
             return []
+        if not entries:
+            # Fallback 1: single-line OCR in normal mode.
+            fallback_text = ""
+            try:
+                fallback_text = sr_ocr.ocr_text(frame_rgb, real_rect, lang="zhs").strip()
+            except Exception as exc:  # noqa: BLE001
+                self.log_fn(
+                    f"[vision][ocr] fallback=single_line error type={type(exc).__name__} message={exc} real_rect={real_rect}"
+                )
+            if fallback_text:
+                self.log_fn(f"[vision][ocr] fallback=single_line hit text={fallback_text!r}")
+                entries = [
+                    {
+                        "text": fallback_text,
+                        "conf": 1.0,
+                        "bbox": (0, 0, max(1, real_rect[2] - real_rect[0]), max(1, real_rect[3] - real_rect[1])),
+                        "center": ((real_rect[2] - real_rect[0]) // 2, (real_rect[3] - real_rect[1]) // 2),
+                    }
+                ]
+            else:
+                # Fallback 2: white-text single-line OCR.
+                try:
+                    fallback_white_text = sr_ocr.ocr_text_white(frame_rgb, real_rect, lang="zhs").strip()
+                except Exception as exc:  # noqa: BLE001
+                    self.log_fn(
+                        f"[vision][ocr] fallback=white_single_line error type={type(exc).__name__} message={exc} real_rect={real_rect}"
+                    )
+                    fallback_white_text = ""
+                if fallback_white_text:
+                    self.log_fn(f"[vision][ocr] fallback=white_single_line hit text={fallback_white_text!r}")
+                    entries = [
+                        {
+                            "text": fallback_white_text,
+                            "conf": 1.0,
+                            "bbox": (0, 0, max(1, real_rect[2] - real_rect[0]), max(1, real_rect[3] - real_rect[1])),
+                            "center": ((real_rect[2] - real_rect[0]) // 2, (real_rect[3] - real_rect[1]) // 2),
+                        }
+                    ]
         out: list[dict[str, Any]] = []
         ox, oy, _, _ = real_rect
         for e in entries:
