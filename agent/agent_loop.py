@@ -11,24 +11,106 @@ from pathlib import Path
 import cv2
 import requests
 
+from agent.behavior_tree.coord_mapper import CoordinateMapper
+from agent.behavior_tree.engine import BehaviorTreeEngine, NodeStatus, TickContext
+from agent.behavior_tree.growth import GrowthManager
+from agent.behavior_tree.storage import ensure_main_tree
 from agent.llm_client import DoubaoClient
-from agent.tooling.tools import ToolExecutor, build_tool_schemas
 from sr_tools.adb import resolve_target_serial
 from sr_tools.emulator import EmulatorClient
 
 DEFAULT_SYSTEM_PROMPT = (
-    "# 目标"
-    "你是一个安卓agent，拥有在安卓模拟器上模拟点击的能力，正在尝试通关模拟宇宙-差分宇宙"
-    "# 核心规则\n"
-    "每轮你会收到一张游戏截图，你需要分析当前游戏状态，决定是否需要点击屏幕来推进游戏。\n\n"
-    "# 坐标与点击规则\n"
-    "1. 坐标原点固定为截图左上角，x轴向右为正，y轴向下为正，最大坐标以归一化后的(999, 999)为准\n"
-    "2. 点击坐标必须是目标元素（如按钮、图标）的中心像素点，禁止以图标左上角、文字位置或阴影位置作为点击点。\n"
-    "3. 当需要点击时，必须调用 tap 工具，给出精确的 tap(x=?, y=?) 指令\n"
-    "4. 不论是否需要点击，给出最简短的理由。\n\n"
+    "# 目标\n"
+    "你是一个安卓agent，拥有在安卓模拟器上模拟点击的能力，正在尝试通关模拟宇宙-差分宇宙。\n"
+    "你当前只在行为树兜底阶段工作：当已有脚本无法覆盖当前画面时，给出可复用的场景定义和动作序列。\n"
 )
 
+LLM_GROWTH_PROMPT = """你是一个视觉驱动游戏自动化脚本架构师。
+
+## 任务背景（可替换）
+{你正在控制一个游戏角色，目标是在当前游戏模式下自动推进流程，尽可能高效地完成关卡。}
+
+你将收到一张来自当前游戏的实时画面截图。请基于画面内容判断当前所处的场景，并给出最优的操作序列。
+
+## 核心约束
+- 输出严格 JSON 对象，仅包含两个字段：condition 和 actions。
+- condition 必须是完整的 Condition 节点，用于识别当前场景。
+- actions 必须是完整的 Action、Sequence 或 Selector 节点，用于执行操作。
+- 所有参数必须放入 params 字段，禁止简写或挂在节点外层。
+- 不要使用 markdown 代码块，不要输出任何额外文字。
+
+## 节点类型（仅限以下）
+组合节点：Sequence、Selector、Repeat
+条件节点：Condition
+动作节点：Action
+引用节点：SubTree
+
+## Condition 设计原则（关键）
+- **condition 的唯一目标：精准确认当前是哪一个页面/场景。**
+- 必须选择该页面**独有的、标志性的视觉元素**进行 template_match。
+- 优先匹配固定图标、独特背景、专属边框等不会与其他页面混淆的元素。
+- 不要选择通用按钮（如“确认”、“返回”）或变化频繁的文字作为主条件——它们容易在不同页面重复出现。
+- 若单一模板不足以区分当前页面，使用 AND 组合多个特征。
+- 配合 stable 条件，确保画面已完全渲染、无转场动画。
+
+## Condition check 允许的函数
+- template_match：在 rect 区域内匹配模板图片
+- stable：画面稳定检测（帧间差异小于阈值）
+- AND / OR / NOT：逻辑组合
+  · AND 和 OR 的参数为 conditions（Condition 对象数组）
+  · NOT 的参数为 condition（单个 Condition 对象）
+
+## Action do 允许的函数
+- click_template：找到模板并点击其中心
+- click_pos：点击指定坐标
+- wait：等待固定毫秒数
+- wait_stable：等待画面稳定（须指定 timeout）
+- wait_for_template：循环等待模板出现（须指定 timeout）
+- wait_for_template_disappear：循环等待模板消失（须指定 timeout）
+
+## 坐标与区域
+- 统一使用 1000x1000 逻辑坐标空间，左上角为 (0,0)，右下角为 (1000,1000)。
+- rect 格式为 [x1, y1, x2, y2]（左上角横坐标、左上角纵坐标、右下角横坐标、右下角纵坐标）。
+- 必须基于画面中 UI 元素的实际位置精确估算 rect，不允许猜测。
+
+## 画面稳定性处理
+- 游戏画面可能处于转场动画、加载中或动态特效等不稳定状态。
+- 在 condition 中，应结合 stable 条件确认画面已稳定。
+- 在 actions 中，点击前使用 wait_stable 等待稳定，点击后使用 wait_for_template_disappear 并设置 timeout 等待操作生效。
+
+## 典型操作流程模式
+推荐顺序：
+1. wait_stable（等待界面稳定）
+2. click_template（点击目标元素）
+3. wait_for_template_disappear（等待该元素消失，确认流程推进）
+
+## 容错与回退
+- 等待类动作必须设置 timeout，超时后应有备选方案。
+- 使用 Selector 节点实现 fallback：优先尝试精确模板点击，若失败则回退到 click_pos 点击固定区域，或进行短暂 wait 后重试。
+
+## 注释要求
+- 每个节点可包含可选的 comment 字段（字符串）。
+- 强烈建议为关键节点添加简短的中文注释，说明节点用途。
+
+## 节点格式参考
+
+Condition 示例：
+{"type":"Condition","comment":"确认战斗界面标志图标存在且画面稳定","check":"AND","params":{"conditions":[{"type":"Condition","check":"template_match","params":{"template":"combat_indicator","rect":[20,20,80,60],"threshold":0.8}},{"type":"Condition","check":"stable","params":{"rect":[0,0,1000,1000],"diff_threshold":0.01}}]}}
+
+Action 示例：
+{"type":"Action","comment":"点击自动战斗按钮","do":"click_template","params":{"template":"btn_auto","rect":[850,620,980,700],"threshold":0.8}}
+
+Selector 示例（带 fallback）：
+{"type":"Selector","comment":"优先点击模板，若失败则点击固定坐标","children":[{"type":"Action","do":"click_template","params":{"template":"btn_main","rect":[400,600,600,680],"threshold":0.8}},{"type":"Action","do":"click_pos","params":{"pos":[500,640]}}]}
+
+## 最终输出格式
+{"condition":{ /* Condition 节点 */ },"actions":{ /* Action / Sequence / Selector 节点 */ }}"""
+
 ANSWER_IMAGE_DIR = Path("debug") / "answers"
+TREE_DIR = Path("BehaviorTree")
+TREE_PATH = TREE_DIR / "main.json"
+TEMPLATE_DIR = TREE_DIR / "templates"
+ENABLE_REFLECT = False
 
 
 def _save_answer_image_data_url(data_url: str, out_dir: Path) -> str | None:
@@ -114,34 +196,6 @@ def _extract_and_save_llm_image(assistant_msg: dict, out_dir: Path) -> str | Non
     return None
 
 
-def _save_local_annotated_frame(frame_rgb, out_dir: Path, taps: list[tuple[int, int]]) -> str:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / "local_annotated.png"
-    image_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-    for i, (x, y) in enumerate(taps, start=1):
-        cv2.circle(image_bgr, (int(x), int(y)), 10, (0, 255, 0), 2)
-        cv2.drawMarker(
-            image_bgr,
-            (int(x), int(y)),
-            (0, 255, 255),
-            markerType=cv2.MARKER_CROSS,
-            markerSize=18,
-            thickness=2,
-        )
-        cv2.putText(
-            image_bgr,
-            f"tap{i}({int(x)},{int(y)})",
-            (int(x) + 12, int(y) - 12),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 255, 0),
-            1,
-            cv2.LINE_AA,
-        )
-    cv2.imwrite(str(out), image_bgr)
-    return str(out)
-
-
 def _build_user_message_from_frame(image_rgb) -> dict:
     data_url = DoubaoClient.encode_image_to_data_url(image_rgb)
     return {
@@ -153,25 +207,19 @@ def _build_user_message_from_frame(image_rgb) -> dict:
     }
 
 
-def _truncate_data_urls(obj, max_len: int = 120):
-    if isinstance(obj, dict):
-        out = {}
-        for k, v in obj.items():
-            out[k] = _truncate_data_urls(v, max_len=max_len)
-        return out
-    if isinstance(obj, list):
-        return [_truncate_data_urls(v, max_len=max_len) for v in obj]
-    if isinstance(obj, str) and obj.startswith("data:image/") and len(obj) > max_len:
-        return obj[:max_len] + "...<truncated>"
-    return obj
+def _normalize_assistant_text(content) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") in {"text", "output_text"}]
+        return "".join(parts).strip()
+    return ""
 
 
-def _print_json_block(title: str, payload) -> None:
-    try:
-        safe = _truncate_data_urls(payload)
-        print(f"{title}\n{json.dumps(safe, ensure_ascii=False, indent=2)}")
-    except Exception as exc:
-        print(f"{title}\n<failed to print json: {exc}>")
+def _truncate_text(text: str, max_len: int = 1200) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[:max_len] + "...<truncated>"
 
 
 def run_agent_loop(
@@ -180,13 +228,81 @@ def run_agent_loop(
     session_id: str,
     serial: str | None = None,
     adb_path: str | None = None,
-    interval_s: int = 5,
+    interval_s: float = 1.0,
 ) -> None:
+    ensure_main_tree(TREE_PATH)
     target_serial = resolve_target_serial(serial=serial, adb_path=adb_path, auto_connect=True)
     emulator = EmulatorClient(serial=target_serial, adb_path=adb_path)
     llm = DoubaoClient()
-    tools = build_tool_schemas()
-    executor = ToolExecutor(emulator)
+    mapper = CoordinateMapper(logical_w=1000, logical_h=1000, real_w=1280, real_h=720)
+    growth = GrowthManager(tree_path=TREE_PATH, template_dir=TEMPLATE_DIR)
+
+    runtime_state: dict[str, object] = {}
+    prev_frame = None
+    latest_round_dir: Path | None = None
+
+    def llm_decide_cb(ctx: TickContext) -> NodeStatus:
+        nonlocal latest_round_dir
+        user_message = _build_user_message_from_frame(ctx.frame_rgb)
+        try:
+            resp = llm.chat_with_session(
+                session_id=f"{session_id}-growth",
+                system_prompt=LLM_GROWTH_PROMPT,
+                user_message=user_message,
+                tools=[],
+                tool_choice="none",
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[llm_decide] call failed: {exc}")
+            return NodeStatus.FAILURE
+
+        assistant_msg = resp["choices"][0]["message"]
+        payload_text = _normalize_assistant_text(assistant_msg.get("content"))
+        print(f"[llm_decide] raw_output={_truncate_text(payload_text)}")
+        if latest_round_dir is not None:
+            saved = _extract_and_save_llm_image(assistant_msg, latest_round_dir)
+            if saved:
+                print(f"[llm_decide] annotated saved: {saved}")
+
+        parsed = growth.parse_llm_growth_payload(payload_text)
+        if parsed is None:
+            print("[llm_decide] invalid JSON payload")
+            return NodeStatus.FAILURE
+
+        condition, actions = parsed
+        print(f"[llm_decide] parsed_condition={json.dumps(condition, ensure_ascii=False)}")
+        print(f"[llm_decide] parsed_actions={json.dumps(actions, ensure_ascii=False)}")
+        condition = growth.extract_and_replace_templates(ctx.frame_rgb, condition, engine.vision)
+        print(f"[llm_decide] condition_after_template_extract={json.dumps(condition, ensure_ascii=False)}")
+
+        candidate = {"type": "Sequence", "children": [condition, actions]}
+        dry_ctx = TickContext(
+            frame_rgb=ctx.frame_rgb,
+            prev_frame_rgb=ctx.prev_frame_rgb,
+            now_monotonic=ctx.now_monotonic,
+            state={},
+        )
+        dry_status = engine.tick(candidate, dry_ctx, node_path="dryrun")
+        print(f"[llm_decide] dry_run_status={dry_status.value}")
+        if dry_status == NodeStatus.FAILURE:
+            print("[llm_decide] dry-run failed, skip solidify")
+            return NodeStatus.FAILURE
+
+        tree = growth.load_tree()
+        inserted = growth.insert_experience(tree, condition, actions)
+        if inserted:
+            growth.save_tree(tree)
+            print("[llm_decide] experience solidified into main.json")
+        else:
+            print("[llm_decide] duplicate experience, skipped")
+        return NodeStatus.SUCCESS
+
+    engine = BehaviorTreeEngine(
+        emulator=emulator,
+        tree_dir=TREE_DIR,
+        mapper=mapper,
+        llm_decide_cb=llm_decide_cb,
+    )
 
     if llm.reasoning is None and (llm.reasoning_effort is None or str(llm.reasoning_effort).strip() == ""):
         print("[agent] reasoning=OFF (no reasoning payload)")
@@ -194,119 +310,47 @@ def run_agent_loop(
         print(f"[agent] reasoning=ON reasoning={llm.reasoning} reasoning_effort={llm.reasoning_effort}")
     print(f"[agent] started, serial={target_serial}, session_id={session_id}")
     ANSWER_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"[agent] answer image dir: {ANSWER_IMAGE_DIR.resolve()}")
 
     round_idx = 1
     while True:
         round_ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         round_dir = ANSWER_IMAGE_DIR / f"round{round_idx}_{round_ts}"
         round_dir.mkdir(parents=True, exist_ok=True)
+        latest_round_dir = round_dir
+
         frame = emulator.screenshot(prefer_png=True)
         fh, fw = frame.shape[:2]
-        print(f"[round {round_idx}] screenshot captured ({fw}x{fh})")
-        print(f"[round {round_idx}] original_image_size={fw}x{fh}")
         if (fw, fh) != (1280, 720):
-            print(f"[round {round_idx}] resize screenshot to 1280x720")
-        frame_for_llm = cv2.resize(frame, (1280, 720), interpolation=cv2.INTER_LINEAR)
-        executor.set_viewport_size(1280, 720)
-        user_message = _build_user_message_from_frame(frame_for_llm)
+            print(f"[round {round_idx}] resize screenshot {fw}x{fh} -> 1280x720")
+            frame = cv2.resize(frame, (1280, 720), interpolation=cv2.INTER_LINEAR)
 
-        resp = llm.chat_with_session(
-            session_id=session_id,
-            system_prompt=system_prompt,
-            user_message=user_message,
-            tools=tools,
-            tool_choice="auto",
+        tree = growth.load_tree()
+        tick_ctx = TickContext(
+            frame_rgb=frame,
+            prev_frame_rgb=prev_frame,
+            now_monotonic=time.monotonic(),
+            state=runtime_state,
         )
-        _print_json_block(f"[round {round_idx}][llm_input][user_message]", user_message)
-        _print_json_block(f"[round {round_idx}][llm_output][raw_response]", resp)
-        round_taps: list[tuple[int, int]] = []
 
-        while True:
-            assistant_msg = resp["choices"][0]["message"]
-            _print_json_block(f"[round {round_idx}][assistant_msg]", assistant_msg)
-            tool_calls = assistant_msg.get("tool_calls") or []
-            text = assistant_msg.get("content")
-            if isinstance(text, str) and text.strip():
-                print(f"[round {round_idx}][assistant] {text.strip()}")
-            elif isinstance(text, list):
-                parts = [p.get("text", "") for p in text if isinstance(p, dict) and p.get("type") in {"text", "output_text"}]
-                joined = "".join(parts).strip()
-                if joined:
-                    print(f"[round {round_idx}][assistant] {joined}")
-                saved = _extract_and_save_llm_image(assistant_msg, round_dir)
-                if saved:
-                    print(f"[round {round_idx}][assistant_image] saved: {saved}")
-                else:
-                    part_types = [p.get("type") for p in text if isinstance(p, dict)]
-                    print(f"[round {round_idx}][assistant_image] not found in content parts: {part_types}")
+        status = engine.tick(tree, tick_ctx)
+        growth.record_result(status == NodeStatus.SUCCESS)
+        print(f"[round {round_idx}] tree_status={status.value}")
 
-            if not tool_calls:
-                break
+        if ENABLE_REFLECT and growth.need_reflect(tree):
+            print("[reflect] trigger reached (fail streak or node threshold), pending architect step")
 
-            for tool_call in tool_calls:
-                tool_name = tool_call.get("function", {}).get("name", "")
-                result = executor.run_tool_call(tool_call)
-                args_text = tool_call.get("function", {}).get("arguments", "{}")
-                try:
-                    args = json.loads(args_text) if args_text else {}
-                except json.JSONDecodeError:
-                    args = {"raw": args_text}
-                if isinstance(args, dict):
-                    args_compact = ", ".join(f"{k}={v}" for k, v in args.items())
-                else:
-                    args_compact = str(args)
-                ok = "ok" if "\"ok\": true" in result.lower() else "err"
-                print(f"[round {round_idx}][tool] {tool_name}({args_compact}) -> {ok}")
-                try:
-                    result_obj = json.loads(result)
-                except json.JSONDecodeError:
-                    result_obj = {}
-                if tool_name == "tap" and isinstance(result_obj, dict):
-                    req = result_obj.get("requested")
-                    remap = result_obj.get("remapped_viewport")
-                    actual = result_obj.get("actual")
-                    print(f"[round {round_idx}][tool][tap_coords] requested={req} remapped={remap} actual={actual}")
-                if (
-                    tool_name == "tap"
-                    and isinstance(result_obj, dict)
-                    and isinstance(result_obj.get("actual"), dict)
-                ):
-                    ax = result_obj["actual"].get("x")
-                    ay = result_obj["actual"].get("y")
-                    if isinstance(ax, int) and isinstance(ay, int):
-                        round_taps.append((ax, ay))
-                llm.append_tool_message(
-                    session_id=session_id,
-                    tool_call_id=tool_call["id"],
-                    content=result,
-                )
-
-            # Continue same turn until model stops calling tools.
-            resp = llm.continue_session(
-                session_id=session_id,
-                tools=tools,
-                tool_choice="auto",
-            )
-            _print_json_block(f"[round {round_idx}][llm_output][continue_raw_response]", resp)
-
-        local_saved = _save_local_annotated_frame(frame_for_llm, round_dir, round_taps)
-        if round_taps:
-            print(f"[round {round_idx}][local_image] saved with taps: {local_saved}")
-        else:
-            print(f"[round {round_idx}][local_image] saved(no tap): {local_saved}")
-
+        prev_frame = frame.copy()
         time.sleep(interval_s)
         round_idx += 1
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Minimal ARK-driven emulator agent loop")
+    parser = argparse.ArgumentParser(description="Behavior tree driven emulator agent loop")
     parser.add_argument("--system", default=DEFAULT_SYSTEM_PROMPT, help="System prompt for task policy")
     parser.add_argument("--session-id", default=f"session-{uuid.uuid4().hex[:8]}")
     parser.add_argument("--serial", default=None)
     parser.add_argument("--adb-path", default=None)
-    parser.add_argument("--interval", type=int, default=5)
+    parser.add_argument("--interval", type=float, default=1.0)
     args = parser.parse_args()
 
     run_agent_loop(

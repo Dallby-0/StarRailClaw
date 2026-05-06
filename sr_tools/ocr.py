@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from functools import lru_cache
-from typing import Iterable, Tuple
+from typing import Any, Iterable, Tuple
 
 import cv2
 import numpy as np
@@ -70,6 +70,43 @@ def _detect_texts(image: np.ndarray, lang: str) -> list[str]:
     return [str(r.ocr_text or "") for r in results]
 
 
+def _detect_text_entries(image: np.ndarray, lang: str) -> list[dict[str, Any]]:
+    if image.size == 0:
+        return []
+    results = _get_text_system(lang).detect_and_ocr(image)
+    out: list[dict[str, Any]] = []
+    for r in results:
+        text = str(getattr(r, "ocr_text", "") or "").strip()
+        if not text:
+            continue
+        score_raw = getattr(r, "score", None)
+        try:
+            conf = float(score_raw) if score_raw is not None else 0.0
+        except Exception:
+            conf = 0.0
+        conf = max(0.0, min(1.0, conf))
+        box = getattr(r, "box", None)
+        if box is not None:
+            try:
+                xs = [int(float(p[0])) for p in box]
+                ys = [int(float(p[1])) for p in box]
+                x1, x2 = min(xs), max(xs)
+                y1, y2 = min(ys), max(ys)
+            except Exception:
+                x1 = y1 = x2 = y2 = 0
+        else:
+            x1 = y1 = x2 = y2 = 0
+        out.append(
+            {
+                "text": text,
+                "conf": conf,
+                "bbox": (x1, y1, max(0, x2 - x1), max(0, y2 - y1)),
+                "center": ((x1 + x2) // 2, (y1 + y2) // 2),
+            }
+        )
+    return out
+
+
 def _has_meaningful_text(texts: Iterable[str]) -> bool:
     for text in texts:
         if parse_name(text):
@@ -101,3 +138,9 @@ def has_text_white(image: np.ndarray, area: Area, lang: str = "zhs") -> bool:
         return _has_meaningful_text(texts)
     return bool(parse_name(_ocr_single_line_text(roi, lang=lang)))
 
+
+def ocr_entries(image: np.ndarray, area: Area, lang: str = "zhs", white: bool = False) -> list[dict[str, Any]]:
+    roi = _crop(image, area)
+    if white:
+        roi = _extract_white_letters(roi, threshold=255)
+    return _detect_text_entries(roi, lang=lang)
