@@ -118,6 +118,10 @@ class YoloEVisualPromptGui:
         tk.Button(top, text="Ref From Emulator", command=self.load_ref_from_emulator).pack(side=tk.LEFT, padx=4)
         tk.Button(top, text="Run dl_matcher", command=self.run_match).pack(side=tk.LEFT, padx=8)
         tk.Button(top, text="Save Result", command=self.save_result).pack(side=tk.LEFT, padx=4)
+        tk.Button(top, text="Save Selected PNG", command=self.save_selected_png).pack(side=tk.LEFT, padx=4)
+
+        self.save_path_var = tk.StringVar(value=str((PROJECT_ROOT / "debug" / "selected_bbox.png").resolve()))
+        tk.Entry(top, textvariable=self.save_path_var, width=48).pack(side=tk.LEFT, padx=6)
 
         self.status_var = tk.StringVar(value="Load target/ref, then draw bbox on ref image.")
         tk.Label(top, textvariable=self.status_var, anchor="w").pack(side=tk.LEFT, padx=10)
@@ -133,6 +137,20 @@ class YoloEVisualPromptGui:
         self.ref_panel.canvas.bind("<ButtonRelease-1>", self.on_ref_mouse_up)
 
         self.root.after(30, self.refresh_view)
+
+    @staticmethod
+    def _map_point_1280x720_to_1000x1000(x: int, y: int) -> Tuple[int, int]:
+        lx = int(round(int(x) * 1000 / 1280))
+        ly = int(round(int(y) * 1000 / 720))
+        lx = max(0, min(1000, lx))
+        ly = max(0, min(1000, ly))
+        return lx, ly
+
+    def _bbox_to_logical_1000(self, bbox_xyxy: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
+        x1, y1, x2, y2 = bbox_xyxy
+        lx1, ly1 = self._map_point_1280x720_to_1000x1000(x1, y1)
+        lx2, ly2 = self._map_point_1280x720_to_1000x1000(x2, y2)
+        return lx1, ly1, lx2, ly2
 
     def _show_error(self, title: str, exc: Exception) -> None:
         tb = traceback.format_exc()
@@ -232,7 +250,8 @@ class YoloEVisualPromptGui:
             self.status_var.set("Ref bbox too small, draw again.")
             return
         self.ref_bbox_xyxy = (left, top, right, bottom)
-        self.status_var.set(f"Ref bbox set: {self.ref_bbox_xyxy}")
+        logical_bbox = self._bbox_to_logical_1000(self.ref_bbox_xyxy)
+        self.status_var.set(f"Ref bbox set real={self.ref_bbox_xyxy} logical1000={logical_bbox}")
 
     def run_match(self) -> None:
         if self.target_rgb is None:
@@ -247,6 +266,7 @@ class YoloEVisualPromptGui:
         print("[Run] target_type=", type(self.target_rgb), "target_shape=", getattr(self.target_rgb, "shape", None))
         print("[Run] ref_type=", type(self.ref_rgb), "ref_shape=", getattr(self.ref_rgb, "shape", None))
         print("[Run] bbox=", self.ref_bbox_xyxy)
+        print("[Run] bbox_logical_1000=", self._bbox_to_logical_1000(self.ref_bbox_xyxy))
         try:
             dets = self.matcher.detect_with_visual_prompt(
                 image_rgb=self.target_rgb,
@@ -274,6 +294,33 @@ class YoloEVisualPromptGui:
         out_bgr = cv2.cvtColor(self.result_rgb, cv2.COLOR_RGB2BGR)
         cv2.imwrite(path, out_bgr)
         self.status_var.set(f"Result saved: {Path(path).name}")
+
+    def save_selected_png(self) -> None:
+        if self.ref_rgb is None:
+            messagebox.showwarning("Save Selected", "Please load ref image first.")
+            return
+        if self.ref_bbox_xyxy is None:
+            messagebox.showwarning("Save Selected", "Please draw bbox on ref image first.")
+            return
+        raw_path = self.save_path_var.get().strip()
+        if not raw_path:
+            messagebox.showwarning("Save Selected", "Please input output path.")
+            return
+        out_path = Path(raw_path)
+        if out_path.suffix.lower() != ".png":
+            out_path = out_path.with_suffix(".png")
+        x1, y1, x2, y2 = self.ref_bbox_xyxy
+        crop = self.ref_rgb[y1:y2, x1:x2]
+        if crop.size == 0:
+            messagebox.showwarning("Save Selected", "Selected bbox is empty.")
+            return
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        ok = cv2.imwrite(str(out_path), cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
+        if not ok:
+            messagebox.showerror("Save Selected", f"Failed to save: {out_path}")
+            return
+        logical_bbox = self._bbox_to_logical_1000(self.ref_bbox_xyxy)
+        self.status_var.set(f"Saved selected png: {out_path} logical1000={logical_bbox}")
 
     def _overlay_ref(self) -> Optional[np.ndarray]:
         if self.ref_rgb is None:

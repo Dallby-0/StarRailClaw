@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import re
+import random
 from dataclasses import dataclass
 from typing import Generator, Optional
 
@@ -97,6 +98,24 @@ class EmulatorClient:
             str(y2),
             str(duration_ms),
         )
+
+    @staticmethod
+    def _normalize_duration_ms(duration: int | float | tuple[float, float] | list[float]) -> int:
+        if isinstance(duration, (tuple, list)) and len(duration) == 2:
+            value_s = random.uniform(float(duration[0]), float(duration[1]))
+            return max(1, int(round(value_s * 1000)))
+        if isinstance(duration, float):
+            return max(1, int(round(duration * 1000)))
+        return max(1, int(duration))
+
+    def long_press(self, x: int, y: int, duration_ms: int = 450) -> None:
+        # Android "input" has no dedicated long-press command; hold is simulated via zero-distance swipe.
+        self.swipe(x, y, x, y, duration_ms=duration_ms)
+
+    def long_click(self, x: int, y: int, duration: int | float | tuple[float, float] | list[float] = (1.0, 1.2)) -> None:
+        # Compatible with StarRailCopilot semantics: float means seconds, tuple/list means random seconds range.
+        duration_ms = self._normalize_duration_ms(duration)
+        self.long_press(x, y, duration_ms=duration_ms)
 
     def forward(self, local_port: int, remote_port: int) -> None:
         self._run_adb("forward", f"tcp:{local_port}", f"tcp:{remote_port}")

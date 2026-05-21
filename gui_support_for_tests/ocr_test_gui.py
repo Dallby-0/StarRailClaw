@@ -62,11 +62,14 @@ class OcrTestGui:
         self.threshold_var = tk.StringVar(value="0.8")
         self.white_text_var = tk.BooleanVar(value=False)
         self.selection_var = tk.StringVar(value="区域: -")
+        self.save_path_var = tk.StringVar(value=str((PROJECT_ROOT / "debug" / "ocr_selected_bbox.png").resolve()))
 
         tk.Label(side, textvariable=self.status_var, anchor="w", justify=tk.LEFT, wraplength=340).pack(fill=tk.X, pady=(0, 6))
         tk.Button(side, text="刷新截图", command=self.refresh_screenshot).pack(fill=tk.X, pady=2)
         tk.Button(side, text="执行OCR", command=self.run_ocr).pack(fill=tk.X, pady=2)
+        tk.Button(side, text="保存选中区域PNG", command=self.save_selected_png).pack(fill=tk.X, pady=2)
         tk.Checkbutton(side, text="白字模式(text_match_white)", variable=self.white_text_var).pack(anchor="w", pady=(4, 2))
+        tk.Entry(side, textvariable=self.save_path_var).pack(fill=tk.X, pady=(2, 6))
 
         controls = tk.Frame(side)
         controls.pack(fill=tk.X, pady=(2, 8))
@@ -192,6 +195,32 @@ class OcrTestGui:
             self.result_text.insert(tk.END, f"{i:02d}. conf={conf:.3f} bbox={bbox} text={text!r}\n")
         self.status_var.set(f"OCR完成: candidates={len(words)} above_threshold={len(kept)}")
         self._refresh_canvas()
+
+    def save_selected_png(self) -> None:
+        if self.current_frame is None:
+            messagebox.showwarning("保存选区", "请先刷新截图")
+            return
+        if self.selection_real is None:
+            messagebox.showwarning("保存选区", "请先框选区域")
+            return
+        raw_path = self.save_path_var.get().strip()
+        if not raw_path:
+            messagebox.showwarning("保存选区", "请填写保存路径")
+            return
+        out_path = Path(raw_path)
+        if out_path.suffix.lower() != ".png":
+            out_path = out_path.with_suffix(".png")
+        x1, y1, x2, y2 = self.selection_real
+        crop = self.current_frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            messagebox.showwarning("保存选区", "选区为空，无法保存")
+            return
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        ok = cv2.imwrite(str(out_path), cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
+        if not ok:
+            messagebox.showerror("保存选区", f"保存失败: {out_path}")
+            return
+        self.status_var.set(f"选区已保存: {out_path}")
 
     def _draw_overlay(self, frame: np.ndarray) -> np.ndarray:
         view = frame.copy()
