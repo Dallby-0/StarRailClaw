@@ -10,7 +10,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 
 FSM_DIR = Path("StateMachineResources")
@@ -105,7 +105,7 @@ HTML = r"""<!doctype html>
 
     .wrap {
       display: grid;
-      grid-template-columns: 1fr 340px;
+      grid-template-columns: 1fr 420px;
       min-height: 0;
     }
 
@@ -176,6 +176,149 @@ HTML = r"""<!doctype html>
     .missing {
       color: #ff8b8b;
     }
+
+    .annotation-frame {
+      position: relative;
+      width: 100%;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #070b10;
+      cursor: zoom-in;
+    }
+
+    .annotation-frame img {
+      display: block;
+      width: 100%;
+      height: auto;
+      user-select: none;
+    }
+
+    .bbox {
+      position: absolute;
+      border: 2px solid rgba(160, 170, 185, .82);
+      background: rgba(160, 170, 185, .08);
+      box-shadow: 0 0 0 1px rgba(0, 0, 0, .45);
+      pointer-events: none;
+    }
+
+    .bbox.active {
+      border-color: #ff4057;
+      background: rgba(255, 64, 87, .12);
+      box-shadow: 0 0 0 1px rgba(0, 0, 0, .55), 0 0 14px rgba(255, 64, 87, .42);
+    }
+
+    .bbox-label {
+      position: absolute;
+      left: -2px;
+      top: -23px;
+      max-width: 260px;
+      padding: 2px 5px;
+      border-radius: 4px 4px 4px 0;
+      background: rgba(18, 26, 36, .94);
+      color: #eef4ff;
+      font-size: 10px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      border: 1px solid rgba(160, 170, 185, .7);
+    }
+
+    .bbox.active .bbox-label {
+      border-color: #ff4057;
+      color: #fff2f4;
+    }
+
+    .condition-list {
+      display: grid;
+      gap: 6px;
+      margin-top: 8px;
+    }
+
+    .condition-item {
+      padding: 7px 8px;
+      border: 1px solid var(--line);
+      border-left-width: 4px;
+      border-radius: 6px;
+      background: #0d141d;
+      overflow-wrap: anywhere;
+    }
+
+    .condition-item.active {
+      border-left-color: #ff4057;
+    }
+
+    .condition-item.inactive {
+      border-left-color: #8b96a5;
+      color: #c3ccd8;
+    }
+
+    .condition-meta {
+      color: var(--muted);
+      font-size: 11px;
+      margin-top: 2px;
+    }
+
+    .lightbox {
+      position: fixed;
+      inset: 0;
+      display: none;
+      z-index: 1000;
+      background: rgba(3, 6, 10, .92);
+    }
+
+    .lightbox.open {
+      display: grid;
+      grid-template-rows: auto 1fr;
+    }
+
+    .lightbox-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 12px;
+      border-bottom: 1px solid #27384c;
+      background: rgba(13, 19, 27, .96);
+    }
+
+    .lightbox-title {
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+      color: var(--muted);
+    }
+
+    .lightbox-stage {
+      position: relative;
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+      cursor: grab;
+    }
+
+    .lightbox-stage.dragging {
+      cursor: grabbing;
+    }
+
+    .lightbox-content {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      transform-origin: 0 0;
+      border: 1px solid #31445c;
+      background: #070b10;
+      box-shadow: 0 18px 60px rgba(0, 0, 0, .48);
+    }
+
+    .lightbox-content img {
+      display: block;
+      width: 100%;
+      height: 100%;
+      user-select: none;
+      pointer-events: none;
+    }
   </style>
 </head>
 <body>
@@ -195,6 +338,10 @@ HTML = r"""<!doctype html>
           <div id="selected" class="value">-</div>
         </div>
         <div class="section">
+          <div class="label">Annotation</div>
+          <div id="annotation" class="value">-</div>
+        </div>
+        <div class="section">
           <div class="label">Runtime</div>
           <div id="runtime" class="kv"></div>
         </div>
@@ -207,6 +354,17 @@ HTML = r"""<!doctype html>
           <div id="incoming" class="edge-list"></div>
         </div>
       </aside>
+    </div>
+  </div>
+  <div id="lightbox" class="lightbox">
+    <div class="lightbox-bar">
+      <button id="lightboxFitBtn">Fit</button>
+      <button id="lightboxOneBtn">100%</button>
+      <button id="lightboxCloseBtn">Close</button>
+      <div id="lightboxTitle" class="lightbox-title">-</div>
+    </div>
+    <div id="lightboxStage" class="lightbox-stage">
+      <div id="lightboxContent" class="lightbox-content"></div>
     </div>
   </div>
 
@@ -320,6 +478,13 @@ HTML = r"""<!doctype html>
       runtime: {},
       graph: { nodes: [], edges: [] },
       selectedId: null,
+      templateCache: new Map(),
+      templateLoadingId: null,
+      lightboxTemplate: null,
+      lightboxScale: 1,
+      lightboxX: 0,
+      lightboxY: 0,
+      lightboxDrag: null,
       follow: true,
       paused: false,
       didInitialLayout: false,
@@ -328,6 +493,7 @@ HTML = r"""<!doctype html>
 
     const statusEl = document.getElementById('status');
     const selectedEl = document.getElementById('selected');
+    const annotationEl = document.getElementById('annotation');
     const runtimeEl = document.getElementById('runtime');
     const outgoingEl = document.getElementById('outgoing');
     const incomingEl = document.getElementById('incoming');
@@ -335,6 +501,13 @@ HTML = r"""<!doctype html>
     const layoutBtn = document.getElementById('layoutBtn');
     const followBtn = document.getElementById('followBtn');
     const pauseBtn = document.getElementById('pauseBtn');
+    const lightboxEl = document.getElementById('lightbox');
+    const lightboxStageEl = document.getElementById('lightboxStage');
+    const lightboxContentEl = document.getElementById('lightboxContent');
+    const lightboxTitleEl = document.getElementById('lightboxTitle');
+    const lightboxFitBtn = document.getElementById('lightboxFitBtn');
+    const lightboxOneBtn = document.getElementById('lightboxOneBtn');
+    const lightboxCloseBtn = document.getElementById('lightboxCloseBtn');
 
     function shortId(id) {
       return id ? String(id).slice(0, 8) : '-';
@@ -543,6 +716,148 @@ HTML = r"""<!doctype html>
       }
     }
 
+    function conditionTitle(condition) {
+      const type = condition.display_type || condition.type || condition.kind || 'condition';
+      const stability = condition.stability || '-';
+      const discrimination = condition.discrimination || '-';
+      return `${type}  stability:${stability}  discrimination:${discrimination}`;
+    }
+
+    function renderAnnotation(template) {
+      annotationEl.innerHTML = '';
+      if (!template || template.missing) {
+        annotationEl.textContent = template && template.message ? template.message : '-';
+        return;
+      }
+
+      const frame = document.createElement('div');
+      frame.className = 'annotation-frame';
+      if (!template.screenshot_url) {
+        annotationEl.textContent = 'screenshot not found';
+        return;
+      }
+      const img = document.createElement('img');
+      img.src = template.screenshot_url;
+      img.alt = template.slug || 'state screenshot';
+      frame.append(img);
+
+      appendBboxes(frame, template);
+      frame.addEventListener('dblclick', () => openLightbox(template));
+      annotationEl.append(frame);
+
+      const list = document.createElement('div');
+      list.className = 'condition-list';
+      for (const condition of template.conditions || []) {
+        const item = document.createElement('div');
+        item.className = `condition-item ${condition.active ? 'active' : 'inactive'}`;
+        const title = document.createElement('div');
+        title.textContent = `${condition.active ? 'active' : 'inactive'} · ${condition.id || '-'} · ${condition.kind || '-'}`;
+        const meta = document.createElement('div');
+        meta.className = 'condition-meta';
+        meta.textContent = `${conditionTitle(condition)} · ${condition.brief || ''}`;
+        item.append(title, meta);
+        list.append(item);
+      }
+      annotationEl.append(list);
+    }
+
+    function appendBboxes(parent, template) {
+      const width = template.image_width || 1000;
+      const height = template.image_height || 1000;
+      for (const condition of template.conditions || []) {
+        const bbox = condition.bbox;
+        if (!Array.isArray(bbox) || bbox.length !== 4) continue;
+        const [x1, y1, x2, y2] = bbox.map(Number);
+        const box = document.createElement('div');
+        box.className = `bbox ${condition.active ? 'active' : ''}`;
+        box.style.left = `${x1 / width * 100}%`;
+        box.style.top = `${y1 / height * 100}%`;
+        box.style.width = `${Math.max(1, x2 - x1) / width * 100}%`;
+        box.style.height = `${Math.max(1, y2 - y1) / height * 100}%`;
+        const label = document.createElement('div');
+        label.className = 'bbox-label';
+        label.textContent = conditionTitle(condition);
+        box.title = `${condition.id || ''}\n${condition.brief || ''}`;
+        box.append(label);
+        parent.append(box);
+      }
+    }
+
+    function renderLightboxContent(template) {
+      lightboxContentEl.innerHTML = '';
+      const img = document.createElement('img');
+      img.src = template.screenshot_url;
+      img.alt = template.slug || 'state screenshot';
+      lightboxContentEl.append(img);
+      appendBboxes(lightboxContentEl, template);
+      lightboxTitleEl.textContent = `${template.slug || 'state'} · double-click image preview · wheel zoom · drag pan · Esc close`;
+      const width = template.screenshot_width || template.image_width || 1000;
+      const height = template.screenshot_height || template.image_height || 1000;
+      lightboxContentEl.style.width = `${width}px`;
+      lightboxContentEl.style.height = `${height}px`;
+    }
+
+    function updateLightboxTransform() {
+      lightboxContentEl.style.transform = `translate(${state.lightboxX}px, ${state.lightboxY}px) scale(${state.lightboxScale}) translate(-50%, -50%)`;
+    }
+
+    function fitLightbox() {
+      const template = state.lightboxTemplate;
+      if (!template) return;
+      const width = template.screenshot_width || template.image_width || 1000;
+      const height = template.screenshot_height || template.image_height || 1000;
+      const rect = lightboxStageEl.getBoundingClientRect();
+      state.lightboxScale = Math.min((rect.width - 48) / width, (rect.height - 48) / height, 1.8);
+      state.lightboxX = 0;
+      state.lightboxY = 0;
+      updateLightboxTransform();
+    }
+
+    function openLightbox(template) {
+      if (!template || !template.screenshot_url) return;
+      state.lightboxTemplate = template;
+      renderLightboxContent(template);
+      lightboxEl.classList.add('open');
+      requestAnimationFrame(fitLightbox);
+    }
+
+    function closeLightbox() {
+      lightboxEl.classList.remove('open');
+      state.lightboxTemplate = null;
+      state.lightboxDrag = null;
+      lightboxStageEl.classList.remove('dragging');
+    }
+
+    async function loadTemplateForSelection(selected, node) {
+      if (!selected) {
+        renderAnnotation(null);
+        return;
+      }
+      if (state.templateCache.has(selected)) {
+        renderAnnotation(state.templateCache.get(selected));
+        return;
+      }
+      if (state.templateLoadingId === selected) return;
+      state.templateLoadingId = selected;
+      annotationEl.textContent = 'loading...';
+      try {
+        const slug = node && node.slug ? node.slug : '';
+        const res = await fetch(`/api/template?state_id=${encodeURIComponent(selected)}&slug=${encodeURIComponent(slug)}`, { cache: 'no-store' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const payload = await res.json();
+        state.templateCache.set(selected, payload);
+        if ((state.selectedId || state.runtime.last_state_id) === selected) {
+          renderAnnotation(payload);
+        }
+      } catch (err) {
+        const payload = { missing: true, message: String(err) };
+        state.templateCache.set(selected, payload);
+        renderAnnotation(payload);
+      } finally {
+        state.templateLoadingId = null;
+      }
+    }
+
     function edgeHtml(edge, direction) {
       const el = document.createElement('div');
       el.className = 'edge-item';
@@ -557,6 +872,7 @@ HTML = r"""<!doctype html>
       const selected = state.selectedId || state.runtime.last_state_id;
       const node = state.graph.nodes.find(n => n.state_id === selected);
       selectedEl.textContent = node ? `${node.slug}\n${node.state_id}` : '-';
+      loadTemplateForSelection(selected, node);
 
       outgoingEl.innerHTML = '';
       incomingEl.innerHTML = '';
@@ -591,6 +907,53 @@ HTML = r"""<!doctype html>
       state.paused = !state.paused;
       pauseBtn.classList.toggle('active', state.paused);
       pauseBtn.textContent = state.paused ? 'Resume' : 'Pause';
+    });
+    lightboxCloseBtn.addEventListener('click', closeLightbox);
+    lightboxFitBtn.addEventListener('click', fitLightbox);
+    lightboxOneBtn.addEventListener('click', () => {
+      state.lightboxScale = 1;
+      state.lightboxX = 0;
+      state.lightboxY = 0;
+      updateLightboxTransform();
+    });
+    lightboxEl.addEventListener('dblclick', event => {
+      if (event.target === lightboxStageEl) closeLightbox();
+    });
+    lightboxStageEl.addEventListener('wheel', event => {
+      if (!state.lightboxTemplate) return;
+      event.preventDefault();
+      const oldScale = state.lightboxScale;
+      const factor = event.deltaY < 0 ? 1.12 : 0.9;
+      state.lightboxScale = Math.max(0.08, Math.min(8, state.lightboxScale * factor));
+      const rect = lightboxStageEl.getBoundingClientRect();
+      const mx = event.clientX - rect.left - rect.width / 2;
+      const my = event.clientY - rect.top - rect.height / 2;
+      state.lightboxX = mx - (mx - state.lightboxX) * (state.lightboxScale / oldScale);
+      state.lightboxY = my - (my - state.lightboxY) * (state.lightboxScale / oldScale);
+      updateLightboxTransform();
+    }, { passive: false });
+    lightboxStageEl.addEventListener('mousedown', event => {
+      if (!state.lightboxTemplate || event.button !== 0) return;
+      state.lightboxDrag = { x: event.clientX, y: event.clientY, ox: state.lightboxX, oy: state.lightboxY };
+      lightboxStageEl.classList.add('dragging');
+    });
+    window.addEventListener('mousemove', event => {
+      if (!state.lightboxDrag) return;
+      state.lightboxX = state.lightboxDrag.ox + event.clientX - state.lightboxDrag.x;
+      state.lightboxY = state.lightboxDrag.oy + event.clientY - state.lightboxDrag.y;
+      updateLightboxTransform();
+    });
+    window.addEventListener('mouseup', () => {
+      state.lightboxDrag = null;
+      lightboxStageEl.classList.remove('dragging');
+    });
+    window.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && lightboxEl.classList.contains('open')) {
+        closeLightbox();
+      }
+    });
+    window.addEventListener('resize', () => {
+      if (lightboxEl.classList.contains('open')) fitLightbox();
     });
 
     poll();
@@ -656,6 +1019,146 @@ def _enabled_edges(graph: dict[str, Any], node_ids: set[str]) -> list[dict[str, 
     return result
 
 
+def _templates_dir_for_graph(graph_path: Path) -> Path:
+    return graph_path.parent / "templates"
+
+
+def _png_size(path: Path) -> tuple[int, int] | None:
+    try:
+        with path.open("rb") as f:
+            header = f.read(24)
+    except OSError:
+        return None
+    if len(header) < 24 or header[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    return int.from_bytes(header[16:20], "big"), int.from_bytes(header[20:24], "big")
+
+
+def _resolve_under(path: Path, root: Path) -> Path | None:
+    try:
+        resolved = path.resolve()
+        root_resolved = root.resolve()
+    except OSError:
+        return None
+    if resolved == root_resolved or root_resolved in resolved.parents:
+        return resolved
+    return None
+
+
+def _find_template_state(templates_dir: Path, state_id: str, slug: str = "") -> tuple[Path, dict[str, Any]] | None:
+    candidates: list[Path] = []
+    if slug:
+        candidates.append(templates_dir / slug / "state.json")
+    if state_id:
+        candidates.extend(templates_dir.glob("*/state.json"))
+    seen: set[Path] = set()
+    for path in candidates:
+        if path in seen or not path.exists():
+            continue
+        seen.add(path)
+        data = _load_json(path)
+        if not isinstance(data, dict):
+            continue
+        if state_id and str(data.get("state_id", "")) == state_id:
+            return path, data
+        if slug and str(data.get("slug", "")) == slug:
+            return path, data
+    return None
+
+
+def _path_from_state_value(value: Any, template_dir: Path, templates_dir: Path) -> Path | None:
+    if not isinstance(value, str) or not value:
+        return None
+    raw = Path(value)
+    candidates = [raw]
+    if not raw.is_absolute():
+        candidates.extend([Path.cwd() / raw, template_dir / raw.name])
+    for candidate in candidates:
+        safe = _resolve_under(candidate, templates_dir)
+        if safe and safe.exists():
+            return safe
+    return None
+
+
+def _find_screenshot_path(state: dict[str, Any], state_path: Path, templates_dir: Path) -> Path | None:
+    template_dir = state_path.parent
+    for condition in state.get("match_conditions", []):
+        if not isinstance(condition, dict):
+            continue
+        source = condition.get("source")
+        if not isinstance(source, dict):
+            continue
+        path = _path_from_state_value(source.get("screenshot_path"), template_dir, templates_dir)
+        if path:
+            return path
+    for path in sorted(template_dir.glob("screenshot*.png")):
+        safe = _resolve_under(path, templates_dir)
+        if safe and safe.exists():
+            return safe
+    return None
+
+
+def _condition_display_type(condition: dict[str, Any]) -> str:
+    kind = str(condition.get("kind", "")).lower()
+    if "text" in kind:
+        return "text"
+    if "template" in kind or "pattern" in kind or "region" in kind:
+        return "template"
+    condition_id = str(condition.get("id", "")).lower()
+    if "text" in condition_id:
+        return "text"
+    if "pattern" in condition_id or "template" in condition_id:
+        return "template"
+    return kind or "condition"
+
+
+def _normalized_conditions(state: dict[str, Any]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for index, condition in enumerate(state.get("match_conditions", []), start=1):
+        if not isinstance(condition, dict):
+            continue
+        bbox = condition.get("bbox") or (condition.get("params") or {}).get("rect")
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            continue
+        try:
+            bbox_nums = [float(v) for v in bbox]
+        except (TypeError, ValueError):
+            continue
+        result.append(
+            {
+                "id": str(condition.get("id", f"condition_{index}")),
+                "kind": str(condition.get("kind", "")),
+                "display_type": _condition_display_type(condition),
+                "active": bool(condition.get("enabled", True)),
+                "enabled": bool(condition.get("enabled", True)),
+                "condition_status": str(condition.get("condition_status", "")),
+                "stability": str(condition.get("stability", "")),
+                "discrimination": str(condition.get("discrimination", "")),
+                "brief": str(condition.get("brief", "")),
+                "role": str(condition.get("role", "")),
+                "weight": condition.get("weight", 1.0),
+                "bbox": bbox_nums,
+            }
+        )
+    return result
+
+
+def _condition_coordinate_size(conditions: list[dict[str, Any]], image_size: tuple[int, int] | None) -> tuple[int, int]:
+    max_x = 0.0
+    max_y = 0.0
+    for condition in conditions:
+        bbox = condition.get("bbox")
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            continue
+        max_x = max(max_x, float(bbox[0]), float(bbox[2]))
+        max_y = max(max_y, float(bbox[1]), float(bbox[3]))
+    if max_x <= 1000 and max_y <= 1000:
+        return 1000, 1000
+    if image_size:
+        return image_size
+    return int(max(1000, max_x)), int(max(1000, max_y))
+
+
 class FsmStateHandler(BaseHTTPRequestHandler):
     graph_path = GRAPH_PATH
     runtime_path = RUNTIME_PATH
@@ -670,6 +1173,12 @@ class FsmStateHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/state":
             self._send_state(parse_qs(parsed.query))
+            return
+        if parsed.path == "/api/template":
+            self._send_template(parse_qs(parsed.query))
+            return
+        if parsed.path == "/api/template-image":
+            self._send_template_image(parse_qs(parsed.query))
             return
         self.send_error(HTTPStatus.NOT_FOUND, "not found")
 
@@ -704,6 +1213,70 @@ class FsmStateHandler(BaseHTTPRequestHandler):
         }
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         self._send_bytes(body, "application/json; charset=utf-8")
+
+    def _send_template(self, query: dict[str, list[str]]) -> None:
+        state_id = query.get("state_id", [""])[0]
+        slug = query.get("slug", [""])[0]
+        templates_dir = _templates_dir_for_graph(self.graph_path)
+        found = _find_template_state(templates_dir, state_id, slug)
+        if not found:
+            body = json.dumps(
+                {
+                    "missing": True,
+                    "message": f"template state not found: {slug or state_id or '-'}",
+                    "conditions": [],
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            self._send_bytes(body, "application/json; charset=utf-8")
+            return
+
+        state_path, state = found
+        screenshot_path = _find_screenshot_path(state, state_path, templates_dir)
+        size = _png_size(screenshot_path) if screenshot_path else None
+        conditions = _normalized_conditions(state)
+        coord_size = _condition_coordinate_size(conditions, size)
+        payload = {
+            "missing": False,
+            "state_id": str(state.get("state_id", "")),
+            "slug": str(state.get("slug", state_path.parent.name)),
+            "display_name": str(state.get("display_name", "")),
+            "description": str(state.get("description", "")),
+            "state_path": str(state_path),
+            "screenshot_path": str(screenshot_path) if screenshot_path else "",
+            "screenshot_url": (
+                f"/api/template-image?state_id={quote(state_id)}&slug={quote(slug)}" if screenshot_path else ""
+            ),
+            "image_width": coord_size[0],
+            "image_height": coord_size[1],
+            "screenshot_width": size[0] if size else None,
+            "screenshot_height": size[1] if size else None,
+            "conditions": conditions,
+            "actions": state.get("actions", []),
+        }
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self._send_bytes(body, "application/json; charset=utf-8")
+
+    def _send_template_image(self, query: dict[str, list[str]]) -> None:
+        state_id = query.get("state_id", [""])[0]
+        slug = query.get("slug", [""])[0]
+        templates_dir = _templates_dir_for_graph(self.graph_path)
+        found = _find_template_state(templates_dir, state_id, slug)
+        if not found:
+            self.send_error(HTTPStatus.NOT_FOUND, "template state not found")
+            return
+        state_path, state = found
+        screenshot_path = _find_screenshot_path(state, state_path, templates_dir)
+        if not screenshot_path:
+            self.send_error(HTTPStatus.NOT_FOUND, "screenshot not found")
+            return
+        try:
+            body = screenshot_path.read_bytes()
+        except OSError:
+            self.send_error(HTTPStatus.NOT_FOUND, "screenshot not readable")
+            return
+        self._send_bytes(body, "image/png")
 
     def _send_bytes(self, body: bytes, content_type: str) -> None:
         self.send_response(HTTPStatus.OK)
