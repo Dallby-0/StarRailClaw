@@ -18,6 +18,7 @@ class MatchResult:
     success: bool
     passed_all: int
     total_all: int
+    condition_results: list[dict[str, Any]] | None = None
 
 
 def _ocr_lines(vision: VisionEngine, frame_rgb, rect: list[int] | None) -> list[str]:
@@ -25,7 +26,7 @@ def _ocr_lines(vision: VisionEngine, frame_rgb, rect: list[int] | None) -> list[
     return [str(e.get("text", "")).strip() for e in entries if str(e.get("text", "")).strip()]
 
 
-def _condition_passed(cond: dict[str, Any], vision: VisionEngine, frame_rgb) -> bool:
+def _condition_eval(cond: dict[str, Any], vision: VisionEngine, frame_rgb) -> tuple[bool, dict[str, Any]]:
     kind = str(cond.get("kind", ""))
     params = cond.get("params", {})
     if not isinstance(params, dict):
@@ -35,20 +36,48 @@ def _condition_passed(cond: dict[str, Any], vision: VisionEngine, frame_rgb) -> 
         bbox = cond.get("bbox")
         if isinstance(bbox, list) and len(bbox) == 4:
             rect = bbox
+    detail: dict[str, Any] = {
+        "id": str(cond.get("id", "")),
+        "kind": kind,
+        "enabled": bool(cond.get("enabled", False)),
+        "status": str(cond.get("condition_status", "active")),
+        "rect": rect,
+        "brief": str(cond.get("brief", "")),
+    }
     if kind == "text_line_contains":
         needle = str(params.get("text", "")).strip()
+        detail["needle"] = needle
         if not needle:
-            return False
+            detail["reason"] = "empty_needle"
+            detail["passed"] = False
+            return False, detail
         lines = _ocr_lines(vision, frame_rgb, rect)
-        return any(needle in line for line in lines)
+        passed = any(needle in line for line in lines)
+        detail["ocr_lines"] = lines
+        detail["passed"] = passed
+        return passed, detail
     if kind == "region_template":
         tpl_path = str(params.get("template_path", "")).strip()
+        detail["template_path"] = tpl_path
         if not tpl_path:
-            return False
+            detail["reason"] = "empty_template_path"
+            detail["passed"] = False
+            return False, detail
         threshold = float(params.get("threshold", 0.8))
-        ok, _, _ = vision.match_template(frame_rgb, Path(tpl_path), rect, threshold=threshold)
-        return ok
-    return False
+        detail["threshold"] = threshold
+        ok, pos, sim = vision.match_template(frame_rgb, Path(tpl_path), rect, threshold=threshold)
+        detail["match_pos"] = pos
+        detail["similarity"] = sim
+        detail["passed"] = ok
+        return ok, detail
+    detail["reason"] = "unsupported_kind"
+    detail["passed"] = False
+    return False, detail
+
+
+def _condition_passed(cond: dict[str, Any], vision: VisionEngine, frame_rgb) -> bool:
+    passed, _ = _condition_eval(cond, vision, frame_rgb)
+    return passed
 
 
 def _level(raw: Any, default: str = "mid") -> str:
@@ -101,8 +130,14 @@ def _select_enabled_conditions(
 def _eval_state_match(meta: dict[str, Any], state_dir: Path, vision: VisionEngine, frame_rgb) -> MatchResult:
     conds = [c for c in meta.get("match_conditions", []) if isinstance(c, dict)]
     enabled_conds = [c for c in conds if c.get("enabled", False)]
-    passed_enabled = sum(1 for c in enabled_conds if _condition_passed(c, vision, frame_rgb))
-    passed_all = sum(1 for c in conds if _condition_passed(c, vision, frame_rgb))
+    condition_results: list[dict[str, Any]] = []
+    passed_by_id: dict[int, bool] = {}
+    for c in conds:
+        passed, detail = _condition_eval(c, vision, frame_rgb)
+        condition_results.append(detail)
+        passed_by_id[id(c)] = passed
+    passed_enabled = sum(1 for c in enabled_conds if passed_by_id.get(id(c), False))
+    passed_all = sum(1 for c in conds if passed_by_id.get(id(c), False))
     total_enabled = len(enabled_conds)
     total_all = len(conds)
     success = (passed_enabled == total_enabled) if total_enabled > 0 else False
@@ -114,6 +149,7 @@ def _eval_state_match(meta: dict[str, Any], state_dir: Path, vision: VisionEngin
         success=success,
         passed_all=passed_all,
         total_all=total_all,
+        condition_results=condition_results,
     )
 
 

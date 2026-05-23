@@ -18,9 +18,11 @@ from state_machine.constants import (
     FSM_GRAPH_PATH,
     FSM_TEMPLATES_DIR,
     HARD_LIMIT,
+    LLM_PARSE_RETRY,
     MAX_RETRY_PER_ACTION,
     MID_LIMIT,
     REPAIR_EFFORTS,
+    SCHEMA_VERSION,
     SOFT_LIMIT,
 )
 from state_machine.io import (
@@ -48,6 +50,7 @@ from state_machine.llm_tasks import (
     _request_llm_payload,
     _save_llm_raw_debug,
 )
+from state_machine.logger import FsmRunLogger, summarize_match
 from state_machine.matching import (
     MatchResult,
     _condition_passed,
@@ -61,6 +64,13 @@ from agent.llm_client import DoubaoClient
 from state_machine.presets import run_preset
 from sr_tools.adb import resolve_target_serial
 from sr_tools.emulator import EmulatorClient
+
+
+def _log(logger: FsmRunLogger | None, message: str, event: str = "console", **fields: Any) -> None:
+    if logger is None:
+        print(message)
+        return
+    logger.text(message, event=event, **fields)
 
 def _iter_state_meta() -> list[tuple[Path, dict[str, Any]]]:
     out: list[tuple[Path, dict[str, Any]]] = []
@@ -246,6 +256,7 @@ def _create_state_from_llm(
     frame_rgb,
     mapper: CoordinateMapper,
     vision: VisionEngine,
+    logger: FsmRunLogger | None = None,
 ) -> tuple[str, Path]:
     state_id = uuid.uuid4().hex
     state_dir = _ensure_unique_state_dir(str(llm_payload.get("slug", "state")))
@@ -277,17 +288,38 @@ def _create_state_from_llm(
         ],
     }
     _save_json(state_dir / "state.json", state_meta)
+    if logger is not None:
+        logger.event(
+            "state_created",
+            state_id=state_id,
+            state_dir=state_dir,
+            slug=state_meta["slug"],
+            page_type=state_meta["page_type"],
+            weak_match=weak_match,
+            elements_count=len(llm_payload.get("elements", [])),
+            actions_count=len(llm_payload.get("actions", [])),
+            conditions=conds,
+            screenshot_path=state_dir / "screenshot_1.png",
+        )
     return state_id, state_dir
 
 
-def _append_graph_node(state_id: str, slug: str) -> None:
+def _append_graph_node(state_id: str, slug: str, logger: FsmRunLogger | None = None) -> None:
     graph = _load_json(FSM_GRAPH_PATH)
     graph["nodes"].append({"state_id": state_id, "slug": slug, "enabled": True})
     graph["updated_at"] = _now_iso()
     _save_json(FSM_GRAPH_PATH, graph)
+    if logger is not None:
+        logger.event("graph_node_added", state_id=state_id, slug=slug)
 
 
-def _append_graph_edge(from_state_id: str | None, action_id: str, to_state_id: str) -> None:
+def _append_graph_edge(
+    from_state_id: str | None,
+    action_id: str,
+    to_state_id: str,
+    logger: FsmRunLogger | None = None,
+    reason: str = "",
+) -> None:
     if not from_state_id:
         return
     graph = _load_json(FSM_GRAPH_PATH)
@@ -306,6 +338,14 @@ def _append_graph_edge(from_state_id: str | None, action_id: str, to_state_id: s
     )
     graph["updated_at"] = _now_iso()
     _save_json(FSM_GRAPH_PATH, graph)
+    if logger is not None:
+        logger.event(
+            "graph_edge_added",
+            from_state_id=from_state_id,
+            action_id=action_id,
+            to_state_id=to_state_id,
+            reason=reason,
+        )
 
 
 def _get_reachable_targets(graph: dict[str, Any], from_state_id: str | None) -> set[str]:
@@ -417,6 +457,7 @@ def _try_merge_page_type(
     mapper: CoordinateMapper,
     vision: VisionEngine,
     metas: list[tuple[Path, dict[str, Any]]],
+    logger: FsmRunLogger | None = None,
 ) -> tuple[str, Path] | None:
     page_type = _normalize_page_type(llm_payload.get("possible_page_type"))
     if not page_type:
@@ -446,7 +487,7 @@ def _try_merge_page_type(
         new_payload=llm_payload,
     )
     if rev is None or not rev.get("same_page_type", False):
-        print(f"[fsm][merge] reject page_type={page_type} reason=llm_not_same_or_invalid")
+        _log(logger, f"[fsm][merge] reject page_type={page_type} reason=llm_not_same_or_invalid", "merge_rejected", page_type=page_type, reason="llm_not_same_or_invalid")
         return None
 
     by_id = {str(c.get("id", "")): c for c in existing_conds}
@@ -477,13 +518,13 @@ def _try_merge_page_type(
             sample_frames.append(img)
     sample_frames.append(frame_rgb)
     if not _conditions_pass_all(revised, vision, sample_frames):
-        print(f"[fsm][merge] reject page_type={page_type} reason=revised_conditions_do_not_cover_positive_samples")
+        _log(logger, f"[fsm][merge] reject page_type={page_type} reason=revised_conditions_do_not_cover_positive_samples", "merge_rejected", page_type=page_type, reason="revised_conditions_do_not_cover_positive_samples")
         return None
 
     revised, weak_match = _select_enabled_conditions(revised, vision, frame_rgb)
     false_positive = _selected_conditions_match_other_page(revised, vision, metas, page_type)
     if false_positive:
-        print(f"[fsm][merge] reject page_type={page_type} reason=false_positive other={false_positive}")
+        _log(logger, f"[fsm][merge] reject page_type={page_type} reason=false_positive other={false_positive}", "merge_rejected", page_type=page_type, reason="false_positive", other=false_positive)
         return None
 
     _backup_json(latest_dir / "state.json")
@@ -497,7 +538,16 @@ def _try_merge_page_type(
         latest_meta["model_info"]["weak_match"] = weak_match
         latest_meta["model_info"]["last_merge_note"] = str(rev.get("note", ""))
     _save_json(latest_dir / "state.json", latest_meta)
-    print(f"[fsm][merge] accepted page_type={page_type} state_id={latest_meta.get('state_id')} weak={weak_match}")
+    _log(
+        logger,
+        f"[fsm][merge] accepted page_type={page_type} state_id={latest_meta.get('state_id')} weak={weak_match}",
+        "merge_accepted",
+        page_type=page_type,
+        state_id=latest_meta.get("state_id"),
+        weak_match=weak_match,
+        conditions=revised,
+        screenshot_path=latest_dir / f"screenshot_{next_idx}.png",
+    )
     return str(latest_meta.get("state_id", "")), latest_dir
 
 
@@ -510,6 +560,7 @@ def _request_llm_repair(
     state_slug: str,
     last_actions: list[dict[str, Any]],
     fail_index: int,
+    logger: FsmRunLogger | None = None,
 ) -> dict[str, Any] | None:
     old_effort = _apply_reasoning_effort(llm, effort)
     text = (
@@ -532,10 +583,19 @@ def _request_llm_repair(
             )
             raw = _normalize_assistant_text(resp["choices"][0]["message"].get("content"))
             _save_llm_raw_debug(session_id, attempt, raw, f"repair_{effort}")
-            print(f"[fsm][repair][llm] effort={effort} attempt={attempt} raw={raw[:600]}")
+            _log(logger, f"[fsm][repair][llm] effort={effort} attempt={attempt} raw={raw[:600]}", "llm_repair_raw", effort=effort, attempt=attempt, raw_preview=raw[:600])
             parsed = _parse_llm_repair(raw)
             if parsed is not None:
                 parsed["actions"] = _normalize_actions(parsed.get("actions", []))
+                if logger is not None:
+                    logger.event(
+                        "llm_repair_parsed",
+                        effort=effort,
+                        attempt=attempt,
+                        judgement=parsed.get("judgement"),
+                        mode=parsed.get("mode"),
+                        actions=parsed.get("actions", []),
+                    )
                 return parsed
     finally:
         llm.reasoning_effort = old_effort
@@ -550,12 +610,15 @@ def _execute_action_steps(
     steps: list[dict[str, Any]],
     state_id: str,
     matches_provider,
+    logger: FsmRunLogger | None = None,
+    action_id: str = "",
+    attempt: int | str = "",
 ) -> bool:
     for idx, step in enumerate(steps, start=1):
         stype = str(step.get("type", "click"))
         if stype == "run_preset":
             name = str(step.get("name", ""))
-            print(f"[fsm][action][preset] step={idx} name={name}")
+            _log(logger, f"[fsm][action][preset] step={idx} name={name}", "action_preset", state_id=state_id, action_id=action_id, attempt=attempt, step=idx, name=name)
             ok = run_preset(
                 name,
                 emulator=emulator,
@@ -573,9 +636,20 @@ def _execute_action_steps(
         y = int(step.get("y", 500))
         brief = str(step.get("brief", "")).strip()
         rx, ry = mapper.point_to_real(x, y)
-        print(f"[fsm][action][click] step={idx} logical=({x},{y}) real=({rx},{ry}) brief={brief}")
+        _log(
+            logger,
+            f"[fsm][action][click] step={idx} logical=({x},{y}) real=({rx},{ry}) brief={brief}",
+            "action_click",
+            state_id=state_id,
+            action_id=action_id,
+            attempt=attempt,
+            step=idx,
+            logical=[x, y],
+            real=[rx, ry],
+            brief=brief,
+        )
         emulator.tap(rx, ry)
-        print(f"[fsm][action][wait] sleep={ACTION_CLICK_WAIT_S}s after step={idx}")
+        _log(logger, f"[fsm][action][wait] sleep={ACTION_CLICK_WAIT_S}s after step={idx}", "action_wait", state_id=state_id, action_id=action_id, attempt=attempt, step=idx, sleep_s=ACTION_CLICK_WAIT_S)
         time.sleep(ACTION_CLICK_WAIT_S)
     return True
 
@@ -631,48 +705,66 @@ def _execute_state_action(
     system_prompt: str,
     graph: dict[str, Any],
     prefer_reachable_first: bool,
+    logger: FsmRunLogger | None = None,
 ) -> tuple[bool, Any]:
     state_meta = _load_json(state_dir / "state.json")
     actions = [a for a in state_meta.get("actions", []) if isinstance(a, dict) and a.get("enabled", True)]
     if not actions:
-        print(f"[fsm][reason] action not triggered: state={state_id} has no enabled actions")
+        _log(logger, f"[fsm][reason] action not triggered: state={state_id} has no enabled actions", "action_skipped", state_id=state_id, reason="no_enabled_actions")
         return False, frame_before
     action = actions[0]
     action_id = str(action.get("action_id", "action_main"))
     steps = action.get("steps", [])
     if not isinstance(steps, list) or not steps:
-        print(f"[fsm][reason] action not triggered: state={state_id} action={action_id} has empty steps")
+        _log(logger, f"[fsm][reason] action not triggered: state={state_id} action={action_id} has empty steps", "action_skipped", state_id=state_id, action_id=action_id, reason="empty_steps")
         return False, frame_before
 
     # normal attempts
     for attempt in range(1, MAX_RETRY_PER_ACTION + 1):
-        print(f"[fsm][action] state={state_id} action={action_id} attempt={attempt}")
-        if not _execute_action_steps(emulator, mapper, vision, state_dir, steps, state_id, matches_provider):
+        _log(logger, f"[fsm][action] state={state_id} action={action_id} attempt={attempt}", "action_attempt", state_id=state_id, action_id=action_id, attempt=attempt, steps=steps)
+        if not _execute_action_steps(emulator, mapper, vision, state_dir, steps, state_id, matches_provider, logger=logger, action_id=action_id, attempt=attempt):
             return False, frame_before
         post = emulator.screenshot(prefer_png=True)
         matches = matches_provider(post)
         reachable = _get_reachable_targets(graph, state_id)
+        if logger is not None:
+            logger.event(
+                "post_action_match",
+                state_id=state_id,
+                action_id=action_id,
+                attempt=attempt,
+                reachable=sorted(reachable),
+                candidates=[summarize_match(m) for m in matches],
+            )
         nxt: MatchResult | None = None
         if prefer_reachable_first and reachable:
             reachable_hits = [m for m in matches if m.success and m.state_id in reachable]
             if reachable_hits:
                 nxt = sorted(reachable_hits, key=lambda m: (-m.passed_all, -m.passed_enabled))[0]
-                print(f"[fsm][transition][reachable] from={state_id} action={action_id} to={nxt.state_id}")
+                _log(logger, f"[fsm][transition][reachable] from={state_id} action={action_id} to={nxt.state_id}", "transition", from_state=state_id, action_id=action_id, to_state=nxt.state_id, reason="reachable")
             else:
-                print(f"[fsm][transition][reachable-miss] from={state_id} action={action_id} reachable={sorted(reachable)}")
+                _log(logger, f"[fsm][transition][reachable-miss] from={state_id} action={action_id} reachable={sorted(reachable)}", "transition_reachable_miss", from_state=state_id, action_id=action_id, reachable=sorted(reachable))
         if nxt is None:
             unknown_pick = _select_best_for_unknown(matches)
             if unknown_pick is not None and unknown_pick.state_id != state_id:
                 if unknown_pick.total_enabled > 0 and unknown_pick.passed_enabled == unknown_pick.total_enabled:
                     nxt = unknown_pick
-                    print(f"[fsm][transition][unknown-fallback] from={state_id} action={action_id} to={nxt.state_id}")
+                    _log(logger, f"[fsm][transition][unknown-fallback] from={state_id} action={action_id} to={nxt.state_id}", "transition", from_state=state_id, action_id=action_id, to_state=nxt.state_id, reason="unknown-fallback")
                     if nxt.state_id not in reachable:
-                        _append_graph_edge(state_id, action_id, nxt.state_id)
-                        print(f"[fsm][edge][added] from={state_id} action={action_id} to={nxt.state_id} reason=unknown-fallback")
+                        _append_graph_edge(state_id, action_id, nxt.state_id, logger=logger, reason="unknown-fallback")
+                        _log(logger, f"[fsm][edge][added] from={state_id} action={action_id} to={nxt.state_id} reason=unknown-fallback", "edge_added", from_state=state_id, action_id=action_id, to_state=nxt.state_id, reason="unknown-fallback")
                 else:
-                    print(
+                    _log(
+                        logger,
                         f"[fsm][transition][unknown-fallback-rejected] from={state_id} action={action_id} "
-                        f"candidate={unknown_pick.state_id} enabled_pass={unknown_pick.passed_enabled}/{unknown_pick.total_enabled}"
+                        f"candidate={unknown_pick.state_id} enabled_pass={unknown_pick.passed_enabled}/{unknown_pick.total_enabled}",
+                        "transition_rejected",
+                        from_state=state_id,
+                        action_id=action_id,
+                        candidate=unknown_pick.state_id,
+                        reason="unknown-fallback-enabled-miss",
+                        passed_enabled=unknown_pick.passed_enabled,
+                        total_enabled=unknown_pick.total_enabled,
                     )
         if nxt is not None and nxt.state_id != state_id:
             runtime["last_state_id"] = nxt.state_id
@@ -689,7 +781,7 @@ def _execute_state_action(
             runtime["pending_from_state_id"] = state_id
             runtime["pending_action_id"] = action_id
             _save_runtime(runtime)
-            print(f"[fsm][transition][to-unknown] from={state_id} action={action_id} reason=original-state-no-longer-matched")
+            _log(logger, f"[fsm][transition][to-unknown] from={state_id} action={action_id} reason=original-state-no-longer-matched", "transition", from_state=state_id, action_id=action_id, to_state=None, reason="original-state-no-longer-matched")
             return True, post
 
     # repair loop
@@ -704,13 +796,14 @@ def _execute_state_action(
             state_slug=str(state_meta.get("slug", state_id)),
             last_actions=steps,
             fail_index=idx,
+            logger=logger,
         )
         runtime["llm_turn_count"] = int(runtime.get("llm_turn_count", 0)) + 1
         _save_runtime(runtime)
         if repair is None:
             continue
         if not repair.get("actions"):
-            print(f"[fsm][repair] skip empty actions effort={effort}")
+            _log(logger, f"[fsm][repair] skip empty actions effort={effort}", "repair_skipped", effort=effort, reason="empty_actions")
             continue
         steps = _apply_repair_result(steps, repair)
         action["version"] = int(action.get("version", 1)) + 1
@@ -718,33 +811,49 @@ def _execute_state_action(
         state_meta["updated_at"] = _now_iso()
         _save_json(state_dir / "state.json", state_meta)
 
-        print(f"[fsm][repair] effort={effort} mode={repair.get('mode')} judgement={repair.get('judgement')}")
-        if not _execute_action_steps(emulator, mapper, vision, state_dir, steps, state_id, matches_provider):
+        _log(logger, f"[fsm][repair] effort={effort} mode={repair.get('mode')} judgement={repair.get('judgement')}", "repair_applied", effort=effort, mode=repair.get("mode"), judgement=repair.get("judgement"), steps=steps)
+        if not _execute_action_steps(emulator, mapper, vision, state_dir, steps, state_id, matches_provider, logger=logger, action_id=action_id, attempt=f"repair:{effort}"):
             continue
         post2 = emulator.screenshot(prefer_png=True)
         matches2 = matches_provider(post2)
         reachable2 = _get_reachable_targets(graph, state_id)
+        if logger is not None:
+            logger.event(
+                "post_repair_match",
+                state_id=state_id,
+                action_id=action_id,
+                effort=effort,
+                reachable=sorted(reachable2),
+                candidates=[summarize_match(m) for m in matches2],
+            )
         nxt2: MatchResult | None = None
         if prefer_reachable_first and reachable2:
             reachable_hits2 = [m for m in matches2 if m.success and m.state_id in reachable2]
             if reachable_hits2:
                 nxt2 = sorted(reachable_hits2, key=lambda m: (-m.passed_all, -m.passed_enabled))[0]
-                print(f"[fsm][transition][reachable] from={state_id} action={action_id} to={nxt2.state_id} after_repair={effort}")
+                _log(logger, f"[fsm][transition][reachable] from={state_id} action={action_id} to={nxt2.state_id} after_repair={effort}", "transition", from_state=state_id, action_id=action_id, to_state=nxt2.state_id, reason="reachable-after-repair", effort=effort)
             else:
-                print(f"[fsm][transition][reachable-miss] from={state_id} action={action_id} after_repair={effort}")
+                _log(logger, f"[fsm][transition][reachable-miss] from={state_id} action={action_id} after_repair={effort}", "transition_reachable_miss", from_state=state_id, action_id=action_id, reachable=sorted(reachable2), effort=effort)
         if nxt2 is None:
             unknown_pick2 = _select_best_for_unknown(matches2)
             if unknown_pick2 is not None and unknown_pick2.state_id != state_id:
                 if unknown_pick2.total_enabled > 0 and unknown_pick2.passed_enabled == unknown_pick2.total_enabled:
                     nxt2 = unknown_pick2
-                    print(f"[fsm][transition][unknown-fallback] from={state_id} action={action_id} to={nxt2.state_id} after_repair={effort}")
+                    _log(logger, f"[fsm][transition][unknown-fallback] from={state_id} action={action_id} to={nxt2.state_id} after_repair={effort}", "transition", from_state=state_id, action_id=action_id, to_state=nxt2.state_id, reason="unknown-fallback-after-repair", effort=effort)
                     if nxt2.state_id not in reachable2:
-                        _append_graph_edge(state_id, action_id, nxt2.state_id)
-                        print(f"[fsm][edge][added] from={state_id} action={action_id} to={nxt2.state_id} reason=unknown-fallback-after-repair")
+                        _append_graph_edge(state_id, action_id, nxt2.state_id, logger=logger, reason="unknown-fallback-after-repair")
+                        _log(logger, f"[fsm][edge][added] from={state_id} action={action_id} to={nxt2.state_id} reason=unknown-fallback-after-repair", "edge_added", from_state=state_id, action_id=action_id, to_state=nxt2.state_id, reason="unknown-fallback-after-repair")
                 else:
-                    print(
+                    _log(
+                        logger,
                         f"[fsm][transition][unknown-fallback-rejected] from={state_id} action={action_id} after_repair={effort} "
-                        f"candidate={unknown_pick2.state_id} enabled_pass={unknown_pick2.passed_enabled}/{unknown_pick2.total_enabled}"
+                        f"candidate={unknown_pick2.state_id} enabled_pass={unknown_pick2.passed_enabled}/{unknown_pick2.total_enabled}",
+                        "transition_rejected",
+                        from_state=state_id,
+                        action_id=action_id,
+                        candidate=unknown_pick2.state_id,
+                        reason="unknown-fallback-enabled-miss-after-repair",
+                        effort=effort,
                     )
         if nxt2 is not None and nxt2.state_id != state_id:
             runtime["last_state_id"] = nxt2.state_id
@@ -764,13 +873,13 @@ def _execute_state_action(
             runtime["pending_action_id"] = action_id
             _save_runtime(runtime)
             _append_experience(f"repair success(to-unknown): {state_meta.get('slug', state_id)}; mode={repair.get('mode')} effort={effort}")
-            print(f"[fsm][transition][to-unknown] from={state_id} action={action_id} after_repair={effort}")
+            _log(logger, f"[fsm][transition][to-unknown] from={state_id} action={action_id} after_repair={effort}", "transition", from_state=state_id, action_id=action_id, to_state=None, reason="to-unknown-after-repair", effort=effort)
             return True, post2
 
     runtime["repair_fail_count"] = int(runtime.get("repair_fail_count", 0)) + 1
     runtime["last_transition_ok"] = False
     _save_runtime(runtime)
-    print("[fsm][repair] failed for low/mid/high, exiting")
+    _log(logger, "[fsm][repair] failed for low/mid/high, exiting", "repair_failed", state_id=state_id, action_id=action_id, repair_fail_count=runtime["repair_fail_count"])
     raise SystemExit(1)
 
 
@@ -789,16 +898,36 @@ def run_agent_loop_fsm(*, session_id: str, serial: str | None = None, adb_path: 
     runtime.setdefault("pending_from_state_id", None)
     runtime.setdefault("pending_action_id", None)
     _save_runtime(runtime)
+    logger = FsmRunLogger(str(runtime["run_id"]))
+    logger.event(
+        "run_start",
+        session_id=session_id,
+        serial=target_serial,
+        adb_path=adb_path,
+        interval_s=interval_s,
+        log_path=logger.path,
+    )
+    logger.text(f"[fsm][log] path={logger.path}", "log_path", log_path=logger.path)
 
     prev_frame = None
 
     while True:
         llm_session_id = _refresh_session_if_needed(runtime, session_id)
         system_prompt = _build_system_prompt_with_experience()
+        logger.event(
+            "loop_start",
+            llm_session_id=llm_session_id,
+            llm_turn_count=runtime.get("llm_turn_count", 0),
+            session_tier=runtime.get("session_tier"),
+            last_state_id=runtime.get("last_state_id"),
+            pending_from_state_id=runtime.get("pending_from_state_id"),
+            pending_action_id=runtime.get("pending_action_id"),
+        )
 
         frame = emulator.screenshot(prefer_png=True)
         if frame.shape[1] != 1280 or frame.shape[0] != 720:
             frame = cv2.resize(frame, (1280, 720), interpolation=cv2.INTER_LINEAR)
+        logger.event("frame_captured", width=int(frame.shape[1]), height=int(frame.shape[0]))
 
         metas = _iter_state_meta()
 
@@ -807,19 +936,26 @@ def run_agent_loop_fsm(*, session_id: str, serial: str | None = None, adb_path: 
 
         matches = matches_provider(frame)
         dbg = [f"{m.state_id}:{m.passed_enabled}/{m.total_enabled}|all={m.passed_all}/{m.total_all}|ok={m.success}" for m in matches]
-        print(f"[fsm][match] candidates={dbg}")
+        logger.text(f"[fsm][match] candidates={dbg}", "match_candidates", candidates=[summarize_match(m) for m in matches])
 
         best = _select_best_for_unknown(matches)
         if best is None:
-            print("[fsm] unknown state, requesting llm")
+            logger.text("[fsm] unknown state, requesting llm", "unknown_state")
             payload = _request_llm_payload(llm, llm_session_id, frame, system_prompt, _page_type_summaries(metas))
             runtime["llm_turn_count"] = int(runtime.get("llm_turn_count", 0)) + 1
             _save_runtime(runtime)
             if payload is None:
-                print("[fsm][llm] invalid payload")
+                logger.text("[fsm][llm] invalid payload", "llm_payload_invalid", llm_session_id=llm_session_id)
                 prev_frame = frame
                 time.sleep(interval_s)
                 continue
+            logger.event(
+                "llm_payload_parsed",
+                slug=payload.get("slug"),
+                possible_page_type=payload.get("possible_page_type"),
+                elements_count=len(payload.get("elements", [])),
+                actions_count=len(payload.get("actions", [])),
+            )
             merged = _try_merge_page_type(
                 llm=llm,
                 session_id=llm_session_id,
@@ -829,21 +965,27 @@ def run_agent_loop_fsm(*, session_id: str, serial: str | None = None, adb_path: 
                 mapper=mapper,
                 vision=vision,
                 metas=metas,
+                logger=logger,
             )
             if merged is None:
-                new_state_id, new_state_dir = _create_state_from_llm(payload, frame, mapper, vision)
-                _append_graph_node(new_state_id, str(payload.get("slug", "state")))
-                print(f"[fsm] new_state state_id={new_state_id} dir={new_state_dir}")
+                new_state_id, new_state_dir = _create_state_from_llm(payload, frame, mapper, vision, logger=logger)
+                _append_graph_node(new_state_id, str(payload.get("slug", "state")), logger=logger)
+                logger.text(f"[fsm] new_state state_id={new_state_id} dir={new_state_dir}", "state_created_console", state_id=new_state_id, state_dir=new_state_dir)
             else:
                 new_state_id, new_state_dir = merged
-                print(f"[fsm] merged_state state_id={new_state_id} dir={new_state_dir}")
+                logger.text(f"[fsm] merged_state state_id={new_state_id} dir={new_state_dir}", "state_merged_console", state_id=new_state_id, state_dir=new_state_dir)
             pending_from = runtime.get("pending_from_state_id")
             pending_action = runtime.get("pending_action_id")
             if isinstance(pending_from, str) and pending_from and isinstance(pending_action, str) and pending_action:
-                _append_graph_edge(pending_from, pending_action, new_state_id)
-                print(
+                _append_graph_edge(pending_from, pending_action, new_state_id, logger=logger, reason="pending-unknown-resolution")
+                logger.text(
                     f"[fsm][edge][added] from={pending_from} action={pending_action} "
-                    f"to={new_state_id} reason=pending-unknown-resolution"
+                    f"to={new_state_id} reason=pending-unknown-resolution",
+                    "edge_added",
+                    from_state=pending_from,
+                    action_id=pending_action,
+                    to_state=new_state_id,
+                    reason="pending-unknown-resolution",
                 )
                 runtime["pending_from_state_id"] = None
                 runtime["pending_action_id"] = None
@@ -864,6 +1006,7 @@ def run_agent_loop_fsm(*, session_id: str, serial: str | None = None, adb_path: 
                 system_prompt=system_prompt,
                 graph=_load_json(FSM_GRAPH_PATH),
                 prefer_reachable_first=False,
+                logger=logger,
             )
             prev_frame = post_frame if ok else frame
             _maybe_rotate_session(runtime)
@@ -873,13 +1016,19 @@ def run_agent_loop_fsm(*, session_id: str, serial: str | None = None, adb_path: 
 
         runtime["last_state_id"] = best.state_id
         runtime["last_transition_ok"] = False
+        logger.event("state_selected", state_id=best.state_id, state_dir=best.state_dir, match=summarize_match(best))
         pending_from2 = runtime.get("pending_from_state_id")
         pending_action2 = runtime.get("pending_action_id")
         if isinstance(pending_from2, str) and pending_from2 and isinstance(pending_action2, str) and pending_action2:
-            _append_graph_edge(pending_from2, pending_action2, best.state_id)
-            print(
+            _append_graph_edge(pending_from2, pending_action2, best.state_id, logger=logger, reason="pending-unknown-resolved-to-existing")
+            logger.text(
                 f"[fsm][edge][added] from={pending_from2} action={pending_action2} "
-                f"to={best.state_id} reason=pending-unknown-resolved-to-existing"
+                f"to={best.state_id} reason=pending-unknown-resolved-to-existing",
+                "edge_added",
+                from_state=pending_from2,
+                action_id=pending_action2,
+                to_state=best.state_id,
+                reason="pending-unknown-resolved-to-existing",
             )
             runtime["pending_from_state_id"] = None
             runtime["pending_action_id"] = None
@@ -899,6 +1048,7 @@ def run_agent_loop_fsm(*, session_id: str, serial: str | None = None, adb_path: 
             system_prompt=system_prompt,
             graph=_load_json(FSM_GRAPH_PATH),
             prefer_reachable_first=True,
+            logger=logger,
         )
         prev_frame = post_frame if ok else frame
         _maybe_rotate_session(runtime)
