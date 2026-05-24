@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import time
 from typing import Any, Callable
 
 import cv2
@@ -17,6 +18,11 @@ class VisionEngine:
     mapper: CoordinateMapper
     log_fn: Callable[[str], None] = print
     _ocr_backend_logged: bool = False
+    log_ocr_calls: bool = True
+    ocr_call_count: int = 0
+    ocr_success_count: int = 0
+    ocr_error_count: int = 0
+    ocr_elapsed_s: float = 0.0
 
     def crop_rect(self, frame_rgb: np.ndarray, rect: list[int] | tuple[int, int, int, int] | None) -> np.ndarray:
         if rect is None:
@@ -65,10 +71,13 @@ class VisionEngine:
 
     def ocr(self, frame_rgb: np.ndarray, rect: list[int] | None, white_text: bool = False) -> list[dict[str, Any]]:
         real_rect = self._real_area(frame_rgb, rect)
-        if not self._ocr_backend_logged:
+        if self.log_ocr_calls and not self._ocr_backend_logged:
             self.log_fn("[vision][ocr] backend=sr_tools.ocr(pponnxcr)")
             self._ocr_backend_logged = True
-        self.log_fn(f"[vision][ocr] call mode=single_line white_text={white_text} logical_rect={rect} real_rect={real_rect}")
+        if self.log_ocr_calls:
+            self.log_fn(f"[vision][ocr] call mode=single_line white_text={white_text} logical_rect={rect} real_rect={real_rect}")
+        self.ocr_call_count += 1
+        started = time.perf_counter()
         text = ""
         try:
             if white_text:
@@ -78,6 +87,8 @@ class VisionEngine:
                 if not text:
                     text = sr_ocr.ocr_text_white(frame_rgb, real_rect, lang="zhs").strip()
         except Exception as exc:  # noqa: BLE001
+            self.ocr_error_count += 1
+            self.ocr_elapsed_s += time.perf_counter() - started
             self.log_fn(
                 f"[vision][ocr] error type={type(exc).__name__} message={exc} logical_rect={rect} real_rect={real_rect}"
             )
@@ -105,8 +116,28 @@ class VisionEngine:
                     "center": (int(cx) + ox, int(cy) + oy),
                 }
             )
-        self.log_fn(f"[vision][ocr] done candidates={len(out)} logical_rect={rect}")
+        self.ocr_elapsed_s += time.perf_counter() - started
+        if out:
+            self.ocr_success_count += 1
+        if self.log_ocr_calls:
+            self.log_fn(f"[vision][ocr] done candidates={len(out)} logical_rect={rect}")
         return out
+
+    def reset_ocr_stats(self) -> None:
+        self.ocr_call_count = 0
+        self.ocr_success_count = 0
+        self.ocr_error_count = 0
+        self.ocr_elapsed_s = 0.0
+
+    def consume_ocr_stats(self) -> dict[str, int | float]:
+        stats = {
+            "calls": self.ocr_call_count,
+            "successes": self.ocr_success_count,
+            "errors": self.ocr_error_count,
+            "elapsed_s": self.ocr_elapsed_s,
+        }
+        self.reset_ocr_stats()
+        return stats
 
     def save_template_from_rect(self, frame_rgb: np.ndarray, rect: list[int], output_path: Path) -> None:
         crop = self.crop_rect(frame_rgb, rect)

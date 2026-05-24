@@ -326,6 +326,8 @@ HTML = r"""<!doctype html>
     <div class="toolbar">
       <button id="fitBtn">Fit</button>
       <button id="layoutBtn">Layout</button>
+      <button id="thumbnailBtn">Thumbnails</button>
+      <button id="labelBtn">Label Below</button>
       <button id="followBtn" class="active">Follow</button>
       <button id="pauseBtn">Pause</button>
       <div id="status" class="status">loading...</div>
@@ -397,6 +399,36 @@ HTML = r"""<!doctype html>
             'text-valign': 'center',
             'text-halign': 'center',
             'overlay-opacity': 0
+          }
+        },
+        {
+          selector: 'node.thumbnail',
+          style: {
+            'width': 190,
+            'height': 107,
+            'background-image': 'data(thumbnail_url)',
+            'background-fit': 'cover',
+            'background-clip': 'node',
+            'background-opacity': .72,
+            'background-color': '#0e1722',
+            'text-background-color': '#111821',
+            'text-background-opacity': .82,
+            'text-background-padding': 3
+          }
+        },
+        {
+          selector: 'node.label-below',
+          style: {
+            'text-valign': 'bottom',
+            'text-halign': 'center',
+            'text-margin-y': 22,
+            'text-background-color': '#101720',
+            'text-background-opacity': .92,
+            'text-background-padding': 4,
+            'text-border-color': '#2d4058',
+            'text-border-opacity': .9,
+            'text-border-width': 1,
+            'text-max-width': 210
           }
         },
         {
@@ -485,6 +517,8 @@ HTML = r"""<!doctype html>
       lightboxX: 0,
       lightboxY: 0,
       lightboxDrag: null,
+      thumbnails: false,
+      labelsBelow: false,
       follow: true,
       paused: false,
       didInitialLayout: false,
@@ -499,6 +533,8 @@ HTML = r"""<!doctype html>
     const incomingEl = document.getElementById('incoming');
     const fitBtn = document.getElementById('fitBtn');
     const layoutBtn = document.getElementById('layoutBtn');
+    const thumbnailBtn = document.getElementById('thumbnailBtn');
+    const labelBtn = document.getElementById('labelBtn');
     const followBtn = document.getElementById('followBtn');
     const pauseBtn = document.getElementById('pauseBtn');
     const lightboxEl = document.getElementById('lightbox');
@@ -516,6 +552,12 @@ HTML = r"""<!doctype html>
     function nodeLabel(node) {
       const slug = node.slug || node.state_id || 'state';
       return `${slug}\n${shortId(node.state_id)}`;
+    }
+
+    function templateImageUrl(node) {
+      const stateId = node.state_id || '';
+      const slug = node.slug || '';
+      return `/api/template-image?state_id=${encodeURIComponent(stateId)}&slug=${encodeURIComponent(slug)}`;
     }
 
     function edgeId(edge, index) {
@@ -598,6 +640,7 @@ HTML = r"""<!doctype html>
           const data = {
             id,
             label: nodeLabel(node),
+            thumbnail_url: templateImageUrl(node),
             slug: node.slug || id,
             state_id: id
           };
@@ -666,6 +709,7 @@ HTML = r"""<!doctype html>
       if (runtime.last_state_id) {
         state.prevCurrent = runtime.last_state_id;
       }
+      updateNodeViewMode(false);
       renderSide();
       statusEl.textContent = [
         `nodes=${graph.nodes.length}`,
@@ -828,6 +872,18 @@ HTML = r"""<!doctype html>
       lightboxStageEl.classList.remove('dragging');
     }
 
+    function updateNodeViewMode(relayout = true) {
+      cy.nodes().toggleClass('thumbnail', state.thumbnails);
+      cy.nodes().toggleClass('label-below', state.labelsBelow);
+      thumbnailBtn.classList.toggle('active', state.thumbnails);
+      labelBtn.classList.toggle('active', state.labelsBelow);
+      labelBtn.textContent = state.labelsBelow ? 'Label Inside' : 'Label Below';
+      if (relayout) {
+        runLayout(true);
+        window.setTimeout(() => cy.fit(cy.elements(), 60), 320);
+      }
+    }
+
     async function loadTemplateForSelection(selected, node) {
       if (!selected) {
         renderAnnotation(null);
@@ -899,6 +955,14 @@ HTML = r"""<!doctype html>
 
     fitBtn.addEventListener('click', () => cy.fit(cy.elements(), 60));
     layoutBtn.addEventListener('click', () => runLayout(true));
+    thumbnailBtn.addEventListener('click', () => {
+      state.thumbnails = !state.thumbnails;
+      updateNodeViewMode(true);
+    });
+    labelBtn.addEventListener('click', () => {
+      state.labelsBelow = !state.labelsBelow;
+      updateNodeViewMode(true);
+    });
     followBtn.addEventListener('click', () => {
       state.follow = !state.follow;
       followBtn.classList.toggle('active', state.follow);

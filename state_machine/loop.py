@@ -18,11 +18,14 @@ from state_machine.constants import (
     FSM_GRAPH_PATH,
     FSM_TEMPLATES_DIR,
     HARD_LIMIT,
+    LOCAL_FLOW_MAX_STEPS,
+    LOCAL_FLOW_NO_PROGRESS_LIMIT,
     LLM_PARSE_RETRY,
     MAX_RETRY_PER_ACTION,
     MID_LIMIT,
     REPAIR_EFFORTS,
     SCHEMA_VERSION,
+    SCREEN_CHANGE_DIFF_THRESHOLD,
     SOFT_LIMIT,
 )
 from state_machine.io import (
@@ -661,6 +664,238 @@ def _apply_repair_result(action_steps: list[dict[str, Any]], repair: dict[str, A
     return list(action_steps) + list(new_steps)
 
 
+def _screen_changed(before_rgb, after_rgb, threshold: float = SCREEN_CHANGE_DIFF_THRESHOLD) -> tuple[bool, float]:
+    if before_rgb is None or after_rgb is None:
+        return False, 0.0
+    if before_rgb.shape != after_rgb.shape:
+        return True, 1.0
+    diff = cv2.absdiff(before_rgb, after_rgb)
+    score = float(diff.mean()) / 255.0
+    return score >= threshold, score
+
+
+def _parse_llm_page_local_step(text: str) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    payload["done"] = bool(payload.get("done", False))
+    action = payload.get("action")
+    if action is None:
+        payload["action"] = None
+        return payload if payload["done"] else None
+    if not isinstance(action, dict):
+        return None
+    normalized = _normalize_actions([action])
+    if not normalized:
+        return None
+    payload["action"] = normalized[0]
+    return payload
+
+
+def _request_llm_page_local_step(
+    llm: DoubaoClient,
+    session_id: str,
+    frame_rgb,
+    system_prompt: str,
+    *,
+    state_slug: str,
+    previous_steps: list[dict[str, Any]],
+    no_progress_count: int,
+    logger: FsmRunLogger | None = None,
+) -> dict[str, Any] | None:
+    text = json.dumps(
+        {
+            "mode": "PAGE_LOCAL_STEP",
+            "instruction": (
+                "当前正在处理同一页面内的多步流程。停留在同一状态不一定是失败；"
+                "如果画面/文字/可操作对象仍在变化，说明流程可能正在推进。"
+                "请基于当前截图给出下一步最小动作，或在应交还 FSM 重新识别时输出 done=true。"
+                "不要重复 previous_steps 中已经证明无进展的动作。"
+                "只输出严格 JSON。"
+            ),
+            "current_state": state_slug,
+            "previous_steps": previous_steps[-8:],
+            "no_progress_count": no_progress_count,
+            "allowed_actions": [
+                {"type": "click", "x": "integer", "y": "integer", "brief": "string"},
+                {"type": "run_preset", "name": "wait_till_combat_end|find_and_interact_with_next_object", "brief": "string"},
+            ],
+            "output_schema": {
+                "done": "boolean",
+                "reason": "string",
+                "action": {"type": "click|run_preset", "x": "integer optional", "y": "integer optional", "name": "string optional", "brief": "string"},
+                "expected_effect": "screen_changes|text_changes|state_changes|overlay_appears|unknown",
+            },
+        },
+        ensure_ascii=False,
+    )
+    prompt_fix = "上次JSON无效。只输出一个完整JSON对象，字段为 done, reason, action, expected_effect。"
+    for attempt in range(1, LLM_PARSE_RETRY + 2):
+        msg = _build_user_message_from_frame(frame_rgb, text if attempt == 1 else prompt_fix)
+        resp = llm.chat_with_session(
+            session_id=session_id,
+            system_prompt=system_prompt,
+            user_message=msg,
+            tools=[],
+            tool_choice="none",
+        )
+        raw = _normalize_assistant_text(resp["choices"][0]["message"].get("content"))
+        _save_llm_raw_debug(session_id, attempt, raw, "page_local")
+        _log(logger, f"[fsm][local][llm] attempt={attempt} raw={raw[:600]}", "llm_page_local_raw", attempt=attempt, raw_preview=raw[:600])
+        parsed = _parse_llm_page_local_step(raw)
+        if parsed is not None:
+            if logger is not None:
+                logger.event("llm_page_local_parsed", attempt=attempt, parsed=parsed)
+            return parsed
+    return None
+
+
+def _resolve_transition_after_progress(
+    *,
+    state_id: str,
+    action_id: str,
+    matches: list[MatchResult],
+    graph: dict[str, Any],
+    runtime: dict[str, Any],
+    prefer_reachable_first: bool,
+    logger: FsmRunLogger | None,
+    reason_suffix: str,
+) -> MatchResult | None:
+    reachable = _get_reachable_targets(graph, state_id)
+    nxt: MatchResult | None = None
+    if prefer_reachable_first and reachable:
+        reachable_hits = [m for m in matches if m.success and m.state_id in reachable]
+        if reachable_hits:
+            nxt = sorted(reachable_hits, key=lambda m: (-m.passed_all, -m.passed_enabled))[0]
+            _log(logger, f"[fsm][transition][reachable] from={state_id} action={action_id} to={nxt.state_id} {reason_suffix}", "transition", from_state=state_id, action_id=action_id, to_state=nxt.state_id, reason=f"reachable{reason_suffix}")
+    if nxt is None:
+        unknown_pick = _select_best_for_unknown(matches)
+        if unknown_pick is not None and unknown_pick.state_id != state_id:
+            if unknown_pick.total_enabled > 0 and unknown_pick.passed_enabled == unknown_pick.total_enabled:
+                nxt = unknown_pick
+                _log(logger, f"[fsm][transition][unknown-fallback] from={state_id} action={action_id} to={nxt.state_id} {reason_suffix}", "transition", from_state=state_id, action_id=action_id, to_state=nxt.state_id, reason=f"unknown-fallback{reason_suffix}")
+                if nxt.state_id not in reachable:
+                    _append_graph_edge(state_id, action_id, nxt.state_id, logger=logger, reason=f"unknown-fallback{reason_suffix}")
+    if nxt is not None and nxt.state_id != state_id:
+        runtime["last_state_id"] = nxt.state_id
+        runtime["last_transition_ok"] = True
+        runtime["pending_from_state_id"] = None
+        runtime["pending_action_id"] = None
+        _save_runtime(runtime)
+        return nxt
+    return None
+
+
+def _run_page_local_flow(
+    *,
+    emulator: EmulatorClient,
+    mapper: CoordinateMapper,
+    vision: VisionEngine,
+    state_id: str,
+    state_dir: Path,
+    action_id: str,
+    start_frame,
+    matches_provider,
+    runtime: dict[str, Any],
+    llm: DoubaoClient,
+    llm_session_id: str,
+    system_prompt: str,
+    graph: dict[str, Any],
+    prefer_reachable_first: bool,
+    state_slug: str,
+    logger: FsmRunLogger | None = None,
+) -> tuple[bool, Any]:
+    current = start_frame
+    previous_steps: list[dict[str, Any]] = []
+    no_progress_count = 0
+    made_progress = False
+    for step_idx in range(1, LOCAL_FLOW_MAX_STEPS + 1):
+        decision = _request_llm_page_local_step(
+            llm,
+            llm_session_id,
+            current,
+            system_prompt,
+            state_slug=state_slug,
+            previous_steps=previous_steps,
+            no_progress_count=no_progress_count,
+            logger=logger,
+        )
+        runtime["llm_turn_count"] = int(runtime.get("llm_turn_count", 0)) + 1
+        _save_runtime(runtime)
+        if decision is None:
+            _log(logger, f"[fsm][local] no valid llm decision step={step_idx}", "page_local_invalid", state_id=state_id, step=step_idx)
+            return made_progress, current
+        if decision.get("done", False):
+            _log(logger, f"[fsm][local] done step={step_idx} reason={decision.get('reason', '')}", "page_local_done", state_id=state_id, step=step_idx, reason=decision.get("reason", ""))
+            return True, current
+        action = decision.get("action")
+        if not isinstance(action, dict):
+            return made_progress, current
+        previous_steps.append({"action": action, "reason": decision.get("reason", ""), "expected_effect": decision.get("expected_effect", "")})
+        if not _execute_action_steps(
+            emulator,
+            mapper,
+            vision,
+            state_dir,
+            [action],
+            state_id,
+            matches_provider,
+            logger=logger,
+            action_id=action_id,
+            attempt=f"local:{step_idx}",
+        ):
+            return made_progress, current
+        post = emulator.screenshot(prefer_png=True)
+        changed, diff_score = _screen_changed(current, post)
+        matches = matches_provider(post)
+        if logger is not None:
+            logger.event(
+                "page_local_step_result",
+                state_id=state_id,
+                action_id=action_id,
+                step=step_idx,
+                changed=changed,
+                diff_score=diff_score,
+                candidates=[summarize_match(m) for m in matches],
+            )
+        nxt = _resolve_transition_after_progress(
+            state_id=state_id,
+            action_id=action_id,
+            matches=matches,
+            graph=graph,
+            runtime=runtime,
+            prefer_reachable_first=prefer_reachable_first,
+            logger=logger,
+            reason_suffix="-page-local",
+        )
+        if nxt is not None:
+            return True, post
+        curr_match = _find_match_by_state(matches, state_id)
+        if curr_match is None or not curr_match.success:
+            runtime["last_state_id"] = None
+            runtime["last_transition_ok"] = True
+            runtime["pending_from_state_id"] = state_id
+            runtime["pending_action_id"] = action_id
+            _save_runtime(runtime)
+            _log(logger, f"[fsm][local][transition][to-unknown] from={state_id} action={action_id}", "transition", from_state=state_id, action_id=action_id, to_state=None, reason="page-local-original-state-no-longer-matched")
+            return True, post
+        if changed:
+            made_progress = True
+            no_progress_count = 0
+            current = post
+            continue
+        no_progress_count += 1
+        current = post
+        if no_progress_count >= LOCAL_FLOW_NO_PROGRESS_LIMIT:
+            _log(logger, f"[fsm][local] no progress limit hit state={state_id}", "page_local_no_progress", state_id=state_id, limit=LOCAL_FLOW_NO_PROGRESS_LIMIT)
+            return made_progress, current
+    _log(logger, f"[fsm][local] max steps reached state={state_id} progress={made_progress}", "page_local_max_steps", state_id=state_id, max_steps=LOCAL_FLOW_MAX_STEPS, made_progress=made_progress)
+    return made_progress, current
+
+
 def _maybe_rotate_session(runtime: dict[str, Any]) -> bool:
     turns = int(runtime.get("llm_turn_count", 0))
     tier = str(runtime.get("session_tier", "soft"))
@@ -719,6 +954,7 @@ def _execute_state_action(
         _log(logger, f"[fsm][reason] action not triggered: state={state_id} action={action_id} has empty steps", "action_skipped", state_id=state_id, action_id=action_id, reason="empty_steps")
         return False, frame_before
 
+    last_attempt_frame = frame_before
     # normal attempts
     for attempt in range(1, MAX_RETRY_PER_ACTION + 1):
         _log(logger, f"[fsm][action] state={state_id} action={action_id} attempt={attempt}", "action_attempt", state_id=state_id, action_id=action_id, attempt=attempt, steps=steps)
@@ -783,6 +1019,39 @@ def _execute_state_action(
             _save_runtime(runtime)
             _log(logger, f"[fsm][transition][to-unknown] from={state_id} action={action_id} reason=original-state-no-longer-matched", "transition", from_state=state_id, action_id=action_id, to_state=None, reason="original-state-no-longer-matched")
             return True, post
+        changed, diff_score = _screen_changed(last_attempt_frame, post)
+        if changed:
+            _log(
+                logger,
+                f"[fsm][local] same state but screen changed diff={diff_score:.4f}; enter page-local flow",
+                "page_local_enter",
+                state_id=state_id,
+                action_id=action_id,
+                attempt=attempt,
+                diff_score=diff_score,
+            )
+            local_ok, local_frame = _run_page_local_flow(
+                emulator=emulator,
+                mapper=mapper,
+                vision=vision,
+                state_id=state_id,
+                state_dir=state_dir,
+                action_id=action_id,
+                start_frame=post,
+                matches_provider=matches_provider,
+                runtime=runtime,
+                llm=llm,
+                llm_session_id=llm_session_id,
+                system_prompt=system_prompt,
+                graph=graph,
+                prefer_reachable_first=prefer_reachable_first,
+                state_slug=str(state_meta.get("slug", state_id)),
+                logger=logger,
+            )
+            if local_ok:
+                return True, local_frame
+            break
+        last_attempt_frame = post
 
     # repair loop
     for idx, effort in enumerate(REPAIR_EFFORTS, start=1):
@@ -875,6 +1144,39 @@ def _execute_state_action(
             _append_experience(f"repair success(to-unknown): {state_meta.get('slug', state_id)}; mode={repair.get('mode')} effort={effort}")
             _log(logger, f"[fsm][transition][to-unknown] from={state_id} action={action_id} after_repair={effort}", "transition", from_state=state_id, action_id=action_id, to_state=None, reason="to-unknown-after-repair", effort=effort)
             return True, post2
+        changed2, diff_score2 = _screen_changed(post, post2)
+        if changed2:
+            _log(
+                logger,
+                f"[fsm][local] repair kept same state but screen changed diff={diff_score2:.4f}; enter page-local flow",
+                "page_local_enter_after_repair",
+                state_id=state_id,
+                action_id=action_id,
+                effort=effort,
+                diff_score=diff_score2,
+            )
+            local_ok2, local_frame2 = _run_page_local_flow(
+                emulator=emulator,
+                mapper=mapper,
+                vision=vision,
+                state_id=state_id,
+                state_dir=state_dir,
+                action_id=action_id,
+                start_frame=post2,
+                matches_provider=matches_provider,
+                runtime=runtime,
+                llm=llm,
+                llm_session_id=llm_session_id,
+                system_prompt=system_prompt,
+                graph=graph,
+                prefer_reachable_first=prefer_reachable_first,
+                state_slug=str(state_meta.get("slug", state_id)),
+                logger=logger,
+            )
+            if local_ok2:
+                runtime["repair_fail_count"] = 0
+                _save_runtime(runtime)
+                return True, local_frame2
 
     runtime["repair_fail_count"] = int(runtime.get("repair_fail_count", 0)) + 1
     runtime["last_transition_ok"] = False
@@ -889,7 +1191,7 @@ def run_agent_loop_fsm(*, session_id: str, serial: str | None = None, adb_path: 
     emulator = EmulatorClient(serial=target_serial, adb_path=adb_path)
     llm = DoubaoClient()
     mapper = CoordinateMapper(logical_w=1000, logical_h=1000, real_w=1280, real_h=720)
-    vision = VisionEngine(mapper=mapper)
+    vision = VisionEngine(mapper=mapper, log_ocr_calls=False)
 
     runtime = _load_runtime()
     runtime["run_id"] = uuid.uuid4().hex[:8]
@@ -932,7 +1234,21 @@ def run_agent_loop_fsm(*, session_id: str, serial: str | None = None, adb_path: 
         metas = _iter_state_meta()
 
         def matches_provider(img):
-            return [_eval_state_match(meta, sdir, vision, img) for sdir, meta in metas]
+            vision.reset_ocr_stats()
+            matches = [_eval_state_match(meta, sdir, vision, img) for sdir, meta in metas]
+            ocr_stats = vision.consume_ocr_stats()
+            calls = int(ocr_stats["calls"])
+            if calls > 0:
+                elapsed_s = float(ocr_stats["elapsed_s"])
+                logger.text(
+                    f"[vision][ocr] summary calls={calls} successes={int(ocr_stats['successes'])} errors={int(ocr_stats['errors'])} elapsed={elapsed_s:.2f}s",
+                    "ocr_summary",
+                    calls=calls,
+                    successes=int(ocr_stats["successes"]),
+                    errors=int(ocr_stats["errors"]),
+                    elapsed_s=elapsed_s,
+                )
+            return matches
 
         matches = matches_provider(frame)
         dbg = [f"{m.state_id}:{m.passed_enabled}/{m.total_enabled}|all={m.passed_all}/{m.total_all}|ok={m.success}" for m in matches]
