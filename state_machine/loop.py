@@ -488,6 +488,7 @@ def _try_merge_page_type(
         latest_meta=latest_meta,
         failed_conditions=failed,
         new_payload=llm_payload,
+        raw_debug_dir=logger.llm_raw_dir if logger is not None else None,
     )
     if rev is None or not rev.get("same_page_type", False):
         _log(logger, f"[fsm][merge] reject page_type={page_type} reason=llm_not_same_or_invalid", "merge_rejected", page_type=page_type, reason="llm_not_same_or_invalid")
@@ -585,7 +586,7 @@ def _request_llm_repair(
                 tool_choice="none",
             )
             raw = _normalize_assistant_text(resp["choices"][0]["message"].get("content"))
-            _save_llm_raw_debug(session_id, attempt, raw, f"repair_{effort}")
+            _save_llm_raw_debug(session_id, attempt, raw, f"repair_{effort}", logger.llm_raw_dir if logger is not None else None)
             _log(logger, f"[fsm][repair][llm] effort={effort} attempt={attempt} raw={raw[:600]}", "llm_repair_raw", effort=effort, attempt=attempt, raw_preview=raw[:600])
             parsed = _parse_llm_repair(raw)
             if parsed is not None:
@@ -743,7 +744,7 @@ def _request_llm_page_local_step(
             tool_choice="none",
         )
         raw = _normalize_assistant_text(resp["choices"][0]["message"].get("content"))
-        _save_llm_raw_debug(session_id, attempt, raw, "page_local")
+        _save_llm_raw_debug(session_id, attempt, raw, "page_local", logger.llm_raw_dir if logger is not None else None)
         _log(logger, f"[fsm][local][llm] attempt={attempt} raw={raw[:600]}", "llm_page_local_raw", attempt=attempt, raw_preview=raw[:600])
         parsed = _parse_llm_page_local_step(raw)
         if parsed is not None:
@@ -1200,16 +1201,21 @@ def run_agent_loop_fsm(*, session_id: str, serial: str | None = None, adb_path: 
     runtime.setdefault("pending_from_state_id", None)
     runtime.setdefault("pending_action_id", None)
     _save_runtime(runtime)
-    logger = FsmRunLogger(str(runtime["run_id"]))
+    logger = FsmRunLogger(session_id, str(runtime["run_id"]))
     logger.event(
         "run_start",
         session_id=session_id,
         serial=target_serial,
         adb_path=adb_path,
         interval_s=interval_s,
-        log_path=logger.path,
+        run_dir=logger.run_dir,
+        events_path=logger.events_path,
+        summary_path=logger.summary_path,
+        report_path=logger.report_path,
+        latest_report_path=logger.latest_report_path,
+        llm_raw_dir=logger.llm_raw_dir,
     )
-    logger.text(f"[fsm][log] path={logger.path}", "log_path", log_path=logger.path)
+    logger.text(f"[fsm][log] dir={logger.run_dir}", "log_path", run_dir=logger.run_dir, report_path=logger.report_path, latest_report_path=logger.latest_report_path)
 
     prev_frame = None
 
@@ -1257,7 +1263,7 @@ def run_agent_loop_fsm(*, session_id: str, serial: str | None = None, adb_path: 
         best = _select_best_for_unknown(matches)
         if best is None:
             logger.text("[fsm] unknown state, requesting llm", "unknown_state")
-            payload = _request_llm_payload(llm, llm_session_id, frame, system_prompt, _page_type_summaries(metas))
+            payload = _request_llm_payload(llm, llm_session_id, frame, system_prompt, _page_type_summaries(metas), raw_debug_dir=logger.llm_raw_dir)
             runtime["llm_turn_count"] = int(runtime.get("llm_turn_count", 0)) + 1
             _save_runtime(runtime)
             if payload is None:

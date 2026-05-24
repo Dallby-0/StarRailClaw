@@ -88,10 +88,13 @@ def _parse_llm_condition_revision(text: str) -> dict[str, Any] | None:
     return payload
 
 
-def _save_llm_raw_debug(session_id: str, attempt: int, text: str, kind: str = "normal") -> None:
+def _save_llm_raw_debug(session_id: str, attempt: int, text: str, kind: str = "normal", debug_dir: Path | None = None) -> Path:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    p = FSM_DEBUG_DIR / f"llm_raw_{kind}_{session_id}_attempt{attempt}_{ts}.txt"
+    root = debug_dir or FSM_DEBUG_DIR
+    root.mkdir(parents=True, exist_ok=True)
+    p = root / f"llm_raw_{kind}_{session_id}_attempt{attempt}_{ts}.txt"
     p.write_text(text, encoding="utf-8")
+    return p
 
 
 def _apply_reasoning_effort(llm: DoubaoClient, effort: str | None) -> str | None:
@@ -106,6 +109,7 @@ def _request_llm_payload(
     frame_rgb,
     system_prompt: str,
     page_summaries: list[dict[str, Any]] | None = None,
+    raw_debug_dir: Path | None = None,
 ) -> dict[str, Any] | None:
     context = {
         "mode": "NORMAL",
@@ -127,7 +131,7 @@ def _request_llm_payload(
             tool_choice="none",
         )
         text = _normalize_assistant_text(resp["choices"][0]["message"].get("content"))
-        _save_llm_raw_debug(session_id, attempt, text, "normal")
+        _save_llm_raw_debug(session_id, attempt, text, "normal", raw_debug_dir)
         print(f"[fsm][llm] raw(attempt={attempt})={text[:600]}")
         parsed = _parse_llm_payload(text)
         if parsed is not None:
@@ -146,6 +150,7 @@ def _request_llm_condition_revision(
     latest_meta: dict[str, Any],
     failed_conditions: list[dict[str, Any]],
     new_payload: dict[str, Any],
+    raw_debug_dir: Path | None = None,
 ) -> dict[str, Any] | None:
     text = json.dumps(
         {
@@ -203,7 +208,7 @@ def _request_llm_condition_revision(
             tool_choice="none",
         )
         raw = _normalize_assistant_text(resp["choices"][0]["message"].get("content"))
-        _save_llm_raw_debug(session_id, attempt, raw, "merge_condition")
+        _save_llm_raw_debug(session_id, attempt, raw, "merge_condition", raw_debug_dir)
         print(f"[fsm][merge][llm] raw(attempt={attempt})={raw[:600]}")
         parsed = _parse_llm_condition_revision(raw)
         if parsed is not None:
