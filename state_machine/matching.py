@@ -117,6 +117,14 @@ def _select_enabled_conditions(
         score_sum += _discrimination_score(c)
         if score_sum >= MATCH_DISCRIMINATION_TARGET:
             break
+    if len(selected) == 1 and selected[0].get("kind") == "text_line_contains":
+        for c in ordered:
+            if c is selected[0]:
+                continue
+            if _stability_score(c) >= STABILITY_SCORE["mid"]:
+                selected.append(c)
+                score_sum += _discrimination_score(c)
+                break
     if score_sum < MATCH_DISCRIMINATION_TARGET:
         selected = ordered
 
@@ -127,19 +135,27 @@ def _select_enabled_conditions(
     return conditions, weak
 
 
-def _eval_state_match(meta: dict[str, Any], state_dir: Path, vision: VisionEngine, frame_rgb) -> MatchResult:
+def _eval_state_match(
+    meta: dict[str, Any],
+    state_dir: Path,
+    vision: VisionEngine,
+    frame_rgb,
+    *,
+    include_disabled: bool = False,
+) -> MatchResult:
     conds = [c for c in meta.get("match_conditions", []) if isinstance(c, dict)]
     enabled_conds = [c for c in conds if c.get("enabled", False)]
+    eval_conds = conds if include_disabled else enabled_conds
     condition_results: list[dict[str, Any]] = []
     passed_by_id: dict[int, bool] = {}
-    for c in conds:
+    for c in eval_conds:
         passed, detail = _condition_eval(c, vision, frame_rgb)
         condition_results.append(detail)
         passed_by_id[id(c)] = passed
     passed_enabled = sum(1 for c in enabled_conds if passed_by_id.get(id(c), False))
     passed_all = sum(1 for c in conds if passed_by_id.get(id(c), False))
     total_enabled = len(enabled_conds)
-    total_all = len(conds)
+    total_all = len(conds) if include_disabled else total_enabled
     success = (passed_enabled == total_enabled) if total_enabled > 0 else False
     return MatchResult(
         state_id=str(meta.get("state_id", "")),
@@ -159,7 +175,7 @@ def _select_best_for_unknown(matches: list[MatchResult]) -> MatchResult | None:
         return None
     if len(cands) == 1:
         return cands[0]
-    cands_sorted = sorted(cands, key=lambda m: (-m.passed_all, -m.passed_enabled))
+    cands_sorted = sorted(cands, key=lambda m: (-m.passed_enabled, -m.total_enabled))
     return cands_sorted[0]
 
 

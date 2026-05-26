@@ -94,6 +94,23 @@ HTML = r"""<!doctype html>
       color: #fff4da;
     }
 
+    .search-input {
+      width: 220px;
+      height: 30px;
+      min-width: 120px;
+      padding: 0 9px;
+      border: 1px solid #33465f;
+      border-radius: 6px;
+      background: #0a1017;
+      color: var(--text);
+      font: inherit;
+      outline: none;
+    }
+
+    .search-input:focus {
+      border-color: var(--accent);
+    }
+
     .status {
       flex: 1;
       min-width: 0;
@@ -328,6 +345,8 @@ HTML = r"""<!doctype html>
       <button id="layoutBtn">Layout</button>
       <button id="thumbnailBtn">Thumbnails</button>
       <button id="labelBtn">Label Below</button>
+      <input id="searchInput" class="search-input" type="search" placeholder="slug or node id" />
+      <button id="searchBtn">Search</button>
       <button id="followBtn" class="active">Follow</button>
       <button id="pauseBtn">Pause</button>
       <div id="status" class="status">loading...</div>
@@ -535,6 +554,8 @@ HTML = r"""<!doctype html>
     const layoutBtn = document.getElementById('layoutBtn');
     const thumbnailBtn = document.getElementById('thumbnailBtn');
     const labelBtn = document.getElementById('labelBtn');
+    const searchInput = document.getElementById('searchInput');
+    const searchBtn = document.getElementById('searchBtn');
     const followBtn = document.getElementById('followBtn');
     const pauseBtn = document.getElementById('pauseBtn');
     const lightboxEl = document.getElementById('lightbox');
@@ -884,6 +905,31 @@ HTML = r"""<!doctype html>
       }
     }
 
+    function searchNode() {
+      const query = searchInput.value.trim().toLowerCase();
+      if (!query) return;
+      const matches = state.graph.nodes.filter(node => {
+        const id = String(node.state_id || '').toLowerCase();
+        const slug = String(node.slug || '').toLowerCase();
+        return id.includes(query) || slug.includes(query);
+      });
+      if (!matches.length) {
+        statusEl.textContent = `node not found: ${searchInput.value.trim()}`;
+        return;
+      }
+      const node = matches[0];
+      const ele = cy.getElementById(node.state_id);
+      if (ele.empty()) {
+        statusEl.textContent = `node not rendered: ${node.slug || node.state_id}`;
+        return;
+      }
+      state.selectedId = node.state_id;
+      ele.select();
+      cy.animate({ center: { eles: ele }, zoom: Math.max(cy.zoom(), 0.9) }, { duration: 280 });
+      renderSide();
+      statusEl.textContent = `found ${matches.length}: ${node.slug || node.state_id} (${shortId(node.state_id)})`;
+    }
+
     async function loadTemplateForSelection(selected, node) {
       if (!selected) {
         renderAnnotation(null);
@@ -962,6 +1008,10 @@ HTML = r"""<!doctype html>
     labelBtn.addEventListener('click', () => {
       state.labelsBelow = !state.labelsBelow;
       updateNodeViewMode(true);
+    });
+    searchBtn.addEventListener('click', searchNode);
+    searchInput.addEventListener('keydown', event => {
+      if (event.key === 'Enter') searchNode();
     });
     followBtn.addEventListener('click', () => {
       state.follow = !state.follow;
@@ -1110,11 +1160,18 @@ def _resolve_under(path: Path, root: Path) -> Path | None:
 
 
 def _find_template_state(templates_dir: Path, state_id: str, slug: str = "") -> tuple[Path, dict[str, Any]] | None:
+    if state_id:
+        for path in sorted(templates_dir.glob("*/state.json")):
+            if not path.exists():
+                continue
+            data = _load_json(path)
+            if isinstance(data, dict) and str(data.get("state_id", "")) == state_id:
+                return path, data
+        return None
+
     candidates: list[Path] = []
     if slug:
         candidates.append(templates_dir / slug / "state.json")
-    if state_id:
-        candidates.extend(templates_dir.glob("*/state.json"))
     seen: set[Path] = set()
     for path in candidates:
         if path in seen or not path.exists():
@@ -1123,8 +1180,6 @@ def _find_template_state(templates_dir: Path, state_id: str, slug: str = "") -> 
         data = _load_json(path)
         if not isinstance(data, dict):
             continue
-        if state_id and str(data.get("state_id", "")) == state_id:
-            return path, data
         if slug and str(data.get("slug", "")) == slug:
             return path, data
     return None
