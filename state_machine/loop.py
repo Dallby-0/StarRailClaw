@@ -27,6 +27,9 @@ from state_machine.constants import (
     SCHEMA_VERSION,
     SCREEN_CHANGE_DIFF_THRESHOLD,
     SOFT_LIMIT,
+    UNKNOWN_STABILITY_DIFF_THRESHOLD,
+    UNKNOWN_STABILITY_RETRY_WAIT_S,
+    UNKNOWN_STABILITY_SAMPLE_INTERVAL_S,
 )
 from state_machine.io import (
     _append_experience,
@@ -998,6 +1001,44 @@ def _screen_changed(before_rgb, after_rgb, threshold: float = SCREEN_CHANGE_DIFF
     return score >= threshold, score
 
 
+def _wait_for_unknown_screen_stable(
+    emulator: EmulatorClient,
+    first_frame,
+    *,
+    threshold: float = UNKNOWN_STABILITY_DIFF_THRESHOLD,
+    interval_s: float = UNKNOWN_STABILITY_SAMPLE_INTERVAL_S,
+    logger: FsmRunLogger | None = None,
+):
+    time.sleep(interval_s)
+    second = emulator.screenshot(prefer_png=True)
+    if second.shape[1] != 1280 or second.shape[0] != 720:
+        second = cv2.resize(second, (1280, 720), interpolation=cv2.INTER_LINEAR)
+    time.sleep(interval_s)
+    third = emulator.screenshot(prefer_png=True)
+    if third.shape[1] != 1280 or third.shape[0] != 720:
+        third = cv2.resize(third, (1280, 720), interpolation=cv2.INTER_LINEAR)
+
+    changed_12, diff_12 = _screen_changed(first_frame, second, threshold)
+    changed_23, diff_23 = _screen_changed(second, third, threshold)
+    changed_13, diff_13 = _screen_changed(first_frame, third, threshold)
+    stable = not (changed_12 or changed_23 or changed_13)
+    _log(
+        logger,
+        (
+            "[fsm][unknown][stability] "
+            f"stable={stable} diff12={diff_12:.4f} diff23={diff_23:.4f} diff13={diff_13:.4f} threshold={threshold:.4f}"
+        ),
+        "unknown_stability_check",
+        stable=stable,
+        diff12=diff_12,
+        diff23=diff_23,
+        diff13=diff_13,
+        threshold=threshold,
+        interval_s=interval_s,
+    )
+    return third if stable else None
+
+
 def _resolve_transition_after_progress(
     *,
     state_id: str,
@@ -1605,6 +1646,17 @@ def run_agent_loop_fsm(*, session_id: str, serial: str | None = None, adb_path: 
         else:
             best = _select_best_for_unknown(matches)
         if best is None:
+            stable_frame = _wait_for_unknown_screen_stable(emulator, frame, logger=logger)
+            if stable_frame is None:
+                logger.text(
+                    f"[fsm][unknown] screen unstable, wait {UNKNOWN_STABILITY_RETRY_WAIT_S}s before retry",
+                    "unknown_unstable_wait",
+                    wait_s=UNKNOWN_STABILITY_RETRY_WAIT_S,
+                )
+                prev_frame = frame
+                time.sleep(UNKNOWN_STABILITY_RETRY_WAIT_S)
+                continue
+            frame = stable_frame
             logger.text("[fsm] unknown state, requesting llm", "unknown_state")
             payload = _request_llm_payload(llm, llm_session_id, frame, system_prompt, _page_type_summaries(metas), raw_debug_dir=logger.llm_raw_dir)
             runtime["llm_turn_count"] = int(runtime.get("llm_turn_count", 0)) + 1
