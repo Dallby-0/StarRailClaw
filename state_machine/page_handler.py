@@ -97,6 +97,7 @@ def match_page_handler_edge(
     frame_rgb,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
     candidates: list[tuple[tuple[int, int, int], dict[str, Any], list[dict[str, Any]]]] = []
+    default_candidates: list[tuple[tuple[int, int, int], dict[str, Any], list[dict[str, Any]]]] = []
     diagnostics: list[dict[str, Any]] = []
     for edge in handler.get("edges", []):
         if not isinstance(edge, dict) or not edge.get("enabled", True):
@@ -105,6 +106,11 @@ def match_page_handler_edge(
             continue
         conditions = [c for c in edge.get("conditions", []) if isinstance(c, dict)]
         if not conditions:
+            if edge.get("condition_policy") == "default_if_no_edge_matches":
+                priority = int(edge.get("priority", 0))
+                success_count = int(edge.get("success_count", 0))
+                fail_count = int(edge.get("fail_count", 0))
+                default_candidates.append(((priority, success_count - fail_count, 0), edge, []))
             continue
         details: list[dict[str, Any]] = []
         passed = 0
@@ -121,7 +127,10 @@ def match_page_handler_edge(
             fail_count = int(edge.get("fail_count", 0))
             candidates.append(((priority, success_count - fail_count, len(conditions)), edge, details))
     if not candidates:
-        return None, diagnostics
+        if not default_candidates:
+            return None, diagnostics
+        default_candidates.sort(key=lambda item: item[0], reverse=True)
+        return default_candidates[0][1], diagnostics
     candidates.sort(key=lambda item: item[0], reverse=True)
     return candidates[0][1], diagnostics
 
@@ -141,6 +150,18 @@ def update_edge_stats(meta: dict[str, Any], edge_id: str, *, success: bool, stat
 
 def add_page_handler_edge(meta: dict[str, Any], edge: dict[str, Any], *, state_path: Path) -> dict[str, Any]:
     handler = ensure_page_handler(meta)
+    for existing in handler.get("edges", []):
+        if (
+            isinstance(existing, dict)
+            and str(existing.get("from_node", "root")) == str(edge.get("from_node", "root"))
+            and existing.get("condition_policy") == "default_if_no_edge_matches"
+            and edge.get("condition_policy") == "default_if_no_edge_matches"
+        ):
+            existing.update(edge)
+            existing["updated_at"] = _now_iso()
+            meta["updated_at"] = _now_iso()
+            _save_json(state_path, meta)
+            return existing
     existing_nodes = {str(n.get("id")): n for n in handler.get("nodes", []) if isinstance(n, dict)}
     for node_id in {str(edge.get("from_node", "root")), str(edge.get("to_node", "root"))}:
         if node_id and node_id not in existing_nodes:
@@ -176,6 +197,7 @@ def request_page_handler_edge(
     handler_summary: dict[str, Any],
     previous_steps: list[dict[str, Any]],
     logger=None,
+    allow_default_edge: bool = True,
 ) -> dict[str, Any] | None:
     text = json.dumps(
         {
@@ -184,6 +206,8 @@ def request_page_handler_edge(
                 "当前处于同一页面内的局部操作模式。请只在当前截图上为当前局部节点生成一条可复用的条件边。"
                 "边的含义是：当 conditions 全部满足时，runtime 从 from_node 转移到代表操作的 to_node，并执行 action。"
                 "runtime 会把 action 持久化到 to_node 上；edge 上的 action 用于创建/兼容。"
+                "如果当前动作是该局部深度在没有任何可匹配条件时也应执行的固定默认动作，可以输出空 conditions，"
+                "并设置 condition_policy=default_if_no_edge_matches；这类无条件边只会在同节点没有任何有条件边命中时低优先级执行。"
                 "conditions 只能使用与主路径完全一致的两种条件："
                 "1) text_line_contains：单行 OCR contains 子串。params 必须包含 text 和 rect。rect 必须只覆盖一行文字；"
                 "text 是 contains 子串，不是精确匹配，不是正则。优先选择同类页面共有的稳定短词，删除名称、编号、数量、进度等可变部分。"
@@ -199,6 +223,7 @@ def request_page_handler_edge(
             "output_schema": {
                 "from_node": "string",
                 "to_node": "string",
+                "condition_policy": "all_match|default_if_no_edge_matches",
                 "conditions": [
                     {
                         "kind": "text_line_contains|region_template",
@@ -235,13 +260,13 @@ def request_page_handler_edge(
         _save_llm_raw_debug(session_id, attempt, raw, "page_handler", logger.llm_raw_dir if logger is not None else None)
         if logger is not None:
             logger.text(f"[fsm][handler][llm] attempt={attempt} raw={raw[:600]}", "llm_page_handler_raw", attempt=attempt, raw_preview=raw[:600])
-        parsed = parse_page_handler_edge(raw)
+        parsed = parse_page_handler_edge(raw, allow_default_edge=allow_default_edge)
         if parsed is not None:
             return parsed
     return None
 
 
-def parse_page_handler_edge(text: str) -> dict[str, Any] | None:
+def parse_page_handler_edge(text: str, *, allow_default_edge: bool = True) -> dict[str, Any] | None:
     try:
         payload = json.loads(text)
     except Exception:
@@ -250,11 +275,14 @@ def parse_page_handler_edge(text: str) -> dict[str, Any] | None:
         return None
     conditions = payload.get("conditions")
     action = payload.get("action")
-    if not isinstance(conditions, list) or not conditions or not isinstance(action, dict):
+    condition_policy = str(payload.get("condition_policy") or "all_match")
+    if not isinstance(conditions, list) or not isinstance(action, dict):
+        return None
+    if not conditions and (not allow_default_edge or condition_policy != "default_if_no_edge_matches"):
         return None
     normalized_conditions = [_normalize_condition(c) for c in conditions if isinstance(c, dict)]
     normalized_conditions = [c for c in normalized_conditions if c is not None]
-    if not normalized_conditions:
+    if conditions and not normalized_conditions:
         return None
     normalized_action = _normalize_action(action)
     if normalized_action is None:
@@ -267,6 +295,7 @@ def parse_page_handler_edge(text: str) -> dict[str, Any] | None:
         "enabled": True,
         "from_node": str(payload.get("from_node") or "root"),
         "to_node": str(payload.get("to_node") or payload.get("from_node") or "root"),
+        "condition_policy": condition_policy if condition_policy == "default_if_no_edge_matches" else "all_match",
         "conditions": normalized_conditions,
         "action": normalized_action,
         "expected_after_action": {
@@ -275,7 +304,7 @@ def parse_page_handler_edge(text: str) -> dict[str, Any] | None:
             "screen_should_change": bool(expected.get("screen_should_change", True)),
             "reason": str(expected.get("reason", "")),
         },
-        "priority": max(0, min(100, int(payload.get("priority", 50)))),
+        "priority": max(0, min(100, int(payload.get("priority", 5 if condition_policy == "default_if_no_edge_matches" else 50)))),
         "brief": str(payload.get("brief", "")),
         "success_count": 0,
         "fail_count": 0,
@@ -320,6 +349,8 @@ def materialize_page_handler_edge(
 
 def edge_conditions_pass(edge: dict[str, Any], vision: VisionEngine, frame_rgb) -> bool:
     conditions = [c for c in edge.get("conditions", []) if isinstance(c, dict)]
+    if not conditions and edge.get("condition_policy") == "default_if_no_edge_matches":
+        return True
     return bool(conditions) and all(_condition_eval(c, vision, frame_rgb)[0] for c in conditions)
 
 
