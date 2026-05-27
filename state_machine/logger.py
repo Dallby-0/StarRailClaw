@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .constants import FSM_DEBUG_DIR
+from . import constants
 
 
 def _now_iso() -> str:
@@ -27,10 +27,12 @@ def _json_safe(value: Any) -> Any:
 class FsmRunLogger:
     """Session/run scoped logger with machine and human readable outputs."""
 
-    def __init__(self, session_id: str, run_id: str, debug_dir: Path = FSM_DEBUG_DIR) -> None:
+    def __init__(self, session_id: str, run_id: str, debug_dir: Path | None = None) -> None:
         self.session_id = _safe_name(session_id)
         self.run_id = run_id
         self.started_at = _now_iso()
+        if debug_dir is None:
+            debug_dir = constants.FSM_DEBUG_DIR
         self.session_dir = debug_dir / "sessions" / self.session_id
         self.run_dir = self.session_dir / "runs" / f"run_{run_id}"
         self.llm_raw_dir = self.run_dir / "llm_raw"
@@ -66,6 +68,33 @@ class FsmRunLogger:
             "last_state_id": None,
             "last_transition": None,
             "event_counts": self._event_counts,
+            "mechanisms": {
+                "unknown_stability_checks": 0,
+                "unknown_stability_stable": 0,
+                "unknown_unstable_waits": 0,
+                "page_local_enters": 0,
+                "page_handler_hits": 0,
+                "page_handler_misses": 0,
+                "page_handler_invalid": 0,
+                "page_handler_rejected": 0,
+                "page_local_steps": 0,
+                "page_local_changed_steps": 0,
+                "transition_reachable_misses": 0,
+                "transitions_to_unknown": 0,
+                "transitions_after_repair": 0,
+                "state_misidentified": 0,
+                "repair_skipped": 0,
+                "action_skipped": 0,
+                "llm_payload_invalid": 0,
+                "disambiguation_started": 0,
+                "disambiguation_results": 0,
+                "disambiguation_strengthened": 0,
+            },
+            "by_state": {},
+            "by_action": {},
+            "transition_reasons": {},
+            "repair_efforts": {},
+            "rates": {},
             "paths": {
                 "run_dir": str(self.run_dir),
                 "events": str(self.events_path),
@@ -102,6 +131,8 @@ class FsmRunLogger:
         _update_counts(self._event_counts, event)
         _touch_total(self._summary, str(row.get("ts", "")))
         _apply_delta(self._summary, _event_delta(event, row))
+        _apply_mechanism_stats(self._summary, event, row)
+        _refresh_rates(self._summary)
 
     def _write_summary_and_report(self) -> None:
         _write_json(self.summary_path, self._summary)
@@ -173,8 +204,40 @@ def _summary_text(summary: dict[str, Any]) -> str:
         f"last_state_id: {summary.get('last_state_id')}",
         f"last_transition: {summary.get('last_transition')}",
         "",
-        "Paths",
+        "Rates",
     ]
+    rates = summary.get("rates", {})
+    if isinstance(rates, dict):
+        for key, value in rates.items():
+            lines.append(f"{key}: {value}")
+    lines.extend(
+        [
+            "",
+            "Mechanisms",
+        ]
+    )
+    mechanisms = summary.get("mechanisms", {})
+    if isinstance(mechanisms, dict):
+        for key, value in mechanisms.items():
+            lines.append(f"{key}: {value}")
+    lines.extend(
+        [
+            "",
+            "Top States",
+            *_format_top_dict(summary.get("by_state"), limit=12),
+            "",
+            "Top Actions",
+            *_format_top_dict(summary.get("by_action"), limit=12),
+            "",
+            "Transition Reasons",
+            *_format_top_dict(summary.get("transition_reasons"), limit=12),
+            "",
+            "Repair Efforts",
+            *_format_top_dict(summary.get("repair_efforts"), limit=8),
+            "",
+            "Paths",
+        ]
+    )
     paths = summary.get("paths", {})
     if isinstance(paths, dict):
         for key, value in paths.items():
@@ -263,6 +326,160 @@ def _apply_delta(summary: dict[str, Any], delta: dict[str, Any]) -> None:
             pass
     _set_if_present(summary, "last_state_id", delta.get("last_state_id"))
     _set_if_present(summary, "last_transition", delta.get("last_transition"))
+
+
+def _bucket(summary: dict[str, Any], key: str) -> dict[str, Any]:
+    value = summary.setdefault(key, {})
+    if not isinstance(value, dict):
+        value = {}
+        summary[key] = value
+    return value
+
+
+def _mechanisms(summary: dict[str, Any]) -> dict[str, int]:
+    value = summary.setdefault("mechanisms", {})
+    if not isinstance(value, dict):
+        value = {}
+        summary["mechanisms"] = value
+    return value
+
+
+def _incr(mapping: dict[str, Any], key: str, value: int = 1) -> None:
+    mapping[key] = int(mapping.get(key, 0) or 0) + value
+
+
+def _incr_nested(summary: dict[str, Any], bucket_key: str, name: Any, field: str, value: int = 1) -> None:
+    if name is None:
+        return
+    name_text = str(name)
+    if not name_text:
+        return
+    bucket = _bucket(summary, bucket_key)
+    item = bucket.setdefault(name_text, {})
+    if not isinstance(item, dict):
+        item = {}
+        bucket[name_text] = item
+    _incr(item, field, value)
+
+
+def _apply_mechanism_stats(summary: dict[str, Any], event: str, row: dict[str, Any]) -> None:
+    mechanisms = _mechanisms(summary)
+    state_id = row.get("state_id") or row.get("from_state") or row.get("to_state")
+    action_id = row.get("action_id")
+
+    if event in {"state_selected", "state_created", "state_created_console", "state_merged_console"}:
+        _incr_nested(summary, "by_state", row.get("state_id"), event)
+    elif state_id:
+        _incr_nested(summary, "by_state", state_id, event)
+    if action_id:
+        _incr_nested(summary, "by_action", action_id, event)
+
+    if event == "unknown_stability_check":
+        _incr(mechanisms, "unknown_stability_checks")
+        if bool(row.get("stable")):
+            _incr(mechanisms, "unknown_stability_stable")
+    elif event == "unknown_unstable_wait":
+        _incr(mechanisms, "unknown_unstable_waits")
+    elif event in {"page_local_enter", "page_local_enter_after_repair"}:
+        _incr(mechanisms, "page_local_enters")
+    elif event == "page_handler_hit":
+        _incr(mechanisms, "page_handler_hits")
+    elif event == "page_handler_miss":
+        _incr(mechanisms, "page_handler_misses")
+    elif event == "page_handler_invalid":
+        _incr(mechanisms, "page_handler_invalid")
+    elif event == "page_handler_rejected":
+        _incr(mechanisms, "page_handler_rejected")
+    elif event == "page_local_step_result":
+        _incr(mechanisms, "page_local_steps")
+        if bool(row.get("changed")):
+            _incr(mechanisms, "page_local_changed_steps")
+    elif event == "transition_reachable_miss":
+        _incr(mechanisms, "transition_reachable_misses")
+    elif event == "transition":
+        reason = str(row.get("reason", "") or "unknown")
+        _incr(_bucket(summary, "transition_reasons"), reason)
+        if not row.get("to_state"):
+            _incr(mechanisms, "transitions_to_unknown")
+        if "repair" in reason or row.get("effort"):
+            _incr(mechanisms, "transitions_after_repair")
+    elif event == "repair_applied":
+        effort = str(row.get("effort", "") or "unknown")
+        _incr(_bucket(summary, "repair_efforts"), effort)
+    elif event == "repair_skipped":
+        _incr(mechanisms, "repair_skipped")
+    elif event == "action_skipped":
+        _incr(mechanisms, "action_skipped")
+    elif event == "state_misidentified":
+        _incr(mechanisms, "state_misidentified")
+    elif event == "llm_payload_invalid":
+        _incr(mechanisms, "llm_payload_invalid")
+    elif event == "disambiguation_started":
+        _incr(mechanisms, "disambiguation_started")
+    elif event == "disambiguation_result":
+        _incr(mechanisms, "disambiguation_results")
+    elif event == "disambiguation_strengthened_winner":
+        _incr(mechanisms, "disambiguation_strengthened")
+
+
+def _ratio(numerator: Any, denominator: Any) -> float:
+    den = int(denominator or 0)
+    if den <= 0:
+        return 0.0
+    return round(float(numerator or 0) / den, 4)
+
+
+def _refresh_rates(summary: dict[str, Any]) -> None:
+    mechanisms = summary.get("mechanisms", {})
+    if not isinstance(mechanisms, dict):
+        mechanisms = {}
+    loops = int(summary.get("loops", 0) or 0)
+    actions = int(summary.get("actions", 0) or 0)
+    repairs = int(summary.get("repairs", 0) or 0)
+    transitions = int(summary.get("transitions", 0) or 0)
+    stability_checks = int(mechanisms.get("unknown_stability_checks", 0) or 0)
+    handler_total = int(mechanisms.get("page_handler_hits", 0) or 0) + int(mechanisms.get("page_handler_misses", 0) or 0)
+    page_local_steps = int(mechanisms.get("page_local_steps", 0) or 0)
+
+    rates = {
+        "unknown_per_loop": _ratio(summary.get("unknown_states"), loops),
+        "llm_turns_per_loop": _ratio(summary.get("llm_turns"), loops),
+        "actions_per_loop": _ratio(actions, loops),
+        "transitions_per_action": _ratio(transitions, actions),
+        "transitions_to_unknown_per_transition": _ratio(mechanisms.get("transitions_to_unknown"), transitions),
+        "repairs_per_action": _ratio(repairs, actions),
+        "repair_success_transition_rate": _ratio(mechanisms.get("transitions_after_repair"), repairs),
+        "page_local_enters_per_action": _ratio(mechanisms.get("page_local_enters"), actions),
+        "page_handler_hit_rate": _ratio(mechanisms.get("page_handler_hits"), handler_total),
+        "page_local_changed_step_rate": _ratio(mechanisms.get("page_local_changed_steps"), page_local_steps),
+        "unknown_stability_stable_rate": _ratio(mechanisms.get("unknown_stability_stable"), stability_checks),
+        "merge_accept_rate": _ratio(
+            int(summary.get("states_merged", 0) or 0) + int(summary.get("states_created", 0) or 0),
+            int(summary.get("states_merged", 0) or 0) + int(summary.get("states_created", 0) or 0) + int(summary.get("merge_rejected", 0) or 0),
+        ),
+    }
+    summary["rates"] = rates
+
+
+def _format_top_dict(value: Any, limit: int) -> list[str]:
+    if not isinstance(value, dict) or not value:
+        return ["-"]
+    items: list[tuple[str, int, Any]] = []
+    for key, raw in value.items():
+        if isinstance(raw, dict):
+            total = sum(int(v or 0) for v in raw.values() if isinstance(v, int))
+        else:
+            total = int(raw or 0)
+        items.append((str(key), total, raw))
+    items.sort(key=lambda item: item[1], reverse=True)
+    lines = []
+    for key, _total, raw in items[:limit]:
+        if isinstance(raw, dict):
+            payload = json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
+            lines.append(f"{key}: {payload}")
+        else:
+            lines.append(f"{key}: {raw}")
+    return lines
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:

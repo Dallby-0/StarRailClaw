@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import sys
 import threading
 import time
 import webbrowser
@@ -11,6 +12,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from state_machine.tasks import list_task_workspaces, task_workspace_path
 
 
 FSM_DIR = Path("StateMachineResources")
@@ -109,6 +114,19 @@ HTML = r"""<!doctype html>
 
     .search-input:focus {
       border-color: var(--accent);
+    }
+
+    .task-select {
+      width: 150px;
+      height: 30px;
+      min-width: 100px;
+      padding: 0 6px;
+      border: 1px solid #33465f;
+      border-radius: 6px;
+      background: #0a1017;
+      color: var(--text);
+      font: inherit;
+      outline: none;
     }
 
     .status {
@@ -341,6 +359,11 @@ HTML = r"""<!doctype html>
 <body>
   <div class="app">
     <div class="toolbar">
+      <select id="taskSelect" class="task-select" title="Known task workspaces">
+        <option value="">default</option>
+      </select>
+      <input id="taskInput" class="search-input" type="search" placeholder="task name" />
+      <button id="taskLoadBtn">Load Task</button>
       <button id="fitBtn">Fit</button>
       <button id="layoutBtn">Layout</button>
       <button id="thumbnailBtn">Thumbnails</button>
@@ -545,6 +568,9 @@ HTML = r"""<!doctype html>
     };
 
     const statusEl = document.getElementById('status');
+    const taskSelect = document.getElementById('taskSelect');
+    const taskInput = document.getElementById('taskInput');
+    const taskLoadBtn = document.getElementById('taskLoadBtn');
     const selectedEl = document.getElementById('selected');
     const annotationEl = document.getElementById('annotation');
     const runtimeEl = document.getElementById('runtime');
@@ -737,8 +763,44 @@ HTML = r"""<!doctype html>
         `edges=${graph.edges.length}`,
         `current=${shortId(runtime.last_state_id)}`,
         `run=${runtime.run_id || '-'}`,
+        `task=${payload.task_name || 'default'}`,
         `updated=${payload.graph_updated_at || '-'}`
       ].join('  ');
+    }
+
+    async function loadTaskList() {
+      try {
+        const res = await fetch('/api/tasks', { cache: 'no-store' });
+        if (!res.ok) return;
+        const payload = await res.json();
+        taskSelect.innerHTML = '<option value="">default</option>';
+        for (const task of payload.tasks || []) {
+          const opt = document.createElement('option');
+          opt.value = task.name || '';
+          opt.textContent = task.name || task.path || '';
+          opt.title = task.summary || task.path || '';
+          taskSelect.appendChild(opt);
+        }
+      } catch (_err) {
+      }
+    }
+
+    async function loadTask(name) {
+      const task = String(name || '').trim();
+      const res = await fetch(`/api/task?name=${encodeURIComponent(task)}`, { cache: 'no-store' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const payload = await res.json();
+      state.signature = '';
+      state.runtime = {};
+      state.graph = { nodes: [], edges: [] };
+      state.selectedId = null;
+      state.templateCache.clear();
+      state.didInitialLayout = false;
+      state.prevCurrent = null;
+      taskInput.value = payload.task_name || '';
+      taskSelect.value = payload.task_name || '';
+      statusEl.textContent = `workspace=${payload.workspace}`;
+      await poll();
     }
 
     async function poll() {
@@ -1013,6 +1075,18 @@ HTML = r"""<!doctype html>
     searchInput.addEventListener('keydown', event => {
       if (event.key === 'Enter') searchNode();
     });
+    taskLoadBtn.addEventListener('click', () => {
+      loadTask(taskInput.value).catch(err => {
+        statusEl.innerHTML = `<span class="missing">${String(err)}</span>`;
+      });
+    });
+    taskInput.addEventListener('keydown', event => {
+      if (event.key === 'Enter') taskLoadBtn.click();
+    });
+    taskSelect.addEventListener('change', () => {
+      taskInput.value = taskSelect.value;
+      taskLoadBtn.click();
+    });
     followBtn.addEventListener('click', () => {
       state.follow = !state.follow;
       followBtn.classList.toggle('active', state.follow);
@@ -1070,6 +1144,7 @@ HTML = r"""<!doctype html>
       if (lightboxEl.classList.contains('open')) fitLightbox();
     });
 
+    loadTaskList();
     poll();
     setInterval(poll, 700);
   </script>
@@ -1281,6 +1356,7 @@ def _condition_coordinate_size(conditions: list[dict[str, Any]], image_size: tup
 class FsmStateHandler(BaseHTTPRequestHandler):
     graph_path = GRAPH_PATH
     runtime_path = RUNTIME_PATH
+    task_name = ""
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"[fsm-cyto] {self.address_string()} {fmt % args}")
@@ -1292,6 +1368,12 @@ class FsmStateHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/state":
             self._send_state(parse_qs(parsed.query))
+            return
+        if parsed.path == "/api/tasks":
+            self._send_tasks()
+            return
+        if parsed.path == "/api/task":
+            self._set_task(parse_qs(parsed.query))
             return
         if parsed.path == "/api/template":
             self._send_template(parse_qs(parsed.query))
@@ -1321,6 +1403,8 @@ class FsmStateHandler(BaseHTTPRequestHandler):
             "signature": signature,
             "graph_path": str(self.graph_path),
             "runtime_path": str(self.runtime_path),
+            "task_name": self.task_name,
+            "workspace": str(self.graph_path.parent),
             "graph_updated_at": graph.get("updated_at", ""),
             "graph": {
                 "schema_version": graph.get("schema_version", ""),
@@ -1329,6 +1413,30 @@ class FsmStateHandler(BaseHTTPRequestHandler):
             },
             "runtime": runtime,
             "server_time": time.time(),
+        }
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self._send_bytes(body, "application/json; charset=utf-8")
+
+    def _send_tasks(self) -> None:
+        payload = {
+            "tasks": list_task_workspaces(),
+            "current": self.task_name,
+            "workspace": str(self.graph_path.parent),
+        }
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self._send_bytes(body, "application/json; charset=utf-8")
+
+    def _set_task(self, query: dict[str, list[str]]) -> None:
+        name = query.get("name", [""])[0].strip()
+        workspace = task_workspace_path(name or None)
+        type(self).task_name = name
+        type(self).graph_path = workspace / "state_graph.json"
+        type(self).runtime_path = workspace / "runtime_state.json"
+        payload = {
+            "task_name": name,
+            "workspace": str(workspace),
+            "graph_path": str(type(self).graph_path),
+            "runtime_path": str(type(self).runtime_path),
         }
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         self._send_bytes(body, "application/json; charset=utf-8")
@@ -1410,23 +1518,32 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Cytoscape.js live FSM graph viewer")
     parser.add_argument("--graph", default=str(GRAPH_PATH))
     parser.add_argument("--runtime", default=str(RUNTIME_PATH))
+    parser.add_argument("--task", default=None, help="task name under StateMachineTasks")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--open", action="store_true", help="open the viewer in the default browser")
     args = parser.parse_args()
+    graph_path = Path(args.graph)
+    runtime_path = Path(args.runtime)
+    task_name = args.task or ""
+    if args.task:
+        workspace = task_workspace_path(args.task)
+        graph_path = workspace / "state_graph.json"
+        runtime_path = workspace / "runtime_state.json"
 
     handler = type(
         "ConfiguredFsmStateHandler",
         (FsmStateHandler,),
         {
-            "graph_path": Path(args.graph),
-            "runtime_path": Path(args.runtime),
+            "graph_path": graph_path,
+            "runtime_path": runtime_path,
+            "task_name": task_name,
         },
     )
     server = ThreadingHTTPServer((args.host, args.port), handler)
     url = f"http://{args.host}:{args.port}/"
     print(f"[fsm-cyto] serving {url}")
-    print(f"[fsm-cyto] graph={Path(args.graph)} runtime={Path(args.runtime)}")
+    print(f"[fsm-cyto] graph={graph_path} runtime={runtime_path} task={task_name or 'default'}")
 
     if args.open:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()

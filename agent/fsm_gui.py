@@ -6,11 +6,16 @@ import json
 import math
 import shlex
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import tkinter as tk
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from state_machine.tasks import task_workspace_path
 
 
 FSM_DIR = Path("StateMachineResources")
@@ -60,6 +65,16 @@ class FsmGui:
         self.root.title("FSM Live View")
         self.root.geometry("1360x900")
 
+        self.task_var = tk.StringVar(value=self.graph_path.parent.name if self.graph_path.parent != FSM_DIR else "")
+        self.task_frame = tk.Frame(self.root)
+        self.task_frame.pack(fill="x", padx=8, pady=(6, 0))
+        tk.Label(self.task_frame, text="Task").pack(side="left")
+        self.task_entry = tk.Entry(self.task_frame, textvariable=self.task_var, width=28)
+        self.task_entry.pack(side="left", padx=(6, 4))
+        tk.Button(self.task_frame, text="Load", command=self._load_task).pack(side="left")
+        self.task_status_var = tk.StringVar(value=f"workspace: {self.graph_path.parent}")
+        tk.Label(self.task_frame, textvariable=self.task_status_var, anchor="w").pack(side="left", padx=(8, 0), fill="x", expand=True)
+
         self.info_var = tk.StringVar(value="loading...")
         self.info = tk.Label(self.root, textvariable=self.info_var, anchor="w", justify="left")
         self.info.pack(fill="x", padx=8, pady=6)
@@ -89,6 +104,20 @@ class FsmGui:
         self.canvas.bind("<Double-Button-1>", self._on_reset_view)
 
         self.root.after(50, self._tick)
+
+    def _load_task(self) -> None:
+        name = self.task_var.get().strip()
+        workspace = task_workspace_path(name or None)
+        self.graph_path = workspace / "state_graph.json"
+        self.runtime_path = workspace / "runtime_state.json"
+        self.task_status_var.set(f"workspace: {workspace}")
+        self.last_graph_signature = ""
+        self.nodes = {}
+        self.edges = []
+        self.layout_ok = False
+        self.layout_error = ""
+        self.last_state_id = None
+        self.prev_state_id = None
 
     def _on_wheel(self, event) -> None:
         factor = 1.12 if event.delta > 0 else 0.9
@@ -532,13 +561,20 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Live FSM graph viewer")
     parser.add_argument("--graph", default=str(GRAPH_PATH))
     parser.add_argument("--runtime", default=str(RUNTIME_PATH))
+    parser.add_argument("--task", default=None, help="task name under StateMachineTasks")
     parser.add_argument("--poll-ms", type=int, default=700)
     parser.add_argument("--engine", choices=["layered", "sfdp", "dot", "neato"], default="layered")
     args = parser.parse_args()
+    graph_path = Path(args.graph)
+    runtime_path = Path(args.runtime)
+    if args.task:
+        workspace = task_workspace_path(args.task)
+        graph_path = workspace / "state_graph.json"
+        runtime_path = workspace / "runtime_state.json"
 
     gui = FsmGui(
-        graph_path=Path(args.graph),
-        runtime_path=Path(args.runtime),
+        graph_path=graph_path,
+        runtime_path=runtime_path,
         poll_ms=max(200, args.poll_ms),
         engine=args.engine,
     )

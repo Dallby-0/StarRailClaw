@@ -10,6 +10,7 @@ import cv2
 
 from .constants import (
     EXPERIENCE_PATH,
+    EXPERIENCE_WRITE_ENABLED,
     FSM_DEBUG_DIR,
     FSM_GRAPH_PATH,
     FSM_RUNTIME_PATH,
@@ -17,6 +18,7 @@ from .constants import (
     FSM_TEMPLATES_DIR,
     LLM_FSM_PROMPT_BASE,
     SCHEMA_VERSION,
+    TASK_SUMMARY_PATH,
 )
 
 
@@ -50,14 +52,26 @@ def _load_experience_text() -> str:
     return txt[-5000:]
 
 
+def _load_task_summary_text() -> str:
+    if not TASK_SUMMARY_PATH.exists():
+        return ""
+    return TASK_SUMMARY_PATH.read_text(encoding="utf-8").strip()
+
+
 def _build_system_prompt_with_experience() -> str:
+    prompt = LLM_FSM_PROMPT_BASE
+    summary = _load_task_summary_text()
+    if summary:
+        prompt += "\n\nCurrent task summary (English, highest priority for task objective):\n" + summary[-5000:]
     exp = _load_experience_text()
     if not exp:
-        return LLM_FSM_PROMPT_BASE
-    return LLM_FSM_PROMPT_BASE + "\n\n历史经验（仅参考，不要逐字复述）：\n" + exp
+        return prompt
+    return prompt + "\n\n历史经验（仅参考，不要逐字复述）：\n" + exp
 
 
 def _append_experience(line: str) -> None:
+    if not EXPERIENCE_WRITE_ENABLED:
+        return
     EXPERIENCE_PATH.parent.mkdir(parents=True, exist_ok=True)
     if not EXPERIENCE_PATH.exists():
         EXPERIENCE_PATH.write_text("# experience\n\n", encoding="utf-8")

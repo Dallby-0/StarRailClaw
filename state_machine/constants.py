@@ -9,6 +9,8 @@ FSM_SCHEMA_PATH = FSM_DIR / "llm_protocol_schema.json"
 FSM_RUNTIME_PATH = FSM_DIR / "runtime_state.json"
 FSM_DEBUG_DIR = FSM_DIR / "debug"
 EXPERIENCE_PATH = FSM_DIR / "experience.md"
+TASK_SUMMARY_PATH = FSM_DIR / "task_summary.md"
+EXPERIENCE_WRITE_ENABLED = False
 
 SCHEMA_VERSION = "1.1.0"
 ACTION_CLICK_WAIT_S = 5.0
@@ -32,7 +34,9 @@ DISCRIMINATION_SCORE = {"high": 4, "mid": 2, "low": 1}
 STABILITY_SCORE = {"high": 3, "mid": 2, "low": 1}
 MATCH_DISCRIMINATION_TARGET = 4
 
-LLM_FSM_PROMPT_BASE = """你是视觉驱动游戏自动化的状态标注器和动作规划器,当前任务是通关崩坏星穹铁道差分宇宙。
+LLM_FSM_PROMPT_BASE = """你是视觉驱动游戏自动化的状态标注器和动作规划器。
+
+当前任务目标由任务工作区中的 task_summary.md 提供；如果没有任务概要，则仅按当前画面推进通用游戏自动化流程。
 
 你将收到一张游戏截图。你的任务：
 1) 识别并输出用于区分该页面的关键信息，按重要性排序。

@@ -1,1 +1,1 @@
-python agent\fsm_cytoscape_gui.py --host 127.0.0.1 --port 8765 --open
+python agent\fsm_cytoscape_gui.py --host 127.0.0.1 --port 8765 --open %*

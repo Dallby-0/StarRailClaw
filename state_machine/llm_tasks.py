@@ -7,7 +7,8 @@ from typing import Any
 
 from agent.llm_client import DoubaoClient
 
-from .constants import FSM_DEBUG_DIR, LLM_PARSE_RETRY
+from . import constants
+from .constants import LLM_PARSE_RETRY
 
 
 def _normalize_assistant_text(content: Any) -> str:
@@ -120,7 +121,7 @@ def _parse_llm_condition_revision(text: str) -> dict[str, Any] | None:
 
 def _save_llm_raw_debug(session_id: str, attempt: int, text: str, kind: str = "normal", debug_dir: Path | None = None) -> Path:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    root = debug_dir or FSM_DEBUG_DIR
+    root = debug_dir or constants.FSM_DEBUG_DIR
     root.mkdir(parents=True, exist_ok=True)
     p = root / f"llm_raw_{kind}_{session_id}_attempt{attempt}_{ts}.txt"
     p.write_text(text, encoding="utf-8")

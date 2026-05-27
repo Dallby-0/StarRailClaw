@@ -83,6 +83,7 @@ from state_machine.page_handler import (
 )
 from agent.llm_client import DoubaoClient
 from state_machine.presets import run_preset
+from state_machine.tasks import configure_fsm_workspace, create_task_workspace, task_workspace_path
 from sr_tools.adb import resolve_target_serial
 from sr_tools.emulator import EmulatorClient
 
@@ -1551,7 +1552,20 @@ def _execute_state_action(
     raise SystemExit(1)
 
 
-def run_agent_loop_fsm(*, session_id: str, serial: str | None = None, adb_path: str | None = None, interval_s: float = 5.0) -> None:
+def run_agent_loop_fsm(
+    *,
+    session_id: str,
+    serial: str | None = None,
+    adb_path: str | None = None,
+    interval_s: float = 5.0,
+    task: str | None = None,
+    task_dir: str | Path | None = None,
+) -> None:
+    workspace = task_workspace_path(task, task_dir)
+    if task and task_dir is None and not workspace.exists():
+        workspace = create_task_workspace(task)
+        print(f"[fsm][task] created missing task workspace dir={workspace}")
+    workspace = configure_fsm_workspace(workspace)
     _ensure_fsm_resources()
     target_serial = resolve_target_serial(serial=serial, adb_path=adb_path, auto_connect=True)
     emulator = EmulatorClient(serial=target_serial, adb_path=adb_path)
@@ -1573,6 +1587,8 @@ def run_agent_loop_fsm(*, session_id: str, serial: str | None = None, adb_path: 
         serial=target_serial,
         adb_path=adb_path,
         interval_s=interval_s,
+        task=task,
+        task_dir=str(workspace),
         run_dir=logger.run_dir,
         events_path=logger.events_path,
         summary_path=logger.summary_path,
@@ -1782,8 +1798,23 @@ def main() -> None:
     parser.add_argument("--serial", default=None)
     parser.add_argument("--adb-path", default=None)
     parser.add_argument("--interval", type=float, default=5.0)
+    parser.add_argument("--task", default=None, help="task name under StateMachineTasks")
+    parser.add_argument("--task-dir", default=None, help="explicit task workspace directory")
+    parser.add_argument("--create-task", default=None, help="create a task workspace and exit")
+    parser.add_argument("--task-summary", default="", help="English summary written when creating a task")
     args = parser.parse_args()
-    run_agent_loop_fsm(session_id=args.session_id, serial=args.serial, adb_path=args.adb_path, interval_s=args.interval)
+    if args.create_task:
+        workspace = create_task_workspace(args.create_task, summary=args.task_summary)
+        print(f"[fsm][task] created name={args.create_task} dir={workspace}")
+        return
+    run_agent_loop_fsm(
+        session_id=args.session_id,
+        serial=args.serial,
+        adb_path=args.adb_path,
+        interval_s=args.interval,
+        task=args.task,
+        task_dir=args.task_dir,
+    )
 
 
 if __name__ == "__main__":
