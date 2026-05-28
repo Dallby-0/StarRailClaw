@@ -9,7 +9,7 @@ from agent.behavior_tree.coord_mapper import CoordinateMapper
 from agent.behavior_tree.vision import VisionEngine
 from agent.llm_client import DoubaoClient
 from sr_tools.emulator import EmulatorClient
-from state_machine.constants import ACTION_CLICK_WAIT_S, LLM_PARSE_RETRY, MAX_RETRY_PER_ACTION, REPAIR_EFFORTS
+from state_machine.constants import ACTION_CLICK_WAIT_S, LLM_PARSE_RETRY, MAX_RETRY_PER_ACTION, REPAIR_EFFORTS, SAME_EXTERNAL_STATE_REPAIR_THRESHOLD
 from state_machine.graph import _get_reachable_targets
 from state_machine.io import _append_experience, _load_json, _now_iso, _save_json, _save_runtime
 from state_machine.llm_tasks import (
@@ -203,6 +203,21 @@ def _apply_repair_result(action_steps: list[dict[str, Any]], repair: dict[str, A
     return list(action_steps) + list(new_steps)
 
 
+def _reset_same_external_state_counter(runtime: dict[str, Any]) -> None:
+    runtime["same_external_state_id"] = None
+    runtime["same_external_state_count"] = 0
+
+
+def _bump_same_external_state_counter(runtime: dict[str, Any], state_id: str) -> int:
+    if runtime.get("same_external_state_id") == state_id:
+        count = int(runtime.get("same_external_state_count", 0) or 0) + 1
+    else:
+        count = 1
+    runtime["same_external_state_id"] = state_id
+    runtime["same_external_state_count"] = count
+    return count
+
+
 def _execute_state_action(
     *,
     emulator: EmulatorClient,
@@ -220,7 +235,7 @@ def _execute_state_action(
     prefer_reachable_first: bool,
     logger: FsmRunLogger | None = None,
 ) -> tuple[bool, Any]:
-    from state_machine.page_local_flow import _run_page_local_flow
+    from state_machine.page_op_flow import _run_page_op_flow
 
     state_meta = _load_json(state_dir / "state.json")
     actions = [a for a in state_meta.get("actions", []) if isinstance(a, dict) and a.get("enabled", True)]
@@ -237,6 +252,7 @@ def _execute_state_action(
     last_attempt_frame = frame_before
     last_failure_frame = frame_before
     last_failure_matches: list[MatchResult] = []
+    same_state_threshold_reached = False
     for attempt in range(1, MAX_RETRY_PER_ACTION + 1):
         _log(logger, f"[fsm][action] state={state_id} action={action_id} attempt={attempt}", "action_attempt", state_id=state_id, action_id=action_id, attempt=attempt, steps=steps)
         if not _execute_action_steps(emulator, mapper, vision, state_dir, steps, state_id, matches_provider, logger=logger, action_id=action_id, attempt=attempt):
@@ -267,9 +283,11 @@ def _execute_state_action(
             runtime["last_transition_ok"] = True
             runtime["pending_from_state_id"] = None
             runtime["pending_action_id"] = None
+            _reset_same_external_state_counter(runtime)
             _save_runtime(runtime)
             return True, post
         if curr_match is None or not curr_match.success:
+            _reset_same_external_state_counter(runtime)
             return _defer_unknown_transition(
                 runtime=runtime,
                 state_id=state_id,
@@ -278,46 +296,60 @@ def _execute_state_action(
                 frame=post,
                 reason="original-state-no-longer-matched",
             )
-        changed, diff_score = _screen_changed(last_attempt_frame, post)
-        if changed:
+        same_count = _bump_same_external_state_counter(runtime, state_id)
+        _save_runtime(runtime)
+        if same_count >= SAME_EXTERNAL_STATE_REPAIR_THRESHOLD:
+            same_state_threshold_reached = True
             _log(
                 logger,
-                f"[fsm][local] same state but screen changed diff={diff_score:.4f}; enter page-local flow",
-                "page_local_enter",
+                f"[fsm][same-state] state={state_id} count={same_count}; trigger diagnosis",
+                "same_external_state_repair_threshold",
                 state_id=state_id,
                 action_id=action_id,
-                attempt=attempt,
-                diff_score=diff_score,
+                count=same_count,
+                threshold=SAME_EXTERNAL_STATE_REPAIR_THRESHOLD,
             )
-            local_ok, local_frame = _run_page_local_flow(
-                emulator=emulator,
-                mapper=mapper,
-                vision=vision,
-                state_id=state_id,
-                state_dir=state_dir,
-                action_id=action_id,
-                start_frame=post,
-                matches_provider=matches_provider,
-                runtime=runtime,
-                llm=llm,
-                llm_session_id=llm_session_id,
-                system_prompt=system_prompt,
-                graph=graph,
-                prefer_reachable_first=prefer_reachable_first,
-                state_slug=str(state_meta.get("slug", state_id)),
-                seed_step={
-                    "node": "root",
-                    "source": "entry_action",
-                    "action": steps[0],
-                    "brief": f"entry action attempt={attempt}",
-                    "runtime_observation": {"same_state_still_matches": True, "screen_changed_hint": True, "diff_score": diff_score},
-                } if len(steps) == 1 and isinstance(steps[0], dict) else None,
-                logger=logger,
-            )
-            if local_ok:
-                return True, local_frame
             break
-        last_attempt_frame = post
+        changed, diff_score = _screen_changed(last_attempt_frame, post)
+        _log(
+            logger,
+            f"[fsm][local] self-loop state={state_id} diff={diff_score:.4f}; enter page-op flow",
+            "page_local_enter",
+            state_id=state_id,
+            action_id=action_id,
+            attempt=attempt,
+            diff_score=diff_score,
+            changed=changed,
+        )
+        local_ok, local_frame = _run_page_op_flow(
+            emulator=emulator,
+            mapper=mapper,
+            vision=vision,
+            state_id=state_id,
+            state_dir=state_dir,
+            action_id=action_id,
+            start_frame=post,
+            matches_provider=matches_provider,
+            runtime=runtime,
+            llm=llm,
+            llm_session_id=llm_session_id,
+            system_prompt=system_prompt,
+            graph=graph,
+            prefer_reachable_first=prefer_reachable_first,
+            state_slug=str(state_meta.get("slug", state_id)),
+            seed_step={
+                "node": "root",
+                "source": "entry_action_self_loop",
+                "action": steps[0],
+                "brief": f"entry action attempt={attempt}",
+                "runtime_observation": {"same_state_still_matches": True, "screen_changed_hint": changed, "diff_score": diff_score},
+            } if len(steps) == 1 and isinstance(steps[0], dict) else None,
+            seed_before_frame=last_attempt_frame,
+            logger=logger,
+        )
+        if local_ok:
+            return True, local_frame
+        break
 
     diagnosis = _diagnose_before_repair(
         llm=llm,
@@ -335,9 +367,20 @@ def _execute_state_action(
         runtime["last_transition_ok"] = True
         runtime["pending_from_state_id"] = state_id
         runtime["pending_action_id"] = action_id
+        runtime["force_state_resolution"] = True
+        runtime["force_exclude_state_id"] = state_id
         _save_runtime(runtime)
-        _log(logger, f"[fsm][diagnosis] state_misidentified; defer to unknown resolution", "state_misidentified", state_id=state_id, action_id=action_id, diagnosis=diagnosis)
+        _log(logger, f"[fsm][diagnosis] state_misidentified; force state resolution", "state_misidentified", state_id=state_id, action_id=action_id, diagnosis=diagnosis)
         return True, last_failure_frame
+    if same_state_threshold_reached and diagnosis:
+        _log(
+            logger,
+            f"[fsm][same-state] diagnosis={diagnosis.get('diagnosis')} did not request forced resolution; continue repair",
+            "same_external_state_continue_repair",
+            state_id=state_id,
+            action_id=action_id,
+            diagnosis=diagnosis,
+        )
 
     for idx, effort in enumerate(REPAIR_EFFORTS, start=1):
         post = emulator.screenshot(prefer_png=True)
@@ -393,10 +436,12 @@ def _execute_state_action(
             runtime["last_transition_ok"] = True
             runtime["pending_from_state_id"] = None
             runtime["pending_action_id"] = None
+            _reset_same_external_state_counter(runtime)
             _save_runtime(runtime)
             _append_experience(f"repair success: {state_meta.get('slug', state_id)} -> {nxt2.state_id}; mode={repair.get('mode')} effort={effort}")
             return True, post2
         if curr_match2 is None or not curr_match2.success:
+            _reset_same_external_state_counter(runtime)
             _append_experience(f"repair success(to-unknown): {state_meta.get('slug', state_id)}; mode={repair.get('mode')} effort={effort}")
             return _defer_unknown_transition(
                 runtime=runtime,
@@ -408,45 +453,46 @@ def _execute_state_action(
                 effort=effort,
             )
         changed2, diff_score2 = _screen_changed(post, post2)
-        if changed2:
-            _log(
-                logger,
-                f"[fsm][local] repair kept same state but screen changed diff={diff_score2:.4f}; enter page-local flow",
-                "page_local_enter_after_repair",
-                state_id=state_id,
-                action_id=action_id,
-                effort=effort,
-                diff_score=diff_score2,
-            )
-            local_ok2, local_frame2 = _run_page_local_flow(
-                emulator=emulator,
-                mapper=mapper,
-                vision=vision,
-                state_id=state_id,
-                state_dir=state_dir,
-                action_id=action_id,
-                start_frame=post2,
-                matches_provider=matches_provider,
-                runtime=runtime,
-                llm=llm,
-                llm_session_id=llm_session_id,
-                system_prompt=system_prompt,
-                graph=graph,
-                prefer_reachable_first=prefer_reachable_first,
-                state_slug=str(state_meta.get("slug", state_id)),
-                seed_step={
-                    "node": "root",
-                    "source": f"repair_entry_action:{effort}",
-                    "action": steps[0],
-                    "brief": f"repair entry action effort={effort}",
-                    "runtime_observation": {"same_state_still_matches": True, "screen_changed_hint": True, "diff_score": diff_score2},
-                } if len(steps) == 1 and isinstance(steps[0], dict) else None,
-                logger=logger,
-            )
-            if local_ok2:
-                runtime["repair_fail_count"] = 0
-                _save_runtime(runtime)
-                return True, local_frame2
+        _log(
+            logger,
+            f"[fsm][local] repair self-loop state={state_id} diff={diff_score2:.4f}; enter page-op flow",
+            "page_local_enter_after_repair",
+            state_id=state_id,
+            action_id=action_id,
+            effort=effort,
+            diff_score=diff_score2,
+            changed=changed2,
+        )
+        local_ok2, local_frame2 = _run_page_op_flow(
+            emulator=emulator,
+            mapper=mapper,
+            vision=vision,
+            state_id=state_id,
+            state_dir=state_dir,
+            action_id=action_id,
+            start_frame=post2,
+            matches_provider=matches_provider,
+            runtime=runtime,
+            llm=llm,
+            llm_session_id=llm_session_id,
+            system_prompt=system_prompt,
+            graph=graph,
+            prefer_reachable_first=prefer_reachable_first,
+            state_slug=str(state_meta.get("slug", state_id)),
+            seed_step={
+                "node": "root",
+                "source": f"repair_entry_action_self_loop:{effort}",
+                "action": steps[0],
+                "brief": f"repair entry action effort={effort}",
+                "runtime_observation": {"same_state_still_matches": True, "screen_changed_hint": changed2, "diff_score": diff_score2},
+            } if len(steps) == 1 and isinstance(steps[0], dict) else None,
+            seed_before_frame=post,
+            logger=logger,
+        )
+        if local_ok2:
+            runtime["repair_fail_count"] = 0
+            _save_runtime(runtime)
+            return True, local_frame2
 
     runtime["repair_fail_count"] = int(runtime.get("repair_fail_count", 0)) + 1
     runtime["last_transition_ok"] = False

@@ -108,6 +108,10 @@ def _ensure_fsm_resources() -> None:
                 "pending_refresh": False,
                 "pending_from_state_id": None,
                 "pending_action_id": None,
+                "same_external_state_id": None,
+                "same_external_state_count": 0,
+                "force_state_resolution": False,
+                "force_exclude_state_id": None,
             },
         )
     _save_json(

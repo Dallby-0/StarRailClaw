@@ -66,6 +66,10 @@ def run_agent_loop_fsm(
     runtime["pending_refresh"] = True
     runtime.setdefault("pending_from_state_id", None)
     runtime.setdefault("pending_action_id", None)
+    runtime.setdefault("same_external_state_id", None)
+    runtime.setdefault("same_external_state_count", 0)
+    runtime.setdefault("force_state_resolution", False)
+    runtime.setdefault("force_exclude_state_id", None)
     _save_runtime(runtime)
     logger = FsmRunLogger(session_id, str(runtime["run_id"]))
     logger.event(
@@ -128,7 +132,24 @@ def run_agent_loop_fsm(
         dbg = [f"{m.state_id}:{m.passed_enabled}/{m.total_enabled}|all={m.passed_all}/{m.total_all}|ok={m.success}" for m in matches]
         logger.text(f"[fsm][match] candidates={dbg}", "match_candidates", candidates=[summarize_match(m) for m in matches])
 
+        matches_for_selection = matches
+        metas_for_resolution = metas
         successes = _successful_matches(matches)
+        force_state_resolution = bool(runtime.get("force_state_resolution", False))
+        force_exclude_state_id = str(runtime.get("force_exclude_state_id") or "")
+        if force_state_resolution and force_exclude_state_id:
+            original_successes = successes
+            matches_for_selection = [m for m in matches if m.state_id != force_exclude_state_id]
+            metas_for_resolution = [(sdir, meta) for sdir, meta in metas if str(meta.get("state_id", "")) != force_exclude_state_id]
+            successes = _successful_matches(matches_for_selection)
+            logger.text(
+                f"[fsm][forced-resolution] exclude={force_exclude_state_id} "
+                f"before={[m.state_id for m in original_successes]} after={[m.state_id for m in successes]}",
+                "forced_state_resolution",
+                excluded_state_id=force_exclude_state_id,
+                candidates_before=[summarize_match(m) for m in original_successes],
+                candidates_after=[summarize_match(m) for m in successes],
+            )
         pending_resolution_confidence = "matcher_confirmed"
         if len(successes) > 1:
             logger.text(
@@ -142,14 +163,14 @@ def run_agent_loop_fsm(
                 llm_session_id=llm_session_id,
                 frame_rgb=frame,
                 system_prompt=system_prompt,
-                matches=matches,
-                metas=metas,
+                matches=matches_for_selection,
+                metas=metas_for_resolution,
                 vision=vision,
                 runtime=runtime,
                 logger=logger,
             )
         else:
-            best = _select_best_for_unknown(matches)
+            best = successes[0] if force_state_resolution and len(successes) == 1 else _select_best_for_unknown(matches_for_selection)
         if best is None:
             stable_frame = _wait_for_unknown_screen_stable(emulator, frame, logger=logger)
             if stable_frame is None:
@@ -163,7 +184,7 @@ def run_agent_loop_fsm(
                 continue
             frame = stable_frame
             logger.text("[fsm] unknown state, requesting llm", "unknown_state")
-            payload = _request_llm_payload(llm, llm_session_id, frame, system_prompt, _page_type_summaries(metas), raw_debug_dir=logger.llm_raw_dir)
+            payload = _request_llm_payload(llm, llm_session_id, frame, system_prompt, _page_type_summaries(metas_for_resolution), raw_debug_dir=logger.llm_raw_dir)
             runtime["llm_turn_count"] = int(runtime.get("llm_turn_count", 0)) + 1
             _save_runtime(runtime)
             if payload is None:
@@ -186,7 +207,7 @@ def run_agent_loop_fsm(
                 llm_payload=payload,
                 mapper=mapper,
                 vision=vision,
-                metas=metas,
+                metas=metas_for_resolution,
                 logger=logger,
             )
             if merged is None:
@@ -211,6 +232,8 @@ def run_agent_loop_fsm(
                 )
                 runtime["pending_from_state_id"] = None
                 runtime["pending_action_id"] = None
+            runtime["force_state_resolution"] = False
+            runtime["force_exclude_state_id"] = None
             runtime["last_state_id"] = new_state_id
             runtime["last_transition_ok"] = False
             _save_runtime(runtime)
@@ -258,6 +281,9 @@ def run_agent_loop_fsm(
             )
             runtime["pending_from_state_id"] = None
             runtime["pending_action_id"] = None
+        if force_state_resolution:
+            runtime["force_state_resolution"] = False
+            runtime["force_exclude_state_id"] = None
         _save_runtime(runtime)
 
         ok, post_frame = _execute_state_action(
