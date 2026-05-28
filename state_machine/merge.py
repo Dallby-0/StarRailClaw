@@ -1,0 +1,233 @@
+from __future__ import annotations
+
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import cv2
+
+from agent.behavior_tree.coord_mapper import CoordinateMapper
+from agent.behavior_tree.vision import VisionEngine
+from agent.llm_client import DoubaoClient
+from state_machine.io import _backup_json, _load_frame, _normalize_page_type, _now_iso, _save_frame, _save_json, _state_page_type
+from state_machine.llm_tasks import _request_llm_condition_revision
+from state_machine.logger import FsmRunLogger
+from state_machine.matching import _condition_passed, _level, _select_enabled_conditions
+from state_machine.state_store import (
+    _latest_screenshot_path,
+    _latest_state_for_page_type,
+    _sample_screenshot_paths,
+    _states_for_page_type,
+)
+
+
+def _log(logger: FsmRunLogger | None, message: str, event: str = "console", **fields: Any) -> None:
+    if logger is None:
+        print(message)
+        return
+    logger.text(message, event=event, **fields)
+
+
+def _condition_from_revision(raw: dict[str, Any], base: dict[str, Any], state_dir: Path, frame_rgb, mapper: CoordinateMapper) -> dict[str, Any] | None:
+    decision = str(raw.get("decision", "keep")).strip().lower()
+    if decision == "deprecate":
+        cc = dict(base)
+        cc["condition_status"] = "deprecated"
+        cc["enabled"] = False
+        return cc
+    if decision not in {"keep", "revise"}:
+        return None
+    cc = dict(base)
+    cc["condition_status"] = "active"
+    cc["enabled"] = False
+    cc["stability"] = _level(raw.get("stability", cc.get("stability")), "mid")
+    cc["discrimination"] = _level(raw.get("discrimination", cc.get("discrimination")), "mid")
+    cc["brief"] = str(raw.get("brief", cc.get("brief", "")))
+    if decision == "revise":
+        kind = str(raw.get("kind", cc.get("kind", ""))).strip()
+        if kind == "line_contains_text":
+            kind = "text_line_contains"
+        params = raw.get("params", {})
+        if not isinstance(params, dict):
+            params = {}
+        if kind == "text_line_contains":
+            text = str(params.get("text") or params.get("contains") or raw.get("text") or "").strip()
+            rect = params.get("rect") or raw.get("bbox") or cc.get("params", {}).get("rect") or cc.get("bbox")
+            if not text or not (isinstance(rect, list) and len(rect) == 4):
+                return None
+            cc["kind"] = kind
+            cc["params"] = {"text": text, "rect": rect}
+            cc["bbox"] = rect
+        elif kind == "region_template":
+            rect = params.get("rect") or raw.get("bbox") or cc.get("params", {}).get("rect") or cc.get("bbox")
+            if not (isinstance(rect, list) and len(rect) == 4):
+                return None
+            x, y, w, h = mapper.rect_to_real(rect)
+            crop = frame_rgb[y : y + h, x : x + w]
+            tpath = state_dir / f"template_revised_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{cc.get('id', 'cond')}.png"
+            cv2.imwrite(str(tpath), cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
+            cc["kind"] = kind
+            cc["params"] = {
+                "rect": rect,
+                "threshold": float(params.get("threshold", cc.get("params", {}).get("threshold", 0.8))),
+                "template_path": str(tpath),
+            }
+            cc["bbox"] = rect
+            cc["source"] = {
+                "screenshot_path": str(state_dir / "screenshot_latest_merge.png"),
+                "bbox_logical": rect,
+                "template_path": str(tpath),
+            }
+        else:
+            return None
+    return cc
+
+
+def _conditions_pass_all(conditions: list[dict[str, Any]], vision: VisionEngine, frames: list[Any]) -> bool:
+    active = [c for c in conditions if c.get("condition_status", "active") == "active"]
+    if not active:
+        return False
+    for frame in frames:
+        for cond in active:
+            if not _condition_passed(cond, vision, frame):
+                return False
+    return True
+
+
+def _selected_conditions_match_other_page(
+    conditions: list[dict[str, Any]],
+    vision: VisionEngine,
+    metas: list[tuple[Path, dict[str, Any]]],
+    page_type: str,
+) -> str | None:
+    enabled = [c for c in conditions if c.get("enabled", False)]
+    if not enabled:
+        return None
+    for state_dir, meta in metas:
+        if _state_page_type(meta) == page_type:
+            continue
+        shot = _latest_screenshot_path(state_dir)
+        if shot is None:
+            continue
+        frame = _load_frame(shot)
+        if frame is None:
+            continue
+        if all(_condition_passed(c, vision, frame) for c in enabled):
+            return f"{_state_page_type(meta)}:{meta.get('slug', '')}"
+    return None
+
+
+def _try_merge_page_type(
+    *,
+    llm: DoubaoClient,
+    session_id: str,
+    system_prompt: str,
+    frame_rgb,
+    llm_payload: dict[str, Any],
+    mapper: CoordinateMapper,
+    vision: VisionEngine,
+    metas: list[tuple[Path, dict[str, Any]]],
+    logger: FsmRunLogger | None = None,
+) -> tuple[str, Path] | None:
+    page_type = _normalize_page_type(llm_payload.get("possible_page_type"))
+    if not page_type:
+        return None
+    latest = _latest_state_for_page_type(metas, page_type)
+    if latest is None:
+        return None
+    latest_dir, latest_meta = latest
+    sample_path = _latest_screenshot_path(latest_dir)
+    if sample_path is None:
+        return None
+    latest_rgb = _load_frame(sample_path)
+    if latest_rgb is None:
+        return None
+
+    existing_conds = [c for c in latest_meta.get("match_conditions", []) if isinstance(c, dict)]
+    failed = [c for c in existing_conds if c.get("condition_status", "active") != "deprecated" and not _condition_passed(c, vision, frame_rgb)]
+    rev = _request_llm_condition_revision(
+        llm,
+        session_id,
+        system_prompt,
+        latest_sample_rgb=latest_rgb,
+        current_rgb=frame_rgb,
+        page_type=page_type,
+        latest_meta=latest_meta,
+        failed_conditions=failed,
+        new_payload=llm_payload,
+        raw_debug_dir=logger.llm_raw_dir if logger is not None else None,
+    )
+    if rev is None or not rev.get("same_page_type", False):
+        _log(logger, f"[fsm][merge] reject page_type={page_type} reason=llm_not_same_or_invalid", "merge_rejected", page_type=page_type, reason="llm_not_same_or_invalid")
+        return None
+
+    by_id = {str(c.get("id", "")): c for c in existing_conds}
+    revised: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for item in rev.get("conditions", []):
+        if not isinstance(item, dict):
+            continue
+        cid = str(item.get("condition_id") or item.get("id") or "").strip()
+        base = by_id.get(cid)
+        if base is None:
+            continue
+        new_cond = _condition_from_revision(item, base, latest_dir, frame_rgb, mapper)
+        if new_cond is not None:
+            revised.append(new_cond)
+            seen_ids.add(cid)
+    for cond in existing_conds:
+        if str(cond.get("id", "")) not in seen_ids:
+            cc = dict(cond)
+            if not cc.get("enabled", False):
+                cc["condition_status"] = "deprecated"
+            revised.append(cc)
+
+    sample_frames: list[Any] = []
+    for shot in _sample_screenshot_paths([d for d, _ in _states_for_page_type(metas, page_type)]):
+        img = _load_frame(shot)
+        if img is not None:
+            sample_frames.append(img)
+    sample_frames.append(frame_rgb)
+    if not _conditions_pass_all(revised, vision, sample_frames):
+        _log(logger, f"[fsm][merge] reject page_type={page_type} reason=revised_conditions_do_not_cover_positive_samples", "merge_rejected", page_type=page_type, reason="revised_conditions_do_not_cover_positive_samples")
+        return None
+
+    revised, weak_match = _select_enabled_conditions(revised, vision, frame_rgb)
+    false_positive = _selected_conditions_match_other_page(revised, vision, metas, page_type)
+    if false_positive:
+        _log(logger, f"[fsm][merge] reject page_type={page_type} reason=false_positive other={false_positive}", "merge_rejected", page_type=page_type, reason="false_positive", other=false_positive)
+        return None
+
+    _backup_json(latest_dir / "state.json")
+    next_idx = len(list(latest_dir.glob("screenshot_*.png"))) + 1
+    _save_frame(latest_dir / f"screenshot_{next_idx}.png", frame_rgb)
+    samples = latest_meta.setdefault("samples", [])
+    if isinstance(samples, list):
+        samples.append(
+            {
+                "path": str(latest_dir / f"screenshot_{next_idx}.png"),
+                "role": "positive",
+                "source": "merge",
+                "confidence": 0.8,
+                "created_at": _now_iso(),
+            }
+        )
+    latest_meta["match_conditions"] = revised
+    latest_meta["updated_at"] = _now_iso()
+    latest_meta["page_type"] = page_type
+    latest_meta.setdefault("model_info", {})
+    if isinstance(latest_meta["model_info"], dict):
+        latest_meta["model_info"]["weak_match"] = weak_match
+        latest_meta["model_info"]["last_merge_note"] = str(rev.get("note", ""))
+    _save_json(latest_dir / "state.json", latest_meta)
+    _log(
+        logger,
+        f"[fsm][merge] accepted page_type={page_type} state_id={latest_meta.get('state_id')} weak={weak_match}",
+        "merge_accepted",
+        page_type=page_type,
+        state_id=latest_meta.get("state_id"),
+        weak_match=weak_match,
+        conditions=revised,
+        screenshot_path=latest_dir / f"screenshot_{next_idx}.png",
+    )
+    return str(latest_meta.get("state_id", "")), latest_dir

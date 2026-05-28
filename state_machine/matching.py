@@ -117,14 +117,6 @@ def _select_enabled_conditions(
         score_sum += _discrimination_score(c)
         if score_sum >= MATCH_DISCRIMINATION_TARGET:
             break
-    if len(selected) == 1 and selected[0].get("kind") == "text_line_contains":
-        for c in ordered:
-            if c is selected[0]:
-                continue
-            if _stability_score(c) >= STABILITY_SCORE["mid"]:
-                selected.append(c)
-                score_sum += _discrimination_score(c)
-                break
     if score_sum < MATCH_DISCRIMINATION_TARGET:
         selected = ordered
 
