@@ -151,7 +151,21 @@ def run_agent_loop_fsm(
                 candidates_after=[summarize_match(m) for m in successes],
             )
         pending_resolution_confidence = "matcher_confirmed"
-        if len(successes) > 1:
+        transition_hint_id = str(runtime.get("last_state_id") or "")
+        transition_hint_ok = bool(runtime.get("last_transition_ok", False))
+        hinted_best = None
+        if transition_hint_ok and transition_hint_id and not force_state_resolution:
+            hinted_best = next((m for m in successes if m.state_id == transition_hint_id), None)
+        if hinted_best is not None:
+            best = hinted_best
+            pending_resolution_confidence = "transition_hint"
+            logger.text(
+                f"[fsm][selection][transition-hint] state={best.state_id}",
+                "transition_hint_selected",
+                state_id=best.state_id,
+                candidates=[summarize_match(m) for m in successes],
+            )
+        elif len(successes) > 1:
             logger.text(
                 f"[fsm][disambiguation] candidates={[m.state_id for m in successes]}",
                 "disambiguation_started",

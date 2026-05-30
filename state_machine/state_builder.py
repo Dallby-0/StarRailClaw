@@ -113,6 +113,24 @@ def _normalize_actions(raw_actions: list[Any]) -> list[dict[str, Any]]:
     return out
 
 
+def _controller_from_actions(actions: list[dict[str, Any]]) -> dict[str, Any]:
+    first = actions[0] if actions and isinstance(actions[0], dict) else None
+    if first and str(first.get("type", "click")) == "run_preset":
+        return {
+            "type": "preset",
+            "name": str(first.get("name", "")),
+            "brief": str(first.get("brief", "")),
+            "source": "llm_action",
+        }
+    if first:
+        return {
+            "type": "page_op_flow",
+            "seed_action": first,
+            "source": "llm_action",
+        }
+    return {"type": "page_op_flow", "source": "default"}
+
+
 def _create_state_from_llm(
     llm_payload: dict[str, Any],
     frame_rgb,
@@ -126,6 +144,7 @@ def _create_state_from_llm(
     conds = _conditions_from_elements(llm_payload.get("elements", []))
     conds = _extract_region_templates(frame_rgb, mapper, state_dir, conds)
     conds, weak_match = _select_enabled_conditions(conds, vision, frame_rgb)
+    actions = _normalize_actions(llm_payload.get("actions", []))
 
     state_meta = {
         "schema_version": SCHEMA_VERSION,
@@ -148,12 +167,13 @@ def _create_state_from_llm(
             }
         ],
         "match_conditions": conds,
+        "controller": _controller_from_actions(actions),
         "actions": [
             {
                 "action_id": "action_main",
                 "enabled": True,
                 "version": 1,
-                "steps": _normalize_actions(llm_payload.get("actions", [])),
+                "steps": actions,
             }
         ],
     }

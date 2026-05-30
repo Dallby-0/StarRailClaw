@@ -7,6 +7,9 @@ from typing import Any, Callable
 # Preset parameters live in code (no local json config).
 PRESET_WAIT_TIMEOUT_S = 600.0
 WAIT_TILL_COMBAT_END_TEMPLATE_PATH = Path(
+    "StateMachineResources/preset_assets/wait_till_combat_end/combat_ongoing_marker.png"
+)
+WAIT_TILL_COMBAT_END_LEGACY_TEMPLATE_PATH = Path(
     "StateMachineResources/templates/wait_till_combat_end/assets/combat_ongoing_marker.png"
 )
 WAIT_TILL_COMBAT_END_RECT = [38, 14, 63, 38]
@@ -19,6 +22,8 @@ FIND_NEXT_ATTACK_POS = (818, 735)
 
 def _run_wait_till_combat_end(emulator, vision) -> bool:
     template_path = WAIT_TILL_COMBAT_END_TEMPLATE_PATH
+    if not template_path.exists() and WAIT_TILL_COMBAT_END_LEGACY_TEMPLATE_PATH.exists():
+        template_path = WAIT_TILL_COMBAT_END_LEGACY_TEMPLATE_PATH
     if not template_path.exists():
         print(f"[preset] missing template: {template_path}")
         return False

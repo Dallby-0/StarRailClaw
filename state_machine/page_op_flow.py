@@ -294,10 +294,11 @@ def _normalize_op(raw: Any, *, vision: VisionEngine, frame_rgb, mapper: Coordina
     }
 
 
-def _merge_catalog_patch(flow: dict[str, Any], patch: dict[str, Any], *, vision: VisionEngine, frame_rgb, mapper: CoordinateMapper, state_dir: Path) -> None:
+def _merge_catalog_patch(flow: dict[str, Any], patch: dict[str, Any], *, vision: VisionEngine, frame_rgb, mapper: CoordinateMapper, state_dir: Path) -> set[str]:
     catalog = flow["op_catalog"]
     ops = catalog["ops"]
     by_id = {str(op.get("op_id")): op for op in ops if isinstance(op, dict)}
+    touched: set[str] = set()
     for raw in patch.get("new_ops", []) if isinstance(patch.get("new_ops"), list) else []:
         op = _normalize_op(raw, vision=vision, frame_rgb=frame_rgb, mapper=mapper, state_dir=state_dir)
         if op is None:
@@ -306,6 +307,7 @@ def _merge_catalog_patch(flow: dict[str, Any], patch: dict[str, Any], *, vision:
             continue
         ops.append(op)
         by_id[op["op_id"]] = op
+        touched.add(op["op_id"])
     for raw in patch.get("repaired_ops", []) if isinstance(patch.get("repaired_ops"), list) else []:
         target = _slug(raw.get("op_id"), "")
         if not target or target not in by_id:
@@ -319,12 +321,15 @@ def _merge_catalog_patch(flow: dict[str, Any], patch: dict[str, Any], *, vision:
         old.update(op)
         old["effectless"] = False
         old["updated_at"] = _now_iso()
+        touched.add(target)
     disabled = patch.get("disabled_ops") if isinstance(patch.get("disabled_ops"), list) else []
     for raw_id in disabled:
         op = by_id.get(_slug(raw_id, str(raw_id)))
         if op is not None:
             op["status"] = "disabled"
             op["updated_at"] = _now_iso()
+            touched.add(str(op.get("op_id")))
+    return touched
 
 
 def _parse_page_op_step(text: str) -> dict[str, Any] | None:
@@ -379,6 +384,7 @@ def _request_page_op_step(
                 "若 progress=false，catalog_patch 可保持 should_patch=false。"
                 "如果上一步无进度，优先判断是否需要 retry；retry 后仍无进度时，给出替代 op 或修复已有 op。"
                 "action 当前只支持单次 click，坐标为 1000x1000 逻辑坐标。"
+                "复用已有 op 前必须确认它在当前截图仍可见且可点击；如果按钮/目标位置变化，必须用 repaired_ops 给出新坐标和当前截图可验证的条件。"
             ),
             "current_state": state_slug,
             "current_prefix_node": current_node,
@@ -442,20 +448,43 @@ def _condition_list_pass(conditions: list[dict[str, Any]], vision: VisionEngine,
     return all(_condition_eval(c, vision, frame_rgb)[0] for c in conditions if isinstance(c, dict))
 
 
-def _select_decision_op(flow: dict[str, Any], decision: dict[str, Any], vision: VisionEngine, frame_rgb) -> dict[str, Any] | None:
+def _has_conditions(op: dict[str, Any]) -> bool:
+    for key in ("visibility_conditions", "readiness_conditions"):
+        conditions = op.get(key)
+        if isinstance(conditions, list) and any(isinstance(c, dict) for c in conditions):
+            return True
+    return False
+
+
+def _op_applicable(op: dict[str, Any], vision: VisionEngine, frame_rgb, *, allow_unguarded: bool = False) -> bool:
+    if op.get("status", "active") != "active" or bool(op.get("effectless", False)):
+        return False
+    visibility = op.get("visibility_conditions")
+    readiness = op.get("readiness_conditions")
+    has_guards = _has_conditions(op)
+    if not has_guards and not allow_unguarded:
+        return False
+    if isinstance(visibility, list) and visibility and not _condition_list_pass(visibility, vision, frame_rgb):
+        return False
+    if isinstance(readiness, list) and readiness and not _condition_list_pass(readiness, vision, frame_rgb):
+        return False
+    return True
+
+
+def _select_decision_op(flow: dict[str, Any], decision: dict[str, Any], vision: VisionEngine, frame_rgb, *, fresh_op_ids: set[str] | None = None) -> dict[str, Any] | None:
+    fresh_op_ids = fresh_op_ids or set()
     op_id = str(decision.get("op_id", "")).strip()
     if op_id:
-        op = _find_op(flow, _slug(op_id, op_id))
-        if op is not None and op.get("status", "active") == "active" and not bool(op.get("effectless", False)):
-            readiness = op.get("readiness_conditions")
-            if isinstance(readiness, list) and readiness and not _condition_list_pass(readiness, vision, frame_rgb):
-                return None
+        normalized_id = _slug(op_id, op_id)
+        op = _find_op(flow, normalized_id)
+        if op is not None and _op_applicable(op, vision, frame_rgb, allow_unguarded=normalized_id in fresh_op_ids):
             return op
     active = _active_ops(flow)
-    with_readiness = [op for op in active if isinstance(op.get("readiness_conditions"), list) and op.get("readiness_conditions") and _condition_list_pass(op["readiness_conditions"], vision, frame_rgb)]
-    if with_readiness:
-        return with_readiness[0]
-    return active[0] if active else None
+    guarded = [op for op in active if _op_applicable(op, vision, frame_rgb)]
+    if guarded:
+        return guarded[0]
+    fresh = [op for op in active if str(op.get("op_id")) in fresh_op_ids and _op_applicable(op, vision, frame_rgb, allow_unguarded=True)]
+    return fresh[0] if fresh else None
 
 
 def _mark_op_result(op: dict[str, Any], result: str, reason: str = "") -> None:
@@ -543,8 +572,10 @@ def _run_page_op_flow(
     flow = ensure_page_op_flow(state_meta)
     current_node = "root"
     pending_decision: dict[str, Any] | None = None
+    fresh_op_ids: set[str] = set()
     no_progress_count = 0
     made_progress = False
+    emergency_repair_used = False
 
     if isinstance(seed_step, dict):
         response = _request_page_op_step(
@@ -582,7 +613,7 @@ def _run_page_op_flow(
         _save_runtime(runtime)
         if response is None:
             return False, current
-        _merge_catalog_patch(flow, response.get("catalog_patch", {}), vision=vision, frame_rgb=current, mapper=mapper, state_dir=state_dir)
+        fresh_op_ids |= _merge_catalog_patch(flow, response.get("catalog_patch", {}), vision=vision, frame_rgb=current, mapper=mapper, state_dir=state_dir)
         effect = response.get("effect_judgement", {}) if isinstance(response.get("effect_judgement"), dict) else {}
         seed_id = _seed_op_id(seed_step)
         if bool(effect.get("progress", False)):
@@ -626,16 +657,52 @@ def _run_page_op_flow(
             _save_runtime(runtime)
             if response is None:
                 return made_progress, current
-            _merge_catalog_patch(flow, response.get("catalog_patch", {}), vision=vision, frame_rgb=current, mapper=mapper, state_dir=state_dir)
+            fresh_op_ids |= _merge_catalog_patch(flow, response.get("catalog_patch", {}), vision=vision, frame_rgb=current, mapper=mapper, state_dir=state_dir)
             pending_decision = response.get("decision", {})
             state_meta["updated_at"] = _now_iso()
             _save_json(state_path, state_meta)
 
-        op = _select_decision_op(flow, pending_decision or {}, vision, current)
+        op = _select_decision_op(flow, pending_decision or {}, vision, current, fresh_op_ids=fresh_op_ids)
         pending_decision = None
         if op is None:
-            _log(logger, f"[fsm][op] no executable op node={current_node}", "page_op_no_executable", state_id=state_id, node=current_node)
-            return made_progress, current
+            if not emergency_repair_used:
+                emergency_repair_used = True
+                response = _request_page_op_step(
+                    llm=llm,
+                    session_id=llm_session_id,
+                    frame_rgb=current,
+                    previous_frame_rgb=None,
+                    system_prompt=system_prompt,
+                    state_slug=state_slug,
+                    flow=flow,
+                    current_node=current_node,
+                    request={
+                        "has_previous_action": False,
+                        "need_effect_judgement": False,
+                        "need_catalog_patch": True,
+                        "need_decision": True,
+                        "need_repair": True,
+                        "reason": "no_executable_guarded_op",
+                        "instruction": "当前没有任何旧 op 在截图上通过可见/可点击条件。请修复 catalog：优先给出当前截图可验证的新 op 或 repaired_ops，不要复用无条件旧坐标。",
+                    },
+                    logger=logger,
+                    effort="high",
+                )
+                runtime["llm_turn_count"] = int(runtime.get("llm_turn_count", 0)) + 1
+                _save_runtime(runtime)
+                if response is not None:
+                    fresh_op_ids |= _merge_catalog_patch(flow, response.get("catalog_patch", {}), vision=vision, frame_rgb=current, mapper=mapper, state_dir=state_dir)
+                    pending_decision = response.get("decision", {}) if isinstance(response.get("decision"), dict) else {}
+                    state_meta["updated_at"] = _now_iso()
+                    _save_json(state_path, state_meta)
+                    op = _select_decision_op(flow, pending_decision or {}, vision, current, fresh_op_ids=fresh_op_ids)
+                    pending_decision = None
+            if op is None:
+                _log(logger, f"[fsm][op] no executable op node={current_node}", "page_op_no_executable", state_id=state_id, node=current_node)
+                return made_progress, current
+            fresh_op_ids.discard(str(op.get("op_id")))
+        else:
+            fresh_op_ids.discard(str(op.get("op_id")))
 
         if not _execute_click(emulator, mapper, op, logger, state_id=state_id, action_id=action_id, attempt=f"op:{step_idx}"):
             return made_progress, current
@@ -793,7 +860,7 @@ def _run_page_op_flow(
             no_progress_count = 0
             _mark_op_result(op, "progress", "")
             current_node = _record_tree_result(flow, current_node, str(op.get("op_id")), "progress")
-            _merge_catalog_patch(flow, response.get("catalog_patch", {}), vision=vision, frame_rgb=post, mapper=mapper, state_dir=state_dir)
+            fresh_op_ids |= _merge_catalog_patch(flow, response.get("catalog_patch", {}), vision=vision, frame_rgb=post, mapper=mapper, state_dir=state_dir)
             next_decision = response.get("decision", {}) if isinstance(response.get("decision"), dict) else {}
             pending_decision = next_decision if next_decision.get("op_id") else None
             current = post
@@ -802,12 +869,47 @@ def _run_page_op_flow(
             if effectless:
                 _mark_op_result(op, "effectless", reason)
             _record_tree_result(flow, current_node, str(op.get("op_id")), "effectless")
-            _merge_catalog_patch(flow, response.get("catalog_patch", {}), vision=vision, frame_rgb=post, mapper=mapper, state_dir=state_dir)
+            fresh_op_ids |= _merge_catalog_patch(flow, response.get("catalog_patch", {}), vision=vision, frame_rgb=post, mapper=mapper, state_dir=state_dir)
             next_decision = response.get("decision", {}) if isinstance(response.get("decision"), dict) else {}
             pending_decision = next_decision if next_decision.get("op_id") else None
             no_progress_count += 1
             current = post
             if no_progress_count >= LOCAL_FLOW_NO_PROGRESS_LIMIT:
+                if not emergency_repair_used:
+                    emergency_repair_used = True
+                    response = _request_page_op_step(
+                        llm=llm,
+                        session_id=llm_session_id,
+                        frame_rgb=current,
+                        previous_frame_rgb=None,
+                        system_prompt=system_prompt,
+                        state_slug=state_slug,
+                        flow=flow,
+                        current_node=current_node,
+                        request={
+                            "has_previous_action": True,
+                            "previous_op": op.get("op_id"),
+                            "need_effect_judgement": False,
+                            "need_catalog_patch": True,
+                            "need_decision": True,
+                            "need_repair": True,
+                            "runtime_signals": {"no_progress_count": no_progress_count},
+                            "reason": "local_no_progress_limit",
+                            "instruction": "连续操作无进展。请禁用或修复无效 op，并给出当前截图下可验证的新 op 或 repaired_ops。",
+                        },
+                        logger=logger,
+                        effort="high",
+                    )
+                    runtime["llm_turn_count"] = int(runtime.get("llm_turn_count", 0)) + 1
+                    _save_runtime(runtime)
+                    if response is not None:
+                        fresh_op_ids |= _merge_catalog_patch(flow, response.get("catalog_patch", {}), vision=vision, frame_rgb=current, mapper=mapper, state_dir=state_dir)
+                        next_decision = response.get("decision", {}) if isinstance(response.get("decision"), dict) else {}
+                        pending_decision = next_decision if next_decision.get("op_id") else None
+                        no_progress_count = 0
+                        state_meta["updated_at"] = _now_iso()
+                        _save_json(state_path, state_meta)
+                        continue
                 _log(logger, f"[fsm][op] no progress limit hit state={state_id}", "page_local_no_progress", state_id=state_id, limit=LOCAL_FLOW_NO_PROGRESS_LIMIT)
                 state_meta["updated_at"] = _now_iso()
                 _save_json(state_path, state_meta)

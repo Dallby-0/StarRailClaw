@@ -56,25 +56,6 @@ def _parse_llm_payload(text: str) -> dict[str, Any] | None:
     return payload
 
 
-def _parse_llm_repair(text: str) -> dict[str, Any] | None:
-    try:
-        payload = json.loads(text)
-    except Exception:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    required = {"judgement", "mode", "actions"}
-    if not required.issubset(payload.keys()):
-        return None
-    if payload.get("mode") not in {"override", "append"}:
-        return None
-    if payload.get("judgement") not in {"invalid", "partial"}:
-        return None
-    if not isinstance(payload.get("actions"), list):
-        return None
-    return payload
-
-
 def _parse_llm_failure_diagnosis(text: str) -> dict[str, Any] | None:
     try:
         payload = json.loads(text)

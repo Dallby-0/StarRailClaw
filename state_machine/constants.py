@@ -18,7 +18,6 @@ UNKNOWN_STABILITY_DIFF_THRESHOLD = 0.1
 UNKNOWN_STABILITY_SAMPLE_INTERVAL_S = 0.5
 UNKNOWN_STABILITY_RETRY_WAIT_S = 5.0
 LLM_PARSE_RETRY = 2
-MAX_RETRY_PER_ACTION = 2
 PRESET_WAIT_TIMEOUT_S = 600.0
 LOCAL_FLOW_MAX_STEPS = 12
 LOCAL_FLOW_NO_PROGRESS_LIMIT = 2
@@ -30,7 +29,6 @@ MID_LIMIT = 10
 HARD_LIMIT = 15
 FORCE_RESET_AT = 16
 
-REPAIR_EFFORTS = ["low", "mid", "high"]
 DISCRIMINATION_SCORE = {"high": 4, "mid": 2, "low": 1}
 STABILITY_SCORE = {"high": 3, "mid": 2, "low": 1}
 MATCH_DISCRIMINATION_TARGET = 4
@@ -40,12 +38,16 @@ LLM_FSM_PROMPT_BASE = """你是视觉驱动游戏自动化的状态标注器和�
 当前任务目标由任务工作区中的 task_summary.md 提供；如果没有任务概要，则仅按当前画面推进通用游戏自动化流程。
 
 你将收到一张游戏截图。你的任务：
-1) 识别并输出用于区分该页面的关键信息，按重要性排序。
+1) 识别并输出用于区分该页面的关键信息，按匹配价值排序：优先高 stability 且高 discrimination 的 pattern，其次是稳定 text_line。
 2) 输出推进流程的动作序列（1000x1000逻辑坐标）。
 
 强约束：
 - 必须输出严格 JSON 对象，字段必须符合约定。
 - elements: 每项必须有 type。
+  - elements 应优先服务于“页面匹配”，不是描述画面。优先输出最能稳定区分当前页面类型的元素。
+  - 除非当前画面几乎没有稳定视觉图案，否则 elements 中至少应包含 1 个 type=pattern。
+  - 如果页面上同时存在文字和稳定视觉图案，应优先选择“1 个高区分度 pattern + 1 个稳定 text_line”的组合，而不是只输出 text_line。
+  - pattern 用于抵抗 OCR 失败和区分页布局；不要因为页面上有文字就省略 pattern。
   - type=text_line: 必须给 text, bbox[x1,y1,x2,y2], brief。
     - runtime 对 text_line 使用单行 OCR；一个 bbox 必须只框住一行文本，不要框多行、段落或包含上下相邻文字。
     - text 字段会作为该单行 OCR 结果的 contains 子串匹配，不是精确等于，也不是正则。
@@ -56,8 +58,12 @@ LLM_FSM_PROMPT_BASE = """你是视觉驱动游戏自动化的状态标注器和�
     - 如果目标信息分布在多行，请拆成多个 text_line 元素，每个元素只对应一行。
     - 优先选择页面标题、固定标签、固定按钮文字、固定栏目名、稳定类别词；避免选择长正文、叙事描述、实例名称、对象名称、奖励名称、数值、编号、进度、计数等容易变化的内容。
   - type=pattern: 必须给 bbox[x1,y1,x2,y2], brief。
+    - pattern 是首选页面区分信号之一；只要画面中存在稳定且有区分度的视觉区域，就应该输出 pattern。
     - pattern 的 bbox 区域将直接作为模板图像用于匹配，请尽量紧贴图案边缘裁剪，避免包含大面积背景，否则背景变化会导致匹配失败。
-    - 如果一个图案内部包含可独立识别的子元素（例如按钮上的文字、图标、数字等），且该子元素具有稳定的视觉特征，优先选择该子元素的 bbox，而不是整个父级图案。这能提高匹配的鲁棒性
+    - 优先选择高稳定、高区分度的小区域：固定图标、选中态页签、弹窗固定装饰、页面专属徽标、固定按钮图标、固定控件边缘/形状。
+    - 避免选择会变化的区域：角色立绘、奖励物品、随机名称、数值、进度、列表内容、动态特效、大面积背景。
+    - 如果一个图案内部包含可独立识别的子元素（例如按钮上的图标、页签标识、固定角标等），且该子元素具有稳定的视觉特征，优先选择该子元素的 bbox，而不是整个父级图案。这能提高匹配的鲁棒性。
+    - 如果 pattern 很可能能单独区分页面类型，应给 discrimination=high；如果同类页面中基本不变化，应给 stability=high。
   - 每项必须额外给 stability 和 discrimination。
     - stability 表示该元素在同类型页面中不变化的程度，只能是 high/mid/low。
     - discrimination 表示该元素能区分当前页面的能力，只能是 high/mid/low。

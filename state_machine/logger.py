@@ -61,8 +61,7 @@ class FsmRunLogger:
             "presets": 0,
             "transitions": 0,
             "edges_added": 0,
-            "repairs": 0,
-            "repair_failures": 0,
+            "page_op_failures": 0,
             "ocr_calls": 0,
             "ocr_errors": 0,
             "last_state_id": None,
@@ -73,17 +72,11 @@ class FsmRunLogger:
                 "unknown_stability_stable": 0,
                 "unknown_unstable_waits": 0,
                 "page_local_enters": 0,
-                "page_handler_hits": 0,
-                "page_handler_misses": 0,
-                "page_handler_invalid": 0,
-                "page_handler_rejected": 0,
                 "page_local_steps": 0,
                 "page_local_changed_steps": 0,
                 "transition_reachable_misses": 0,
                 "transitions_to_unknown": 0,
-                "transitions_after_repair": 0,
                 "state_misidentified": 0,
-                "repair_skipped": 0,
                 "action_skipped": 0,
                 "llm_payload_invalid": 0,
                 "disambiguation_started": 0,
@@ -93,7 +86,6 @@ class FsmRunLogger:
             "by_state": {},
             "by_action": {},
             "transition_reasons": {},
-            "repair_efforts": {},
             "rates": {},
             "paths": {
                 "run_dir": str(self.run_dir),
@@ -197,8 +189,7 @@ def _summary_text(summary: dict[str, Any]) -> str:
         f"presets: {summary.get('presets')}",
         f"transitions: {summary.get('transitions')}",
         f"edges_added: {summary.get('edges_added')}",
-        f"repairs: {summary.get('repairs')}",
-        f"repair_failures: {summary.get('repair_failures')}",
+        f"page_op_failures: {summary.get('page_op_failures')}",
         f"ocr_calls: {summary.get('ocr_calls')}",
         f"ocr_errors: {summary.get('ocr_errors')}",
         f"last_state_id: {summary.get('last_state_id')}",
@@ -232,9 +223,6 @@ def _summary_text(summary: dict[str, Any]) -> str:
             "Transition Reasons",
             *_format_top_dict(summary.get("transition_reasons"), limit=12),
             "",
-            "Repair Efforts",
-            *_format_top_dict(summary.get("repair_efforts"), limit=8),
-            "",
             "Paths",
         ]
     )
@@ -261,6 +249,8 @@ def _event_delta(event: str, row: dict[str, Any]) -> dict[str, Any]:
         delta["last_state_id"] = row.get("state_id")
     elif event == "merge_rejected":
         delta["merge_rejected"] = 1
+    elif event == "controller_start":
+        delta["actions"] = 1
     elif event == "action_attempt":
         delta["actions"] = 1
     elif event == "action_click":
@@ -279,10 +269,8 @@ def _event_delta(event: str, row: dict[str, Any]) -> dict[str, Any]:
             delta["last_state_id"] = row.get("to_state")
     elif event == "graph_edge_added":
         delta["edges_added"] = 1
-    elif event == "repair_applied":
-        delta["repairs"] = 1
-    elif event == "repair_failed":
-        delta["repair_failures"] = 1
+    elif event == "controller_exhausted":
+        delta["page_op_failures"] = 1
     elif event == "ocr_summary":
         delta["ocr_calls"] = int(row.get("calls", 0) or 0)
         delta["ocr_errors"] = int(row.get("errors", 0) or 0)
@@ -312,8 +300,7 @@ def _apply_delta(summary: dict[str, Any], delta: dict[str, Any]) -> None:
         "presets",
         "transitions",
         "edges_added",
-        "repairs",
-        "repair_failures",
+        "page_op_failures",
         "ocr_calls",
         "ocr_errors",
     ):
@@ -382,14 +369,6 @@ def _apply_mechanism_stats(summary: dict[str, Any], event: str, row: dict[str, A
         _incr(mechanisms, "unknown_unstable_waits")
     elif event in {"page_local_enter", "page_local_enter_after_repair"}:
         _incr(mechanisms, "page_local_enters")
-    elif event == "page_handler_hit":
-        _incr(mechanisms, "page_handler_hits")
-    elif event == "page_handler_miss":
-        _incr(mechanisms, "page_handler_misses")
-    elif event == "page_handler_invalid":
-        _incr(mechanisms, "page_handler_invalid")
-    elif event == "page_handler_rejected":
-        _incr(mechanisms, "page_handler_rejected")
     elif event == "page_local_step_result":
         _incr(mechanisms, "page_local_steps")
         if bool(row.get("changed")):
@@ -401,13 +380,6 @@ def _apply_mechanism_stats(summary: dict[str, Any], event: str, row: dict[str, A
         _incr(_bucket(summary, "transition_reasons"), reason)
         if not row.get("to_state"):
             _incr(mechanisms, "transitions_to_unknown")
-        if "repair" in reason or row.get("effort"):
-            _incr(mechanisms, "transitions_after_repair")
-    elif event == "repair_applied":
-        effort = str(row.get("effort", "") or "unknown")
-        _incr(_bucket(summary, "repair_efforts"), effort)
-    elif event == "repair_skipped":
-        _incr(mechanisms, "repair_skipped")
     elif event == "action_skipped":
         _incr(mechanisms, "action_skipped")
     elif event == "state_misidentified":
@@ -435,10 +407,8 @@ def _refresh_rates(summary: dict[str, Any]) -> None:
         mechanisms = {}
     loops = int(summary.get("loops", 0) or 0)
     actions = int(summary.get("actions", 0) or 0)
-    repairs = int(summary.get("repairs", 0) or 0)
     transitions = int(summary.get("transitions", 0) or 0)
     stability_checks = int(mechanisms.get("unknown_stability_checks", 0) or 0)
-    handler_total = int(mechanisms.get("page_handler_hits", 0) or 0) + int(mechanisms.get("page_handler_misses", 0) or 0)
     page_local_steps = int(mechanisms.get("page_local_steps", 0) or 0)
 
     rates = {
@@ -447,10 +417,8 @@ def _refresh_rates(summary: dict[str, Any]) -> None:
         "actions_per_loop": _ratio(actions, loops),
         "transitions_per_action": _ratio(transitions, actions),
         "transitions_to_unknown_per_transition": _ratio(mechanisms.get("transitions_to_unknown"), transitions),
-        "repairs_per_action": _ratio(repairs, actions),
-        "repair_success_transition_rate": _ratio(mechanisms.get("transitions_after_repair"), repairs),
+        "page_op_failures_per_action": _ratio(summary.get("page_op_failures"), actions),
         "page_local_enters_per_action": _ratio(mechanisms.get("page_local_enters"), actions),
-        "page_handler_hit_rate": _ratio(mechanisms.get("page_handler_hits"), handler_total),
         "page_local_changed_step_rate": _ratio(mechanisms.get("page_local_changed_steps"), page_local_steps),
         "unknown_stability_stable_rate": _ratio(mechanisms.get("unknown_stability_stable"), stability_checks),
         "merge_accept_rate": _ratio(

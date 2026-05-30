@@ -38,6 +38,94 @@ def _candidate_summary_for_llm(match: MatchResult, meta: dict[str, Any]) -> dict
     }
 
 
+def _condition_rank(cond: dict[str, Any]) -> tuple[int, int]:
+    score = {"low": 1, "mid": 2, "high": 3}
+    stability = score.get(str(cond.get("stability", "mid")).lower(), 2)
+    discrimination = score.get(str(cond.get("discrimination", "mid")).lower(), 2)
+    return discrimination, stability
+
+
+def _sample_frames(state_dir: Path, meta: dict[str, Any], *, limit: int = 3) -> list[Any]:
+    frames: list[Any] = []
+    for p in _sample_paths_from_meta(state_dir, meta)[:limit]:
+        img = _load_frame(p)
+        if img is not None:
+            frames.append(img)
+    return frames
+
+
+def _try_exclude_current_from_losers(
+    *,
+    winner: MatchResult,
+    losers: list[MatchResult],
+    metas: list[tuple[Path, dict[str, Any]]],
+    vision: VisionEngine,
+    frame_rgb,
+    logger: FsmRunLogger | None = None,
+) -> dict[str, str]:
+    strengthened: dict[str, str] = {}
+    failures: dict[str, str] = {}
+    for loser in losers:
+        item = _meta_for_state(metas, loser.state_id)
+        if item is None:
+            failures[loser.state_id] = "meta_not_found"
+            continue
+        loser_dir, loser_meta = item
+        frames = _sample_frames(loser_dir, loser_meta)
+        if not frames:
+            failures[loser.state_id] = "no_positive_samples"
+            continue
+        conds = [c for c in loser_meta.get("match_conditions", []) if isinstance(c, dict)]
+        disabled = [c for c in conds if not c.get("enabled", False) and c.get("condition_status", "active") == "active"]
+        candidates: list[dict[str, Any]] = []
+        for cond in disabled:
+            current_ok, _ = _condition_eval(cond, vision, frame_rgb)
+            if current_ok:
+                continue
+            if all(_condition_eval(cond, vision, sample)[0] for sample in frames):
+                candidates.append(cond)
+        if not candidates:
+            failures[loser.state_id] = "no_condition_passes_loser_samples_and_fails_current"
+            continue
+        selected = sorted(candidates, key=_condition_rank, reverse=True)[0]
+        selected["enabled"] = True
+        loser_meta.setdefault("model_info", {})
+        if isinstance(loser_meta["model_info"], dict):
+            loser_meta["model_info"]["last_exclusion_reason"] = {
+                "source": "runtime_disambiguation",
+                "winner_state_id": winner.state_id,
+                "enabled_condition_id": str(selected.get("id", "")),
+                "reason": "condition passes loser positive samples but fails current disambiguated screen",
+                "created_at": _now_iso(),
+            }
+        loser_meta["updated_at"] = _now_iso()
+        _save_json(loser_dir / "state.json", loser_meta)
+        strengthened[loser.state_id] = str(selected.get("id", ""))
+    if logger is not None:
+        logger.event(
+            "disambiguation_losers_strengthened",
+            winner_state_id=winner.state_id,
+            strengthened=strengthened,
+            failures=failures,
+        )
+        if strengthened:
+            logger.text(
+                f"[fsm][disambiguation][losers] winner={winner.state_id} strengthened={strengthened}",
+                "disambiguation_losers_strengthened_console",
+                winner_state_id=winner.state_id,
+                strengthened=strengthened,
+                failures=failures,
+            )
+        elif failures:
+            logger.text(
+                f"[fsm][disambiguation][losers] winner={winner.state_id} no exclusion conditions failures={failures}",
+                "disambiguation_losers_strengthen_failed",
+                winner_state_id=winner.state_id,
+                failures=failures,
+            )
+    return strengthened
+
+
 def _try_strengthen_winner_conditions(
     *,
     winner: MatchResult,
@@ -52,59 +140,22 @@ def _try_strengthen_winner_conditions(
         return False
     winner_dir, winner_meta = found
     conds = [c for c in winner_meta.get("match_conditions", []) if isinstance(c, dict)]
-    current_enabled = [c for c in conds if c.get("enabled", False)]
     disabled = [c for c in conds if not c.get("enabled", False) and c.get("condition_status", "active") == "active"]
-    passing_disabled: list[dict[str, Any]] = []
+    selected: list[dict[str, Any]] = []
     for cond in disabled:
         ok, _ = _condition_eval(cond, vision, frame_rgb)
         if ok:
-            passing_disabled.append(cond)
-    if not passing_disabled:
-        return False
-
-    loser_samples: dict[str, list[Any]] = {}
-    for loser in losers:
-        item = _meta_for_state(metas, loser.state_id)
-        if item is None:
-            continue
-        loser_dir, loser_meta = item
-        frames: list[Any] = []
-        for p in _sample_paths_from_meta(loser_dir, loser_meta)[:3]:
-            img = _load_frame(p)
-            if img is not None:
-                frames.append(img)
-        loser_samples[loser.state_id] = frames
-
-    selected: list[dict[str, Any]] = []
-    remaining = {l.state_id for l in losers}
-    while remaining:
-        best_cond = None
-        best_excluded: set[str] = set()
-        for cond in passing_disabled:
-            if cond in selected:
-                continue
-            excluded: set[str] = set()
-            for loser_id in remaining:
-                frames = loser_samples.get(loser_id) or []
-                if frames and not any(_condition_eval(cond, vision, img)[0] for img in frames):
-                    excluded.add(loser_id)
-            if len(excluded) > len(best_excluded):
-                best_cond = cond
-                best_excluded = excluded
-        if best_cond is None or not best_excluded:
+            selected.append(cond)
             break
-        selected.append(best_cond)
-        remaining -= best_excluded
     if not selected:
         return False
-
-    for c in conds:
-        c["enabled"] = c in current_enabled or c in selected
+    for c in selected:
+        c["enabled"] = True
     winner_meta.setdefault("model_info", {})
     if isinstance(winner_meta["model_info"], dict):
         winner_meta["model_info"]["weak_match"] = False
         winner_meta["model_info"]["last_enabled_reason"] = {
-            "source": "runtime_disambiguation",
+            "source": "runtime_disambiguation_winner_fallback",
             "winner_against": [l.state_id for l in losers],
             "added_condition_ids": [str(c.get("id", "")) for c in selected],
             "created_at": _now_iso(),
@@ -159,5 +210,7 @@ def _disambiguate_matches(
         return None
     winner = by_id[winner_id]
     losers = [m for m in successes if m.state_id != winner_id]
-    _try_strengthen_winner_conditions(winner=winner, losers=losers, metas=metas, vision=vision, frame_rgb=frame_rgb, logger=logger)
+    strengthened = _try_exclude_current_from_losers(winner=winner, losers=losers, metas=metas, vision=vision, frame_rgb=frame_rgb, logger=logger)
+    if len(strengthened) < len(losers):
+        _try_strengthen_winner_conditions(winner=winner, losers=losers, metas=metas, vision=vision, frame_rgb=frame_rgb, logger=logger)
     return winner

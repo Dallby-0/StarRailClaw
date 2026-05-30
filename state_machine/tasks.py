@@ -84,7 +84,4 @@ def configure_fsm_workspace(workspace: str | Path) -> Path:
             if hasattr(module, name):
                 setattr(module, name, value)
 
-    presets = sys.modules.get("state_machine.presets")
-    if presets is not None and hasattr(presets, "WAIT_TILL_COMBAT_END_TEMPLATE_PATH"):
-        presets.WAIT_TILL_COMBAT_END_TEMPLATE_PATH = root / "templates" / "wait_till_combat_end" / "assets" / "combat_ongoing_marker.png"
     return root
