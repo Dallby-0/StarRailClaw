@@ -89,6 +89,7 @@ def _ensure_fsm_resources() -> None:
                 "schema_version": SCHEMA_VERSION,
                 "created_at": _now_iso(),
                 "updated_at": _now_iso(),
+                "next_state_seq": 0,
                 "nodes": [],
                 "edges": [],
             },

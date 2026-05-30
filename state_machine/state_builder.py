@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +11,7 @@ from state_machine.constants import SCHEMA_VERSION
 from state_machine.io import _normalize_page_type, _now_iso, _save_frame, _save_json, _slugify
 from state_machine.logger import FsmRunLogger
 from state_machine.matching import _level, _select_enabled_conditions
-from state_machine.state_store import _ensure_unique_state_dir
+from state_machine.state_store import _allocate_state_id, _ensure_unique_state_dir
 
 
 def _conditions_from_elements(elements: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -138,7 +137,7 @@ def _create_state_from_llm(
     vision: VisionEngine,
     logger: FsmRunLogger | None = None,
 ) -> tuple[str, Path]:
-    state_id = uuid.uuid4().hex
+    state_id = _allocate_state_id()
     state_dir = _ensure_unique_state_dir(str(llm_payload.get("slug", "state")))
     _save_frame(state_dir / "screenshot_1.png", frame_rgb)
     conds = _conditions_from_elements(llm_payload.get("elements", []))

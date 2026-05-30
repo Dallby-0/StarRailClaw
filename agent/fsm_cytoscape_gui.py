@@ -294,6 +294,65 @@ HTML = r"""<!doctype html>
       margin-top: 2px;
     }
 
+    .flow-summary {
+      display: grid;
+      gap: 8px;
+    }
+
+    .flow-stats {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px;
+    }
+
+    .flow-stat {
+      padding: 7px 8px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #0d141d;
+    }
+
+    .flow-stat span {
+      display: block;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .op-list {
+      display: grid;
+      gap: 6px;
+      max-height: 260px;
+      overflow: auto;
+    }
+
+    .op-item {
+      padding: 7px 8px;
+      border: 1px solid var(--line);
+      border-left-width: 4px;
+      border-radius: 6px;
+      background: #0d141d;
+      overflow-wrap: anywhere;
+    }
+
+    .op-item.active {
+      border-left-color: #58c4dd;
+    }
+
+    .op-item.disabled {
+      border-left-color: #8b96a5;
+      color: #c3ccd8;
+    }
+
+    .op-item.effectless {
+      border-left-color: #e6a23c;
+    }
+
+    .op-meta {
+      color: var(--muted);
+      font-size: 11px;
+      margin-top: 2px;
+    }
+
     .lightbox {
       position: fixed;
       inset: 0;
@@ -354,6 +413,47 @@ HTML = r"""<!doctype html>
       user-select: none;
       pointer-events: none;
     }
+
+    .flowbox {
+      position: fixed;
+      inset: 0;
+      display: none;
+      z-index: 1100;
+      background: rgba(3, 6, 10, .94);
+    }
+
+    .flowbox.open {
+      display: grid;
+      grid-template-rows: auto 1fr;
+    }
+
+    .flowbox-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 12px;
+      border-bottom: 1px solid #27384c;
+      background: rgba(13, 19, 27, .96);
+    }
+
+    .flowbox-title {
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+      color: var(--muted);
+    }
+
+    #flowCy {
+      min-width: 0;
+      min-height: 0;
+      background:
+        linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px),
+        var(--bg);
+      background-size: 32px 32px;
+    }
   </style>
 </head>
 <body>
@@ -386,6 +486,10 @@ HTML = r"""<!doctype html>
           <div id="annotation" class="value">-</div>
         </div>
         <div class="section">
+          <div class="label">Page Op Flow</div>
+          <div id="pageOpFlow" class="value">-</div>
+        </div>
+        <div class="section">
           <div class="label">Runtime</div>
           <div id="runtime" class="kv"></div>
         </div>
@@ -410,6 +514,14 @@ HTML = r"""<!doctype html>
     <div id="lightboxStage" class="lightbox-stage">
       <div id="lightboxContent" class="lightbox-content"></div>
     </div>
+  </div>
+  <div id="flowbox" class="flowbox">
+    <div class="flowbox-bar">
+      <button id="flowFitBtn">Fit</button>
+      <button id="flowCloseBtn">Close</button>
+      <div id="flowTitle" class="flowbox-title">-</div>
+    </div>
+    <div id="flowCy"></div>
   </div>
 
   <script>
@@ -471,6 +583,13 @@ HTML = r"""<!doctype html>
             'text-border-opacity': .9,
             'text-border-width': 1,
             'text-max-width': 210
+          }
+        },
+        {
+          selector: 'node.has-flow',
+          style: {
+            'border-color': '#58c4dd',
+            'border-width': 4
           }
         },
         {
@@ -554,13 +673,15 @@ HTML = r"""<!doctype html>
       selectedId: null,
       templateCache: new Map(),
       templateLoadingId: null,
+      selectedTemplate: null,
       lightboxTemplate: null,
       lightboxScale: 1,
       lightboxX: 0,
       lightboxY: 0,
       lightboxDrag: null,
-      thumbnails: false,
-      labelsBelow: false,
+      flowTemplate: null,
+      thumbnails: true,
+      labelsBelow: true,
       follow: true,
       paused: false,
       didInitialLayout: false,
@@ -573,6 +694,7 @@ HTML = r"""<!doctype html>
     const taskLoadBtn = document.getElementById('taskLoadBtn');
     const selectedEl = document.getElementById('selected');
     const annotationEl = document.getElementById('annotation');
+    const pageOpFlowEl = document.getElementById('pageOpFlow');
     const runtimeEl = document.getElementById('runtime');
     const outgoingEl = document.getElementById('outgoing');
     const incomingEl = document.getElementById('incoming');
@@ -591,14 +713,129 @@ HTML = r"""<!doctype html>
     const lightboxFitBtn = document.getElementById('lightboxFitBtn');
     const lightboxOneBtn = document.getElementById('lightboxOneBtn');
     const lightboxCloseBtn = document.getElementById('lightboxCloseBtn');
+    const flowboxEl = document.getElementById('flowbox');
+    const flowCyEl = document.getElementById('flowCy');
+    const flowTitleEl = document.getElementById('flowTitle');
+    const flowFitBtn = document.getElementById('flowFitBtn');
+    const flowCloseBtn = document.getElementById('flowCloseBtn');
+
+    const flowCy = cytoscape({
+      container: flowCyEl,
+      wheelSensitivity: 0.18,
+      minZoom: 0.08,
+      maxZoom: 2.5,
+      elements: [],
+      style: [
+        {
+          selector: 'node',
+          style: {
+            'shape': 'round-rectangle',
+            'width': 210,
+            'height': 64,
+            'background-color': '#1d2b3d',
+            'border-color': '#65809f',
+            'border-width': 2,
+            'label': 'data(label)',
+            'font-family': 'Consolas, monospace',
+            'font-size': 11,
+            'font-weight': 700,
+            'color': '#eef4ff',
+            'text-wrap': 'wrap',
+            'text-max-width': 190,
+            'text-valign': 'center',
+            'text-halign': 'center',
+            'overlay-opacity': 0
+          }
+        },
+        {
+          selector: 'node.root',
+          style: {
+            'background-color': '#304762',
+            'border-color': '#f5b642',
+            'border-width': 4
+          }
+        },
+        {
+          selector: 'node.terminal',
+          style: {
+            'shape': 'ellipse',
+            'width': 92,
+            'height': 52,
+            'background-color': '#193528',
+            'border-color': '#67d391'
+          }
+        },
+        {
+          selector: 'edge',
+          style: {
+            'curve-style': 'bezier',
+            'width': 2.4,
+            'line-color': '#8ea6c1',
+            'target-arrow-color': '#8ea6c1',
+            'target-arrow-shape': 'triangle',
+            'arrow-scale': 1.1,
+            'label': 'data(label)',
+            'font-family': 'Consolas, monospace',
+            'font-size': 10,
+            'color': '#e7edf7',
+            'text-background-color': '#111821',
+            'text-background-opacity': .92,
+            'text-background-padding': 3,
+            'text-rotation': 'autorotate',
+            'overlay-opacity': 0
+          }
+        },
+        {
+          selector: 'edge.progress',
+          style: {
+            'line-color': '#58c4dd',
+            'target-arrow-color': '#58c4dd'
+          }
+        },
+        {
+          selector: 'edge.exit',
+          style: {
+            'line-color': '#67d391',
+            'target-arrow-color': '#67d391',
+            'width': 3.4
+          }
+        },
+        {
+          selector: 'edge.unknown',
+          style: {
+            'line-color': '#f5b642',
+            'target-arrow-color': '#f5b642',
+            'line-style': 'dashed'
+          }
+        },
+        {
+          selector: 'edge.effectless',
+          style: {
+            'line-color': '#8b96a5',
+            'target-arrow-color': '#8b96a5',
+            'line-style': 'dotted'
+          }
+        },
+        {
+          selector: 'edge.failed',
+          style: {
+            'line-color': '#ff4057',
+            'target-arrow-color': '#ff4057'
+          }
+        }
+      ]
+    });
 
     function shortId(id) {
-      return id ? String(id).slice(0, 8) : '-';
+      const text = id ? String(id) : '';
+      if (!text) return '-';
+      return /^\d+$/.test(text) ? text : text.slice(0, 8);
     }
 
     function nodeLabel(node) {
       const slug = node.slug || node.state_id || 'state';
-      return `${slug}\n${shortId(node.state_id)}`;
+      const flow = node.has_page_op_flow ? `\n${node.page_op_flow_label || 'page-op-flow'}` : '';
+      return `${slug}\n${shortId(node.state_id)}${flow}`;
     }
 
     function templateImageUrl(node) {
@@ -688,6 +925,8 @@ HTML = r"""<!doctype html>
             id,
             label: nodeLabel(node),
             thumbnail_url: templateImageUrl(node),
+            has_page_op_flow: !!node.has_page_op_flow,
+            page_op_flow_label: node.page_op_flow_label || '',
             slug: node.slug || id,
             state_id: id
           };
@@ -729,6 +968,9 @@ HTML = r"""<!doctype html>
         if (runtime.last_state_id) {
           cy.getElementById(runtime.last_state_id).addClass('current');
         }
+        cy.nodes().forEach(ele => {
+          ele.toggleClass('has-flow', !!ele.data('has_page_op_flow'));
+        });
         if (runtime.pending_from_state_id) {
           cy.getElementById(runtime.pending_from_state_id).addClass('pending');
         }
@@ -888,6 +1130,67 @@ HTML = r"""<!doctype html>
       annotationEl.append(list);
     }
 
+    function renderPageOpFlow(template) {
+      pageOpFlowEl.innerHTML = '';
+      const flow = template && template.page_op_flow;
+      if (!flow || !flow.present) {
+        pageOpFlowEl.textContent = '-';
+        return;
+      }
+
+      const wrap = document.createElement('div');
+      wrap.className = 'flow-summary';
+
+      const stats = document.createElement('div');
+      stats.className = 'flow-stats';
+      const statItems = [
+        ['ops', flow.op_count],
+        ['active', flow.active_count],
+        ['disabled', flow.disabled_count],
+        ['effectless', flow.effectless_count],
+        ['tree nodes', flow.tree_node_count],
+        ['root visits', flow.root_visits]
+      ];
+      for (const [label, value] of statItems) {
+        const item = document.createElement('div');
+        item.className = 'flow-stat';
+        item.innerHTML = `<span>${label}</span>${value ?? 0}`;
+        stats.append(item);
+      }
+      wrap.append(stats);
+
+      const openBtn = document.createElement('button');
+      openBtn.textContent = 'Open Flow Graph';
+      openBtn.addEventListener('click', () => openFlowGraph(template));
+      wrap.append(openBtn);
+
+      const list = document.createElement('div');
+      list.className = 'op-list';
+      for (const op of flow.ops || []) {
+        const item = document.createElement('div');
+        const status = op.effectless ? 'effectless' : (op.status || 'active');
+        item.className = `op-item ${status}`;
+        const stats = op.stats || {};
+        const action = op.action || {};
+        const title = document.createElement('div');
+        title.textContent = `${op.op_id || '-'} · ${op.status || 'active'}`;
+        const meta = document.createElement('div');
+        meta.className = 'op-meta';
+        const click = action.type === 'click' ? `click(${action.x}, ${action.y})` : (action.type || '-');
+        meta.textContent = `${op.abstract_name || '-'} · try ${stats.try_count || 0} · success ${stats.success_count || 0} · ${click}`;
+        const brief = document.createElement('div');
+        brief.className = 'op-meta';
+        brief.textContent = op.concrete_name || action.brief || '';
+        item.append(title, meta, brief);
+        list.append(item);
+      }
+      if (!(flow.ops || []).length) {
+        list.textContent = '-';
+      }
+      wrap.append(list);
+      pageOpFlowEl.append(wrap);
+    }
+
     function appendBboxes(parent, template) {
       const width = template.image_width || 1000;
       const height = template.image_height || 1000;
@@ -955,6 +1258,99 @@ HTML = r"""<!doctype html>
       lightboxStageEl.classList.remove('dragging');
     }
 
+    function flowEdgeClass(result) {
+      const s = String(result || '').toLowerCase();
+      if (s.includes('exit')) return 'exit';
+      if (s.includes('progress')) return 'progress';
+      if (s.includes('unknown')) return 'unknown';
+      if (s.includes('effectless')) return 'effectless';
+      if (s.includes('fail') || s.includes('reject')) return 'failed';
+      return '';
+    }
+
+    function opNameById(flow, opId) {
+      for (const op of flow.ops || []) {
+        if (String(op.op_id || '') === String(opId || '')) {
+          return op.abstract_name || op.concrete_name || op.op_id || opId;
+        }
+      }
+      return opId || '-';
+    }
+
+    function openFlowGraph(template) {
+      const flow = template && template.page_op_flow;
+      if (!flow || !flow.present) return;
+      state.flowTemplate = template;
+      flowCy.elements().remove();
+
+      const elements = [];
+      const treeNodes = flow.tree_nodes || {};
+      const knownIds = new Set(Object.keys(treeNodes));
+      for (const [nodeId, node] of Object.entries(treeNodes)) {
+        elements.push({
+          group: 'nodes',
+          data: {
+            id: nodeId,
+            label: `${nodeId}\nvisits ${node.visits || 0}`,
+            visits: node.visits || 0
+          },
+          classes: nodeId === 'root' ? 'root' : ''
+        });
+      }
+
+      for (const [nodeId, node] of Object.entries(treeNodes)) {
+        const children = node.children || {};
+        for (const [edgeKey, childIdRaw] of Object.entries(children)) {
+          const childId = String(childIdRaw || '');
+          if (!knownIds.has(childId)) {
+            knownIds.add(childId);
+            elements.push({
+              group: 'nodes',
+              data: { id: childId, label: childId, visits: 0 },
+              classes: 'terminal'
+            });
+          }
+          const parts = String(edgeKey).split(':');
+          const result = parts.length > 1 ? parts[parts.length - 1] : '';
+          const opId = parts.slice(0, -1).join(':') || edgeKey;
+          elements.push({
+            group: 'edges',
+            data: {
+              id: `${nodeId}->${childId}:${edgeKey}`,
+              source: nodeId,
+              target: childId,
+              label: `${opNameById(flow, opId)}:${result || 'next'}`,
+              op_id: opId,
+              result
+            },
+            classes: flowEdgeClass(result)
+          });
+        }
+      }
+
+      if (!elements.length) {
+        elements.push({ group: 'nodes', data: { id: 'root', label: 'root\nvisits 0' }, classes: 'root' });
+      }
+      flowCy.add(elements);
+      flowCy.layout({
+        name: 'dagre',
+        rankDir: 'LR',
+        nodeSep: 70,
+        rankSep: 160,
+        edgeSep: 32,
+        animate: false,
+        fit: false
+      }).run();
+      flowboxEl.classList.add('open');
+      flowTitleEl.textContent = `${template.slug || 'state'} · page_op_flow · ${flow.op_count || 0} ops · ${flow.tree_node_count || 0} tree nodes`;
+      requestAnimationFrame(() => flowCy.fit(flowCy.elements(), 60));
+    }
+
+    function closeFlowGraph() {
+      flowboxEl.classList.remove('open');
+      state.flowTemplate = null;
+    }
+
     function updateNodeViewMode(relayout = true) {
       cy.nodes().toggleClass('thumbnail', state.thumbnails);
       cy.nodes().toggleClass('label-below', state.labelsBelow);
@@ -998,7 +1394,10 @@ HTML = r"""<!doctype html>
         return;
       }
       if (state.templateCache.has(selected)) {
-        renderAnnotation(state.templateCache.get(selected));
+        const payload = state.templateCache.get(selected);
+        state.selectedTemplate = payload;
+        renderAnnotation(payload);
+        renderPageOpFlow(payload);
         return;
       }
       if (state.templateLoadingId === selected) return;
@@ -1011,12 +1410,16 @@ HTML = r"""<!doctype html>
         const payload = await res.json();
         state.templateCache.set(selected, payload);
         if ((state.selectedId || state.runtime.last_state_id) === selected) {
+          state.selectedTemplate = payload;
           renderAnnotation(payload);
+          renderPageOpFlow(payload);
         }
       } catch (err) {
         const payload = { missing: true, message: String(err) };
         state.templateCache.set(selected, payload);
+        state.selectedTemplate = payload;
         renderAnnotation(payload);
+        renderPageOpFlow(payload);
       } finally {
         state.templateLoadingId = null;
       }
@@ -1037,6 +1440,13 @@ HTML = r"""<!doctype html>
       const node = state.graph.nodes.find(n => n.state_id === selected);
       selectedEl.textContent = node ? `${node.slug}\n${node.state_id}` : '-';
       loadTemplateForSelection(selected, node);
+      if (!selected) {
+        renderPageOpFlow(null);
+      } else if (state.templateCache.has(selected)) {
+        const payload = state.templateCache.get(selected);
+        state.selectedTemplate = payload;
+        renderPageOpFlow(payload);
+      }
 
       outgoingEl.innerHTML = '';
       incomingEl.innerHTML = '';
@@ -1139,10 +1549,16 @@ HTML = r"""<!doctype html>
       if (event.key === 'Escape' && lightboxEl.classList.contains('open')) {
         closeLightbox();
       }
+      if (event.key === 'Escape' && flowboxEl.classList.contains('open')) {
+        closeFlowGraph();
+      }
     });
     window.addEventListener('resize', () => {
       if (lightboxEl.classList.contains('open')) fitLightbox();
+      if (flowboxEl.classList.contains('open')) flowCy.fit(flowCy.elements(), 60);
     });
+    flowCloseBtn.addEventListener('click', closeFlowGraph);
+    flowFitBtn.addEventListener('click', () => flowCy.fit(flowCy.elements(), 60));
 
     loadTaskList();
     poll();
@@ -1169,19 +1585,31 @@ def _file_mtime_ns(path: Path) -> int:
         return 0
 
 
-def _enabled_nodes(graph: dict[str, Any]) -> list[dict[str, Any]]:
+def _enabled_nodes(graph: dict[str, Any], graph_path: Path = GRAPH_PATH) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
+    templates_dir = _templates_dir_for_graph(graph_path)
     for node in graph.get("nodes", []):
         if not isinstance(node, dict) or not node.get("enabled", True):
             continue
         state_id = str(node.get("state_id", ""))
         if not state_id:
             continue
+        slug = str(node.get("slug", state_id))
+        flow_summary = None
+        if templates_dir is not None:
+            found = _find_template_state(templates_dir, state_id, slug)
+            if found:
+                _, meta = found
+                flow_summary = _page_op_flow_summary(meta.get("page_op_flow"))
         result.append(
             {
                 "state_id": state_id,
-                "slug": str(node.get("slug", state_id)),
+                "slug": slug,
                 "enabled": True,
+                "has_page_op_flow": bool(flow_summary and flow_summary.get("present")),
+                "page_op_flow_label": (
+                    f"flow {flow_summary.get('op_count', 0)} ops" if flow_summary and flow_summary.get("present") else ""
+                ),
             }
         )
     return result
@@ -1353,6 +1781,88 @@ def _condition_coordinate_size(conditions: list[dict[str, Any]], image_size: tup
     return int(max(1000, max_x)), int(max(1000, max_y))
 
 
+def _page_op_flow_summary(flow: Any) -> dict[str, Any]:
+    if not isinstance(flow, dict):
+        return {"present": False}
+    catalog = flow.get("op_catalog")
+    if not isinstance(catalog, dict):
+        catalog = {}
+    ops_raw = catalog.get("ops")
+    if not isinstance(ops_raw, list):
+        ops_raw = []
+    ops: list[dict[str, Any]] = []
+    active_count = 0
+    disabled_count = 0
+    effectless_count = 0
+    for raw in ops_raw:
+        if not isinstance(raw, dict):
+            continue
+        stats = raw.get("stats") if isinstance(raw.get("stats"), dict) else {}
+        action = raw.get("action") if isinstance(raw.get("action"), dict) else {}
+        status = str(raw.get("status", "active"))
+        effectless = bool(raw.get("effectless", False))
+        if effectless:
+            effectless_count += 1
+        elif status == "active":
+            active_count += 1
+        else:
+            disabled_count += 1
+        ops.append(
+            {
+                "op_id": str(raw.get("op_id", "")),
+                "concrete_name": str(raw.get("concrete_name", "")),
+                "abstract_name": str(raw.get("abstract_name", "")),
+                "status": status,
+                "effectless": effectless,
+                "effectless_reason": str(raw.get("effectless_reason", "")),
+                "action": {
+                    "type": str(action.get("type", "")),
+                    "x": action.get("x"),
+                    "y": action.get("y"),
+                    "brief": str(action.get("brief", "")),
+                },
+                "expected_after_action": raw.get("expected_after_action", {}),
+                "stats": {
+                    "try_count": int(stats.get("try_count", 0) or 0),
+                    "success_count": int(stats.get("success_count", 0) or 0),
+                    "effectless_count": int(stats.get("effectless_count", 0) or 0),
+                },
+            }
+        )
+
+    tree = flow.get("prefix_tree")
+    if not isinstance(tree, dict):
+        tree = {}
+    nodes_raw = tree.get("nodes")
+    if not isinstance(nodes_raw, dict):
+        nodes_raw = {}
+    tree_nodes: dict[str, dict[str, Any]] = {}
+    for node_id, raw in nodes_raw.items():
+        if not isinstance(raw, dict):
+            continue
+        tried_ops = raw.get("tried_ops") if isinstance(raw.get("tried_ops"), dict) else {}
+        children = raw.get("children") if isinstance(raw.get("children"), dict) else {}
+        tree_nodes[str(node_id)] = {
+            "node_id": str(raw.get("node_id", node_id)),
+            "visits": int(raw.get("visits", 0) or 0),
+            "tried_ops": tried_ops,
+            "children": {str(k): str(v) for k, v in children.items()},
+            "updated_at": str(raw.get("updated_at", "")),
+        }
+    root = tree_nodes.get("root", {})
+    return {
+        "present": True,
+        "op_count": len(ops),
+        "active_count": active_count,
+        "disabled_count": disabled_count,
+        "effectless_count": effectless_count,
+        "tree_node_count": len(tree_nodes),
+        "root_visits": int(root.get("visits", 0) or 0),
+        "ops": ops,
+        "tree_nodes": tree_nodes,
+    }
+
+
 class FsmStateHandler(BaseHTTPRequestHandler):
     graph_path = GRAPH_PATH
     runtime_path = RUNTIME_PATH
@@ -1396,7 +1906,7 @@ class FsmStateHandler(BaseHTTPRequestHandler):
 
         graph = _load_json(self.graph_path)
         runtime = _load_json(self.runtime_path)
-        nodes = _enabled_nodes(graph)
+        nodes = _enabled_nodes(graph, self.graph_path)
         node_ids = {node["state_id"] for node in nodes}
         edges = _enabled_edges(graph, node_ids)
         payload = {
@@ -1481,6 +1991,7 @@ class FsmStateHandler(BaseHTTPRequestHandler):
             "screenshot_height": size[1] if size else None,
             "conditions": conditions,
             "actions": state.get("actions", []),
+            "page_op_flow": _page_op_flow_summary(state.get("page_op_flow")),
         }
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         self._send_bytes(body, "application/json; charset=utf-8")

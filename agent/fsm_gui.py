@@ -32,6 +32,10 @@ def _load_json(path: Path) -> dict[str, Any]:
         return {}
 
 
+def _short_state_id(state_id: str) -> str:
+    return state_id if state_id.isdecimal() else state_id[:8]
+
+
 @dataclass
 class NodeDraw:
     state_id: str
@@ -170,7 +174,7 @@ class FsmGui:
             if not sid:
                 continue
             slug = str(n.get("slug", sid))
-            label = f"{slug}\\n{sid[:8]}"
+            label = f"{slug}\\n{_short_state_id(sid)}"
             lines.append(f"  {_q(sid)} [label={_q(label)}];")
 
         for e in edges:
@@ -536,7 +540,7 @@ class FsmGui:
             ow = 2 if not is_current else 4
             self.canvas.create_rectangle(x - w / 2, y - h / 2, x + w / 2, y + h / 2, fill=fill, outline=outline, width=ow)
             self.canvas.create_text(x, y - 8, text=n.slug[:24], fill="#ffffff", font=("Consolas", 10, "bold"))
-            self.canvas.create_text(x, y + 9, text=sid[:8], fill="#cdd8e8", font=("Consolas", 9))
+            self.canvas.create_text(x, y + 9, text=_short_state_id(sid), fill="#cdd8e8", font=("Consolas", 9))
 
         status = "layout=ok"
         if self.layout_error:

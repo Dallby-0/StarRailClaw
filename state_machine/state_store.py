@@ -146,6 +146,60 @@ def _ensure_unique_state_dir(slug: str) -> Path:
     return d
 
 
+def _parse_decimal_state_id(value: Any) -> int | None:
+    text = str(value or "").strip()
+    if not text.isdecimal():
+        return None
+    return int(text)
+
+
+def _allocate_state_id(width: int = 3) -> str:
+    graph = _load_json(constants.FSM_GRAPH_PATH) if constants.FSM_GRAPH_PATH.exists() else {}
+    used: set[str] = set()
+    max_seen = -1
+
+    for node in graph.get("nodes", []) if isinstance(graph.get("nodes"), list) else []:
+        if not isinstance(node, dict):
+            continue
+        state_id = str(node.get("state_id", "")).strip()
+        if not state_id:
+            continue
+        used.add(state_id)
+        parsed = _parse_decimal_state_id(state_id)
+        if parsed is not None:
+            max_seen = max(max_seen, parsed)
+
+    for _, meta in _iter_state_meta():
+        state_id = str(meta.get("state_id", "")).strip()
+        if not state_id:
+            continue
+        used.add(state_id)
+        parsed = _parse_decimal_state_id(state_id)
+        if parsed is not None:
+            max_seen = max(max_seen, parsed)
+
+    try:
+        next_seq = int(graph.get("next_state_seq", 0) or 0)
+    except Exception:
+        next_seq = 0
+    next_seq = max(next_seq, max_seen + 1, 0)
+
+    while True:
+        state_id = f"{next_seq:0{width}d}"
+        if state_id not in used:
+            break
+        next_seq += 1
+
+    graph.setdefault("schema_version", constants.SCHEMA_VERSION)
+    graph.setdefault("created_at", _now_iso())
+    graph.setdefault("nodes", [])
+    graph.setdefault("edges", [])
+    graph["next_state_seq"] = next_seq + 1
+    graph["updated_at"] = _now_iso()
+    _save_json(constants.FSM_GRAPH_PATH, graph)
+    return state_id
+
+
 def _meta_for_state(metas: list[tuple[Path, dict[str, Any]]], state_id: str) -> tuple[Path, dict[str, Any]] | None:
     for d, m in metas:
         if str(m.get("state_id", "")) == state_id:
