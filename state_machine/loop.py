@@ -39,6 +39,38 @@ from state_machine.state_store import (
 from state_machine.tasks import configure_fsm_workspace, create_task_workspace, task_workspace_path
 
 
+def _consume_resume_hint(runtime: dict, state_id: str, logger: FsmRunLogger | None = None) -> dict:
+    stack = runtime.get("resume_stack")
+    if not isinstance(stack, list) or not stack:
+        return {"mode": "normal"}
+    normalized: list[dict] = []
+    matched_index: int | None = None
+    for idx, raw in enumerate(stack):
+        if not isinstance(raw, dict):
+            continue
+        try:
+            ttl = int(raw.get("ttl", 0) or 0) - 1
+        except Exception:
+            ttl = 0
+        if ttl < 0:
+            continue
+        hint = dict(raw)
+        hint["ttl"] = ttl
+        normalized.append(hint)
+        if str(hint.get("return_state_id") or "") == state_id:
+            matched_index = len(normalized) - 1
+    if matched_index is None:
+        runtime["resume_stack"] = normalized
+        _save_runtime(runtime)
+        return {"mode": "normal"}
+    hint = normalized[matched_index]
+    runtime["resume_stack"] = normalized[:matched_index]
+    _save_runtime(runtime)
+    if logger is not None:
+        logger.event("resume_hint_consumed", state_id=state_id, hint=hint, remaining_depth=len(runtime["resume_stack"]))
+    return {"mode": "resume", "resume_hint": hint}
+
+
 def run_agent_loop_fsm(
     *,
     session_id: str,
@@ -300,6 +332,7 @@ def run_agent_loop_fsm(
             runtime["force_exclude_state_id"] = None
         _save_runtime(runtime)
 
+        entry_context = _consume_resume_hint(runtime, best.state_id, logger=logger)
         ok, post_frame = _execute_state_action(
             emulator=emulator,
             mapper=mapper,
@@ -314,6 +347,7 @@ def run_agent_loop_fsm(
             system_prompt=system_prompt,
             graph=_load_json(FSM_GRAPH_PATH),
             prefer_reachable_first=True,
+            entry_context=entry_context,
             logger=logger,
         )
         prev_frame = post_frame if ok else frame

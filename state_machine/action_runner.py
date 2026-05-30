@@ -260,6 +260,7 @@ def _execute_state_action(
     system_prompt: str,
     graph: dict[str, Any],
     prefer_reachable_first: bool,
+    entry_context: dict[str, Any] | None = None,
     logger: FsmRunLogger | None = None,
 ) -> tuple[bool, Any]:
     from state_machine.page_op_flow import _run_page_op_flow
@@ -334,6 +335,7 @@ def _execute_state_action(
             graph=graph,
             prefer_reachable_first=prefer_reachable_first,
             state_slug=str(state_meta.get("slug", state_id)),
+            entry_context=entry_context,
             logger=logger,
         )
         if local_ok:

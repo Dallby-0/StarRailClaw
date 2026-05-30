@@ -25,6 +25,7 @@ from state_machine.logger import FsmRunLogger, summarize_match
 from state_machine.matching import _condition_eval, _find_match_by_state
 from state_machine.screen import _screen_changed
 from state_machine.transition_policy import _defer_unknown_transition, _resolve_transition_after_progress
+from state_machine.weak_guards import WEAK_GUARDS_ENABLED, WEAK_ROI_KIND, evaluate_condition as _eval_weak_guard, materialize_condition as _materialize_weak_guard, normalize_condition as _normalize_weak_guard
 
 
 def _log(logger: FsmRunLogger | None, message: str, event: str = "console", **fields: Any) -> None:
@@ -66,13 +67,19 @@ def ensure_page_op_flow(meta: dict[str, Any]) -> dict[str, Any]:
         "root",
         {
             "node_id": "root",
+            "label": "",
+            "notes": "",
             "visits": 0,
             "first_seen_at": _now_iso(),
             "updated_at": _now_iso(),
+            "candidate_ops": [],
+            "blocked_ops": {},
+            "last_observed_actions": [],
             "tried_ops": {},
             "children": {},
         },
     )
+    _node(flow, "root")
     return flow
 
 
@@ -107,13 +114,35 @@ def _node(flow: dict[str, Any], node_id: str) -> dict[str, Any]:
     if node_id not in nodes or not isinstance(nodes[node_id], dict):
         nodes[node_id] = {
             "node_id": node_id,
+            "label": "",
+            "notes": "",
             "visits": 0,
             "first_seen_at": _now_iso(),
             "updated_at": _now_iso(),
+            "candidate_ops": [],
+            "blocked_ops": {},
+            "last_observed_actions": [],
             "tried_ops": {},
             "children": {},
         }
-    return nodes[node_id]
+    node = nodes[node_id]
+    node.setdefault("node_id", node_id)
+    node.setdefault("label", "")
+    node.setdefault("notes", "")
+    node.setdefault("visits", 0)
+    node.setdefault("first_seen_at", _now_iso())
+    node.setdefault("updated_at", _now_iso())
+    if not isinstance(node.get("candidate_ops"), list):
+        node["candidate_ops"] = []
+    if not isinstance(node.get("blocked_ops"), dict):
+        node["blocked_ops"] = {}
+    if not isinstance(node.get("last_observed_actions"), list):
+        node["last_observed_actions"] = []
+    if not isinstance(node.get("tried_ops"), dict):
+        node["tried_ops"] = {}
+    if not isinstance(node.get("children"), dict):
+        node["children"] = {}
+    return node
 
 
 def _active_ops(flow: dict[str, Any]) -> list[dict[str, Any]]:
@@ -154,6 +183,9 @@ def _normalize_condition(cond: Any) -> dict[str, Any] | None:
         return None
     if kind == "line_contains_text":
         kind = "text_line_contains"
+    weak = _normalize_weak_guard({**cond, "kind": kind}) if WEAK_GUARDS_ENABLED else None
+    if weak is not None:
+        return weak
     if kind == "text_line_contains":
         text = str(params.get("text") or params.get("contains") or cond.get("text") or "").strip()
         if not text:
@@ -189,6 +221,8 @@ def _materialize_condition(cond: dict[str, Any], *, state_dir: Path, frame_rgb, 
     params = dict(out.get("params", {}))
     out["params"] = params
     out["id"] = out.get("id") or suffix
+    if out.get("kind") == WEAK_ROI_KIND and WEAK_GUARDS_ENABLED:
+        return _materialize_weak_guard(out, frame_rgb=frame_rgb, mapper=mapper)
     if out.get("kind") != "region_template":
         return out
     rect = params.get("rect")
@@ -227,7 +261,7 @@ def _dry_run_conditions(
         cond = _materialize_condition(cond, state_dir=state_dir, frame_rgb=frame_rgb, mapper=mapper, suffix=f"{op_id}_{bucket}_{idx}")
         if cond is None:
             continue
-        ok, detail = _condition_eval(cond, vision, frame_rgb)
+        ok, detail = _page_op_condition_eval(cond, vision, frame_rgb, mapper)
         if ok:
             active.append(cond)
             continue
@@ -268,6 +302,10 @@ def _normalize_op(raw: Any, *, vision: VisionEngine, frame_rgb, mapper: Coordina
     expected = raw.get("expected_after_action")
     if not isinstance(expected, dict):
         expected = {}
+    try:
+        resume_ttl = int(expected.get("resume_ttl", 8) or 8)
+    except Exception:
+        resume_ttl = 8
     return {
         "op_id": op_id,
         "concrete_name": str(raw.get("concrete_name") or raw.get("name") or op_id),
@@ -281,6 +319,11 @@ def _normalize_op(raw: Any, *, vision: VisionEngine, frame_rgb, mapper: Coordina
         "expected_after_action": {
             "exit_page": bool(expected.get("exit_page", expected.get("exit_likely", False))),
             "same_page_progress": bool(expected.get("same_page_progress", expected.get("same_page_likely", True))),
+            "temporary_interrupt": bool(expected.get("temporary_interrupt", False)),
+            "resume_policy": str(expected.get("resume_policy", "")),
+            "resume_node": str(expected.get("resume_node", "")),
+            "intent": str(expected.get("intent", "")),
+            "resume_ttl": resume_ttl,
             "observable_changes": expected.get("observable_changes", []) if isinstance(expected.get("observable_changes"), list) else [],
             "reason": str(expected.get("reason", "")),
         },
@@ -332,6 +375,69 @@ def _merge_catalog_patch(flow: dict[str, Any], patch: dict[str, Any], *, vision:
     return touched
 
 
+def _append_unique(target: list[Any], values: list[Any], *, limit: int | None = None) -> None:
+    seen = {str(v) for v in target}
+    for raw in values:
+        value = str(raw).strip()
+        if not value or value in seen:
+            continue
+        target.append(value)
+        seen.add(value)
+    if limit is not None and len(target) > limit:
+        del target[:-limit]
+
+
+def _apply_node_patch(flow: dict[str, Any], node_id: str, patch: dict[str, Any]) -> None:
+    if not isinstance(patch, dict):
+        return
+    node = _node(flow, node_id)
+    if "label" in patch:
+        node["label"] = str(patch.get("label") or "")[:120]
+    if "notes" in patch:
+        node["notes"] = str(patch.get("notes") or "")[:500]
+    add = patch.get("candidate_ops_add") if isinstance(patch.get("candidate_ops_add"), list) else []
+    remove = {_slug(v, str(v)) for v in patch.get("candidate_ops_remove", [])} if isinstance(patch.get("candidate_ops_remove"), list) else set()
+    candidates = node.get("candidate_ops") if isinstance(node.get("candidate_ops"), list) else []
+    if remove:
+        candidates = [op_id for op_id in candidates if _slug(op_id, str(op_id)) not in remove]
+        node["candidate_ops"] = candidates
+    _append_unique(candidates, [_slug(v, str(v)) for v in add], limit=64)
+    blocked = patch.get("blocked_ops") if isinstance(patch.get("blocked_ops"), dict) else {}
+    node_blocked = node.get("blocked_ops") if isinstance(node.get("blocked_ops"), dict) else {}
+    node["blocked_ops"] = node_blocked
+    for raw_id, raw_reason in blocked.items():
+        op_id = _slug(raw_id, str(raw_id))
+        if op_id:
+            node_blocked[op_id] = {"reason": str(raw_reason)[:300], "updated_at": _now_iso()}
+    observed = patch.get("last_observed_actions") if isinstance(patch.get("last_observed_actions"), list) else []
+    if observed:
+        node["last_observed_actions"] = [v for v in observed if isinstance(v, dict) or isinstance(v, str)][-12:]
+    node["updated_at"] = _now_iso()
+
+
+def _attach_fresh_ops_to_node(flow: dict[str, Any], node_id: str, op_ids: set[str]) -> None:
+    if not op_ids:
+        return
+    node = _node(flow, node_id)
+    candidates = node.get("candidate_ops") if isinstance(node.get("candidate_ops"), list) else []
+    node["candidate_ops"] = candidates
+    _append_unique(candidates, sorted(op_ids), limit=64)
+    node["updated_at"] = _now_iso()
+
+
+def _block_node_op(flow: dict[str, Any], node_id: str, op_id: str, reason: str) -> None:
+    node = _node(flow, node_id)
+    blocked = node.get("blocked_ops") if isinstance(node.get("blocked_ops"), dict) else {}
+    node["blocked_ops"] = blocked
+    blocked[_slug(op_id, op_id)] = {"reason": reason[:300], "updated_at": _now_iso()}
+    node["updated_at"] = _now_iso()
+
+
+def _is_node_blocked(flow: dict[str, Any], node_id: str, op_id: str) -> bool:
+    blocked = _node(flow, node_id).get("blocked_ops")
+    return isinstance(blocked, dict) and _slug(op_id, op_id) in blocked
+
+
 def _parse_page_op_step(text: str) -> dict[str, Any] | None:
     try:
         payload = json.loads(text)
@@ -349,6 +455,10 @@ def _parse_page_op_step(text: str) -> dict[str, Any] | None:
     if effect is not None and not isinstance(effect, dict):
         return None
     payload.setdefault("catalog_patch", {"should_patch": False, "new_ops": [], "repaired_ops": [], "disabled_ops": []})
+    node_patch = payload.get("node_patch")
+    if node_patch is not None and not isinstance(node_patch, dict):
+        return None
+    payload.setdefault("node_patch", {})
     payload.setdefault("effect_judgement", {})
     payload.setdefault("decision", {})
     payload["needs_retry"] = bool(payload.get("needs_retry", False))
@@ -377,14 +487,21 @@ def _request_page_op_step(
                 "你正在同一外部页面状态内推进流程。只输出严格 JSON。"
                 "你不能输出 from_node/to_node/edge，也不能维护图结构；局部前缀树由 runtime 维护。"
                 "如需补充操作，只输出当前截图下可执行或可探索的 op。"
-                "condition 只能是 text_line_contains 或 region_template；如果你给出的 condition 在当前截图 dry-run 不通过，runtime 会拒绝它，"
+                "条件优先级：稳定单行 OCR(text_line_contains) > 固定控件/控件状态模板(region_template) > 弱 ROI 存在性(weak_roi_presence)。"
+                "weak_roi_presence 只能在 OCR/template 都不合适时作为兜底；不要把具体对象名称、奖励名、数值、进度或实例内容作为可复用条件。"
+                "描述操作时使用通用术语：选项、条目、按钮、控件、候选目标、可交互区域；不要使用任务领域对象类别。"
+                "condition 只能是 text_line_contains、region_template 或 weak_roi_presence；如果你给出的 condition 在当前截图 dry-run 不通过，runtime 会拒绝它，"
                 "但 op 仍可作为低置信探索操作保留。区分 visibility_conditions 和 readiness_conditions：可见不等于可点击。"
                 "如果上一步有进度且是第一次进入当前局部节点，必须尽量补充当前截图下的新候选操作，并给出下一步 decision。"
                 "当 request.need_catalog_patch=if_progress_enters_new_prefix_node 时，若你判断 progress=true，就等价于必须补充新节点候选操作；"
                 "若 progress=false，catalog_patch 可保持 should_patch=false。"
                 "如果上一步无进度，优先判断是否需要 retry；retry 后仍无进度时，给出替代 op 或修复已有 op。"
                 "action 当前只支持单次 click，坐标为 1000x1000 逻辑坐标。"
-                "复用已有 op 前必须确认它在当前截图仍可见且可点击；如果按钮/目标位置变化，必须用 repaired_ops 给出新坐标和当前截图可验证的条件。"
+                "复用已有 op 前必须确认它在当前截图仍可见且可点击；如果相似按钮/目标在不同页面或分支中位置变化，优先 new_ops 新建当前分支 op，"
+                "并用 node_patch.candidate_ops_add 绑定到当前节点；只有确认同一个 op 定义本身错了才用 repaired_ops。"
+                "op_catalog 是全局动作库，不等于当前节点可执行列表；当前节点的 candidate_ops 才表示本分支优先尝试的操作。"
+                "操作无效时优先用 node_patch.blocked_ops 隔离到当前节点，只有确认该 op 全局都不应再用时才写 disabled_ops。"
+                "last_observed_actions 只作为诊断记录，不作为可直接执行的动作池。"
             ),
             "current_state": state_slug,
             "current_prefix_node": current_node,
@@ -406,14 +523,32 @@ def _request_page_op_step(
                             "op_id": "stable id",
                             "concrete_name": "具体操作",
                             "abstract_name": "泛化操作名",
-                            "visibility_conditions": [],
-                            "readiness_conditions": [],
+                            "visibility_conditions": ["prefer text_line_contains/region_template; weak_roi_presence only as fallback"],
+                            "readiness_conditions": ["same condition kinds as visibility_conditions"],
                             "action": {"type": "click", "x": 0, "y": 0, "brief": ""},
-                            "expected_after_action": {"exit_page": False, "same_page_progress": True, "observable_changes": [], "reason": ""},
+                            "expected_after_action": {
+                                "exit_page": False,
+                                "same_page_progress": True,
+                                "temporary_interrupt": False,
+                                "resume_policy": "",
+                                "resume_node": "",
+                                "intent": "",
+                                "resume_ttl": 8,
+                                "observable_changes": [],
+                                "reason": "",
+                            },
                         }
                     ],
                     "repaired_ops": [],
                     "disabled_ops": [],
+                },
+                "node_patch": {
+                    "label": "optional current branch label",
+                    "notes": "optional current branch notes",
+                    "candidate_ops_add": ["op ids preferred in this node"],
+                    "candidate_ops_remove": ["op ids no longer suitable for this node"],
+                    "blocked_ops": {"op_id": "reason blocked only in this node"},
+                    "last_observed_actions": ["diagnostic summaries only"],
                 },
                 "decision": {"op_id": "existing_or_new_op_id", "reason": "short string"},
                 "needs_retry": "boolean",
@@ -442,10 +577,18 @@ def _request_page_op_step(
     return None
 
 
-def _condition_list_pass(conditions: list[dict[str, Any]], vision: VisionEngine, frame_rgb) -> bool:
+def _page_op_condition_eval(cond: dict[str, Any], vision: VisionEngine, frame_rgb, mapper: CoordinateMapper) -> tuple[bool, dict[str, Any]]:
+    if cond.get("kind") == WEAK_ROI_KIND:
+        if not WEAK_GUARDS_ENABLED:
+            return False, {"kind": WEAK_ROI_KIND, "passed": False, "reason": "weak_guards_disabled"}
+        return _eval_weak_guard(cond, frame_rgb=frame_rgb, mapper=mapper)
+    return _condition_eval(cond, vision, frame_rgb)
+
+
+def _condition_list_pass(conditions: list[dict[str, Any]], vision: VisionEngine, frame_rgb, mapper: CoordinateMapper) -> bool:
     if not conditions:
         return True
-    return all(_condition_eval(c, vision, frame_rgb)[0] for c in conditions if isinstance(c, dict))
+    return all(_page_op_condition_eval(c, vision, frame_rgb, mapper)[0] for c in conditions if isinstance(c, dict))
 
 
 def _has_conditions(op: dict[str, Any]) -> bool:
@@ -456,7 +599,20 @@ def _has_conditions(op: dict[str, Any]) -> bool:
     return False
 
 
-def _op_applicable(op: dict[str, Any], vision: VisionEngine, frame_rgb, *, allow_unguarded: bool = False) -> bool:
+def _guard_rank(op: dict[str, Any]) -> int:
+    ranks = {"text_line_contains": 40, "region_template": 35, WEAK_ROI_KIND: 10}
+    best = 0
+    for key in ("visibility_conditions", "readiness_conditions"):
+        conditions = op.get(key)
+        if not isinstance(conditions, list):
+            continue
+        for cond in conditions:
+            if isinstance(cond, dict):
+                best = max(best, ranks.get(str(cond.get("kind", "")), 0))
+    return best
+
+
+def _op_applicable(op: dict[str, Any], vision: VisionEngine, frame_rgb, mapper: CoordinateMapper, *, allow_unguarded: bool = False) -> bool:
     if op.get("status", "active") != "active" or bool(op.get("effectless", False)):
         return False
     visibility = op.get("visibility_conditions")
@@ -464,26 +620,55 @@ def _op_applicable(op: dict[str, Any], vision: VisionEngine, frame_rgb, *, allow
     has_guards = _has_conditions(op)
     if not has_guards and not allow_unguarded:
         return False
-    if isinstance(visibility, list) and visibility and not _condition_list_pass(visibility, vision, frame_rgb):
+    if isinstance(visibility, list) and visibility and not _condition_list_pass(visibility, vision, frame_rgb, mapper):
         return False
-    if isinstance(readiness, list) and readiness and not _condition_list_pass(readiness, vision, frame_rgb):
+    if isinstance(readiness, list) and readiness and not _condition_list_pass(readiness, vision, frame_rgb, mapper):
         return False
     return True
 
 
-def _select_decision_op(flow: dict[str, Any], decision: dict[str, Any], vision: VisionEngine, frame_rgb, *, fresh_op_ids: set[str] | None = None) -> dict[str, Any] | None:
+def _node_candidate_ids(flow: dict[str, Any], node_id: str, resume_hint: dict[str, Any] | None = None) -> list[str]:
+    ids: list[str] = []
+    if isinstance(resume_hint, dict):
+        expected_node = str(resume_hint.get("expected_node") or resume_hint.get("resume_node") or "")
+        previous_node = str(resume_hint.get("previous_node") or "")
+        for hint_node in (expected_node, previous_node):
+            if hint_node and hint_node in flow.get("prefix_tree", {}).get("nodes", {}):
+                _append_unique(ids, [str(v) for v in _node(flow, hint_node).get("candidate_ops", [])])
+    _append_unique(ids, [str(v) for v in _node(flow, node_id).get("candidate_ops", [])])
+    return ids
+
+
+def _select_decision_op(
+    flow: dict[str, Any],
+    node_id: str,
+    decision: dict[str, Any],
+    vision: VisionEngine,
+    frame_rgb,
+    mapper: CoordinateMapper,
+    *,
+    fresh_op_ids: set[str] | None = None,
+    resume_hint: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     fresh_op_ids = fresh_op_ids or set()
     op_id = str(decision.get("op_id", "")).strip()
     if op_id:
         normalized_id = _slug(op_id, op_id)
         op = _find_op(flow, normalized_id)
-        if op is not None and _op_applicable(op, vision, frame_rgb, allow_unguarded=normalized_id in fresh_op_ids):
+        if op is not None and not _is_node_blocked(flow, node_id, normalized_id) and _op_applicable(op, vision, frame_rgb, mapper, allow_unguarded=normalized_id in fresh_op_ids):
+            return op
+    for candidate_id in _node_candidate_ids(flow, node_id, resume_hint):
+        normalized_id = _slug(candidate_id, candidate_id)
+        if _is_node_blocked(flow, node_id, normalized_id):
+            continue
+        op = _find_op(flow, normalized_id)
+        if op is not None and _op_applicable(op, vision, frame_rgb, mapper, allow_unguarded=normalized_id in fresh_op_ids):
             return op
     active = _active_ops(flow)
-    guarded = [op for op in active if _op_applicable(op, vision, frame_rgb)]
+    guarded = [op for op in active if not _is_node_blocked(flow, node_id, str(op.get("op_id"))) and _op_applicable(op, vision, frame_rgb, mapper)]
     if guarded:
-        return guarded[0]
-    fresh = [op for op in active if str(op.get("op_id")) in fresh_op_ids and _op_applicable(op, vision, frame_rgb, allow_unguarded=True)]
+        return sorted(guarded, key=_guard_rank, reverse=True)[0]
+    fresh = [op for op in active if str(op.get("op_id")) in fresh_op_ids and not _is_node_blocked(flow, node_id, str(op.get("op_id"))) and _op_applicable(op, vision, frame_rgb, mapper, allow_unguarded=True)]
     return fresh[0] if fresh else None
 
 
@@ -497,8 +682,7 @@ def _mark_op_result(op: dict[str, Any], result: str, reason: str = "") -> None:
         stats["success_count"] = int(stats.get("success_count", 0) or 0) + 1
     if result == "effectless":
         stats["effectless_count"] = int(stats.get("effectless_count", 0) or 0) + 1
-        op["effectless"] = True
-        op["effectless_reason"] = reason
+        op["last_effectless_reason"] = reason
     op["updated_at"] = _now_iso()
 
 
@@ -545,6 +729,35 @@ def _execute_click(emulator: EmulatorClient, mapper: CoordinateMapper, op: dict[
     return True
 
 
+def _push_resume_hint(runtime: dict[str, Any], *, state_id: str, current_node: str, op: dict[str, Any], logger: FsmRunLogger | None) -> None:
+    expected = op.get("expected_after_action") if isinstance(op.get("expected_after_action"), dict) else {}
+    if not bool(expected.get("temporary_interrupt", False)):
+        return
+    try:
+        ttl = int(expected.get("resume_ttl", 8) or 8)
+    except Exception:
+        ttl = 8
+    stack = runtime.get("resume_stack")
+    if not isinstance(stack, list):
+        stack = []
+        runtime["resume_stack"] = stack
+    hint = {
+        "return_state_id": state_id,
+        "previous_node": current_node,
+        "expected_node": str(expected.get("resume_node") or ""),
+        "last_op_id": str(op.get("op_id") or ""),
+        "intent": str(expected.get("intent") or expected.get("reason") or "resume_after_interrupt"),
+        "resume_policy": str(expected.get("resume_policy") or "prefer_expected_node"),
+        "ttl": ttl,
+        "created_at": _now_iso(),
+    }
+    stack.append(hint)
+    if len(stack) > 8:
+        del stack[:-8]
+    _save_runtime(runtime)
+    _log(logger, f"[fsm][op][resume] pushed state={state_id} node={current_node} op={hint['last_op_id']}", "page_op_resume_pushed", state_id=state_id, node=current_node, hint=hint)
+
+
 def _run_page_op_flow(
     *,
     emulator: EmulatorClient,
@@ -564,6 +777,7 @@ def _run_page_op_flow(
     state_slug: str,
     seed_step: dict[str, Any] | None = None,
     seed_before_frame=None,
+    entry_context: dict[str, Any] | None = None,
     logger: FsmRunLogger | None = None,
 ) -> tuple[bool, Any]:
     current = start_frame
@@ -576,6 +790,8 @@ def _run_page_op_flow(
     no_progress_count = 0
     made_progress = False
     emergency_repair_used = False
+    entry_context = entry_context if isinstance(entry_context, dict) else {"mode": "normal"}
+    resume_hint = entry_context.get("resume_hint") if isinstance(entry_context.get("resume_hint"), dict) else None
 
     if isinstance(seed_step, dict):
         response = _request_page_op_step(
@@ -594,6 +810,7 @@ def _run_page_op_flow(
                 "need_catalog_patch": "if_progress_enters_new_prefix_node",
                 "need_decision": True,
                 "runtime_signals": seed_step.get("runtime_observation", {}),
+                "entry_context": entry_context,
                 "reason": "external_action_self_loop_enter_page_flow",
                 "effect_classes": [
                     "semantic_exit_same_type",
@@ -613,7 +830,8 @@ def _run_page_op_flow(
         _save_runtime(runtime)
         if response is None:
             return False, current
-        fresh_op_ids |= _merge_catalog_patch(flow, response.get("catalog_patch", {}), vision=vision, frame_rgb=current, mapper=mapper, state_dir=state_dir)
+        fresh = _merge_catalog_patch(flow, response.get("catalog_patch", {}), vision=vision, frame_rgb=current, mapper=mapper, state_dir=state_dir)
+        fresh_op_ids |= fresh
         effect = response.get("effect_judgement", {}) if isinstance(response.get("effect_judgement"), dict) else {}
         seed_id = _seed_op_id(seed_step)
         if bool(effect.get("progress", False)):
@@ -622,6 +840,8 @@ def _run_page_op_flow(
         else:
             _record_tree_result(flow, current_node, seed_id, "effectless")
             no_progress_count = 1 if bool(effect.get("effectless", False)) else 0
+        _apply_node_patch(flow, current_node, response.get("node_patch", {}))
+        _attach_fresh_ops_to_node(flow, current_node, fresh)
         decision = response.get("decision", {}) if isinstance(response.get("decision"), dict) else {}
         pending_decision = decision if decision.get("op_id") else None
         state_meta["updated_at"] = _now_iso()
@@ -634,6 +854,7 @@ def _run_page_op_flow(
         "need_catalog_patch": True,
         "need_decision": True,
         "reason": "enter_page_op_flow",
+        "entry_context": entry_context,
     }
 
     for step_idx in range(1, LOCAL_FLOW_MAX_STEPS + 1):
@@ -657,12 +878,15 @@ def _run_page_op_flow(
             _save_runtime(runtime)
             if response is None:
                 return made_progress, current
-            fresh_op_ids |= _merge_catalog_patch(flow, response.get("catalog_patch", {}), vision=vision, frame_rgb=current, mapper=mapper, state_dir=state_dir)
+            fresh = _merge_catalog_patch(flow, response.get("catalog_patch", {}), vision=vision, frame_rgb=current, mapper=mapper, state_dir=state_dir)
+            fresh_op_ids |= fresh
+            _apply_node_patch(flow, current_node, response.get("node_patch", {}))
+            _attach_fresh_ops_to_node(flow, current_node, fresh)
             pending_decision = response.get("decision", {})
             state_meta["updated_at"] = _now_iso()
             _save_json(state_path, state_meta)
 
-        op = _select_decision_op(flow, pending_decision or {}, vision, current, fresh_op_ids=fresh_op_ids)
+        op = _select_decision_op(flow, current_node, pending_decision or {}, vision, current, mapper, fresh_op_ids=fresh_op_ids, resume_hint=resume_hint)
         pending_decision = None
         if op is None:
             if not emergency_repair_used:
@@ -691,11 +915,14 @@ def _run_page_op_flow(
                 runtime["llm_turn_count"] = int(runtime.get("llm_turn_count", 0)) + 1
                 _save_runtime(runtime)
                 if response is not None:
-                    fresh_op_ids |= _merge_catalog_patch(flow, response.get("catalog_patch", {}), vision=vision, frame_rgb=current, mapper=mapper, state_dir=state_dir)
+                    fresh = _merge_catalog_patch(flow, response.get("catalog_patch", {}), vision=vision, frame_rgb=current, mapper=mapper, state_dir=state_dir)
+                    fresh_op_ids |= fresh
+                    _apply_node_patch(flow, current_node, response.get("node_patch", {}))
+                    _attach_fresh_ops_to_node(flow, current_node, fresh)
                     pending_decision = response.get("decision", {}) if isinstance(response.get("decision"), dict) else {}
                     state_meta["updated_at"] = _now_iso()
                     _save_json(state_path, state_meta)
-                    op = _select_decision_op(flow, pending_decision or {}, vision, current, fresh_op_ids=fresh_op_ids)
+                    op = _select_decision_op(flow, current_node, pending_decision or {}, vision, current, mapper, fresh_op_ids=fresh_op_ids, resume_hint=resume_hint)
                     pending_decision = None
             if op is None:
                 _log(logger, f"[fsm][op] no executable op node={current_node}", "page_op_no_executable", state_id=state_id, node=current_node)
@@ -703,6 +930,7 @@ def _run_page_op_flow(
             fresh_op_ids.discard(str(op.get("op_id")))
         else:
             fresh_op_ids.discard(str(op.get("op_id")))
+        resume_hint = None
 
         if not _execute_click(emulator, mapper, op, logger, state_id=state_id, action_id=action_id, attempt=f"op:{step_idx}"):
             return made_progress, current
@@ -739,6 +967,7 @@ def _run_page_op_flow(
         if nxt is not None:
             _mark_op_result(op, "progress", "")
             _record_tree_result(flow, current_node, str(op.get("op_id")), "exit")
+            _push_resume_hint(runtime, state_id=state_id, current_node=current_node, op=op, logger=logger)
             state_meta["updated_at"] = _now_iso()
             _save_json(state_path, state_meta)
             return True, post
@@ -746,6 +975,7 @@ def _run_page_op_flow(
         if curr_match is None or not curr_match.success:
             _mark_op_result(op, "progress", "")
             _record_tree_result(flow, current_node, str(op.get("op_id")), "unknown")
+            _push_resume_hint(runtime, state_id=state_id, current_node=current_node, op=op, logger=logger)
             state_meta["updated_at"] = _now_iso()
             _save_json(state_path, state_meta)
             return _defer_unknown_transition(
@@ -807,6 +1037,7 @@ def _run_page_op_flow(
             if nxt_retry is not None:
                 _mark_op_result(op, "progress", "")
                 _record_tree_result(flow, current_node, str(op.get("op_id")), "exit")
+                _push_resume_hint(runtime, state_id=state_id, current_node=current_node, op=op, logger=logger)
                 state_meta["updated_at"] = _now_iso()
                 _save_json(state_path, state_meta)
                 return True, retry_post
@@ -814,6 +1045,7 @@ def _run_page_op_flow(
             if curr_retry is None or not curr_retry.success:
                 _mark_op_result(op, "progress", "")
                 _record_tree_result(flow, current_node, str(op.get("op_id")), "unknown")
+                _push_resume_hint(runtime, state_id=state_id, current_node=current_node, op=op, logger=logger)
                 state_meta["updated_at"] = _now_iso()
                 _save_json(state_path, state_meta)
                 return _defer_unknown_transition(
@@ -860,16 +1092,23 @@ def _run_page_op_flow(
             no_progress_count = 0
             _mark_op_result(op, "progress", "")
             current_node = _record_tree_result(flow, current_node, str(op.get("op_id")), "progress")
-            fresh_op_ids |= _merge_catalog_patch(flow, response.get("catalog_patch", {}), vision=vision, frame_rgb=post, mapper=mapper, state_dir=state_dir)
+            fresh = _merge_catalog_patch(flow, response.get("catalog_patch", {}), vision=vision, frame_rgb=post, mapper=mapper, state_dir=state_dir)
+            fresh_op_ids |= fresh
+            _apply_node_patch(flow, current_node, response.get("node_patch", {}))
+            _attach_fresh_ops_to_node(flow, current_node, fresh)
             next_decision = response.get("decision", {}) if isinstance(response.get("decision"), dict) else {}
             pending_decision = next_decision if next_decision.get("op_id") else None
             current = post
         else:
             reason = str(effect.get("evidence") or "llm judged no effective progress")
             if effectless:
+                _block_node_op(flow, current_node, str(op.get("op_id")), reason)
                 _mark_op_result(op, "effectless", reason)
             _record_tree_result(flow, current_node, str(op.get("op_id")), "effectless")
-            fresh_op_ids |= _merge_catalog_patch(flow, response.get("catalog_patch", {}), vision=vision, frame_rgb=post, mapper=mapper, state_dir=state_dir)
+            fresh = _merge_catalog_patch(flow, response.get("catalog_patch", {}), vision=vision, frame_rgb=post, mapper=mapper, state_dir=state_dir)
+            fresh_op_ids |= fresh
+            _apply_node_patch(flow, current_node, response.get("node_patch", {}))
+            _attach_fresh_ops_to_node(flow, current_node, fresh)
             next_decision = response.get("decision", {}) if isinstance(response.get("decision"), dict) else {}
             pending_decision = next_decision if next_decision.get("op_id") else None
             no_progress_count += 1
@@ -903,7 +1142,10 @@ def _run_page_op_flow(
                     runtime["llm_turn_count"] = int(runtime.get("llm_turn_count", 0)) + 1
                     _save_runtime(runtime)
                     if response is not None:
-                        fresh_op_ids |= _merge_catalog_patch(flow, response.get("catalog_patch", {}), vision=vision, frame_rgb=current, mapper=mapper, state_dir=state_dir)
+                        fresh = _merge_catalog_patch(flow, response.get("catalog_patch", {}), vision=vision, frame_rgb=current, mapper=mapper, state_dir=state_dir)
+                        fresh_op_ids |= fresh
+                        _apply_node_patch(flow, current_node, response.get("node_patch", {}))
+                        _attach_fresh_ops_to_node(flow, current_node, fresh)
                         next_decision = response.get("decision", {}) if isinstance(response.get("decision"), dict) else {}
                         pending_decision = next_decision if next_decision.get("op_id") else None
                         no_progress_count = 0
