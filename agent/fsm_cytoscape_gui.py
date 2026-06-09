@@ -454,6 +454,43 @@ HTML = r"""<!doctype html>
         var(--bg);
       background-size: 32px 32px;
     }
+
+    .flowbox-body {
+      display: grid;
+      grid-template-columns: 1fr 360px;
+      min-height: 0;
+    }
+
+    .flow-detail {
+      min-width: 0;
+      overflow: auto;
+      border-left: 1px solid var(--line);
+      background: var(--panel);
+      padding: 12px;
+    }
+
+    .detail-block {
+      padding: 9px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .detail-block:first-child {
+      padding-top: 0;
+    }
+
+    .detail-title {
+      color: #eef4ff;
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+
+    .detail-meta {
+      color: var(--muted);
+      font-size: 11px;
+      margin-top: 4px;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+    }
   </style>
 </head>
 <body>
@@ -521,7 +558,10 @@ HTML = r"""<!doctype html>
       <button id="flowCloseBtn">Close</button>
       <div id="flowTitle" class="flowbox-title">-</div>
     </div>
-    <div id="flowCy"></div>
+    <div class="flowbox-body">
+      <div id="flowCy"></div>
+      <aside id="flowDetail" class="flow-detail">Select a node or edge.</aside>
+    </div>
   </div>
 
   <script>
@@ -715,6 +755,7 @@ HTML = r"""<!doctype html>
     const lightboxCloseBtn = document.getElementById('lightboxCloseBtn');
     const flowboxEl = document.getElementById('flowbox');
     const flowCyEl = document.getElementById('flowCy');
+    const flowDetailEl = document.getElementById('flowDetail');
     const flowTitleEl = document.getElementById('flowTitle');
     const flowFitBtn = document.getElementById('flowFitBtn');
     const flowCloseBtn = document.getElementById('flowCloseBtn');
@@ -1172,16 +1213,21 @@ HTML = r"""<!doctype html>
         item.className = `op-item ${status}`;
         const stats = op.stats || {};
         const action = op.action || {};
+        const cond = op.condition_counts || {};
+        const expected = op.expected_after_action || {};
         const title = document.createElement('div');
         title.textContent = `${op.op_id || '-'} · ${op.status || 'active'}`;
         const meta = document.createElement('div');
         meta.className = 'op-meta';
         const click = action.type === 'click' ? `click(${action.x}, ${action.y})` : (action.type || '-');
         meta.textContent = `${op.abstract_name || '-'} · try ${stats.try_count || 0} · success ${stats.success_count || 0} · ${click}`;
+        const meta2 = document.createElement('div');
+        meta2.className = 'op-meta';
+        meta2.textContent = `conditions v/r/rej ${cond.visibility || 0}/${cond.readiness || 0}/${cond.rejected || 0} · exit=${expected.exit_page ?? '-'} progress=${expected.same_page_progress ?? '-'}`;
         const brief = document.createElement('div');
         brief.className = 'op-meta';
         brief.textContent = op.concrete_name || action.brief || '';
-        item.append(title, meta, brief);
+        item.append(title, meta, meta2, brief);
         list.append(item);
       }
       if (!(flow.ops || []).length) {
@@ -1277,6 +1323,66 @@ HTML = r"""<!doctype html>
       return opId || '-';
     }
 
+    function opById(flow, opId) {
+      for (const op of flow.ops || []) {
+        if (String(op.op_id || '') === String(opId || '')) return op;
+      }
+      return null;
+    }
+
+    function escapeText(value) {
+      return String(value ?? '').replace(/[&<>"']/g, ch => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;'
+      }[ch]));
+    }
+
+    function detailBlock(title, body) {
+      return `<div class="detail-block"><div class="detail-title">${escapeText(title)}</div><div class="detail-meta">${escapeText(body)}</div></div>`;
+    }
+
+    function renderFlowDetail(kind, data) {
+      const flow = state.flowTemplate && state.flowTemplate.page_op_flow;
+      if (!flow || !flow.present) {
+        flowDetailEl.textContent = '-';
+        return;
+      }
+      if (kind === 'node') {
+        const tried = data.tried_ops || {};
+        const lines = Object.entries(tried).map(([opId, result]) => {
+          const r = result || {};
+          return `${opId}: ${r.last_result || '-'} ${r.updated_at || ''}`;
+        });
+        flowDetailEl.innerHTML = [
+          detailBlock(data.id || data.node_id || 'node', `visits: ${data.visits || 0}\nupdated: ${data.updated_at || '-'}`),
+          detailBlock('tried_ops', lines.length ? lines.join('\n') : '-')
+        ].join('');
+        return;
+      }
+      if (kind === 'edge') {
+        const op = opById(flow, data.op_id) || {};
+        const stats = op.stats || {};
+        const action = op.action || {};
+        const expected = op.expected_after_action || {};
+        const cond = op.condition_counts || {};
+        const actionLine = action.type === 'click' ? `click(${action.x}, ${action.y})` : (action.type || '-');
+        flowDetailEl.innerHTML = [
+          detailBlock(op.op_id || data.op_id || 'op', `${op.concrete_name || ''}\n${op.abstract_name || ''}`),
+          detailBlock('result', `${data.result || '-'}\nsource: ${data.source || '-'}\ntarget: ${data.target || '-'}`),
+          detailBlock('status', `${op.status || '-'}${op.effectless ? '\neffectless: true' : ''}${op.effectless_reason ? `\n${op.effectless_reason}` : ''}`),
+          detailBlock('stats', `try: ${stats.try_count || 0}\nsuccess: ${stats.success_count || 0}\neffectless: ${stats.effectless_count || 0}`),
+          detailBlock('conditions', `visibility: ${cond.visibility || 0}\nreadiness: ${cond.readiness || 0}\nrejected: ${cond.rejected || 0}`),
+          detailBlock('action', `${actionLine}\n${action.brief || ''}`),
+          detailBlock('expected', `exit_page: ${expected.exit_page ?? '-'}\nsame_page_progress: ${expected.same_page_progress ?? '-'}\n${(expected.observable_changes || []).join('\n')}\n${expected.reason || ''}`)
+        ].join('');
+        return;
+      }
+      flowDetailEl.textContent = 'Select a node or edge.';
+    }
+
     function openFlowGraph(template) {
       const flow = template && template.page_op_flow;
       if (!flow || !flow.present) return;
@@ -1292,7 +1398,9 @@ HTML = r"""<!doctype html>
           data: {
             id: nodeId,
             label: `${nodeId}\nvisits ${node.visits || 0}`,
-            visits: node.visits || 0
+            visits: node.visits || 0,
+            tried_ops: node.tried_ops || {},
+            updated_at: node.updated_at || ''
           },
           classes: nodeId === 'root' ? 'root' : ''
         });
@@ -1300,7 +1408,9 @@ HTML = r"""<!doctype html>
 
       for (const [nodeId, node] of Object.entries(treeNodes)) {
         const children = node.children || {};
+        const childEdgeKeys = new Set();
         for (const [edgeKey, childIdRaw] of Object.entries(children)) {
+          childEdgeKeys.add(String(edgeKey));
           const childId = String(childIdRaw || '');
           if (!knownIds.has(childId)) {
             knownIds.add(childId);
@@ -1321,7 +1431,36 @@ HTML = r"""<!doctype html>
               target: childId,
               label: `${opNameById(flow, opId)}:${result || 'next'}`,
               op_id: opId,
-              result
+              result,
+              edge_source: 'children'
+            },
+            classes: flowEdgeClass(result)
+          });
+        }
+
+        const triedOps = node.tried_ops || {};
+        for (const [opIdRaw, resultRaw] of Object.entries(triedOps)) {
+          const resultObj = resultRaw || {};
+          const result = String(resultObj.last_result || 'tried');
+          const edgeKey = `${opIdRaw}:${result}`;
+          if (childEdgeKeys.has(edgeKey)) continue;
+          const childId = `${nodeId}::${opIdRaw}:${result}`;
+          elements.push({
+            group: 'nodes',
+            data: { id: childId, label: result, visits: 0 },
+            classes: 'terminal'
+          });
+          elements.push({
+            group: 'edges',
+            data: {
+              id: `${nodeId}->${childId}:${edgeKey}`,
+              source: nodeId,
+              target: childId,
+              label: `${opNameById(flow, opIdRaw)}:${result}`,
+              op_id: String(opIdRaw),
+              result,
+              edge_source: 'tried_ops',
+              updated_at: resultObj.updated_at || ''
             },
             classes: flowEdgeClass(result)
           });
@@ -1343,6 +1482,7 @@ HTML = r"""<!doctype html>
       }).run();
       flowboxEl.classList.add('open');
       flowTitleEl.textContent = `${template.slug || 'state'} · page_op_flow · ${flow.op_count || 0} ops · ${flow.tree_node_count || 0} tree nodes`;
+      flowDetailEl.textContent = 'Select a node or edge.';
       requestAnimationFrame(() => flowCy.fit(flowCy.elements(), 60));
     }
 
@@ -1470,6 +1610,15 @@ HTML = r"""<!doctype html>
         renderSide();
       }
     });
+    flowCy.on('tap', 'node', event => {
+      renderFlowDetail('node', event.target.data());
+    });
+    flowCy.on('tap', 'edge', event => {
+      renderFlowDetail('edge', event.target.data());
+    });
+    flowCy.on('tap', event => {
+      if (event.target === flowCy) renderFlowDetail(null, {});
+    });
 
     fitBtn.addEventListener('click', () => cy.fit(cy.elements(), 60));
     layoutBtn.addEventListener('click', () => runLayout(true));
@@ -1587,7 +1736,7 @@ def _file_mtime_ns(path: Path) -> int:
 
 def _enabled_nodes(graph: dict[str, Any], graph_path: Path = GRAPH_PATH) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
-    templates_dir = _templates_dir_for_graph(graph_path)
+    flow_by_state_id = _page_op_flow_index(_templates_dir_for_graph(graph_path))
     for node in graph.get("nodes", []):
         if not isinstance(node, dict) or not node.get("enabled", True):
             continue
@@ -1595,12 +1744,7 @@ def _enabled_nodes(graph: dict[str, Any], graph_path: Path = GRAPH_PATH) -> list
         if not state_id:
             continue
         slug = str(node.get("slug", state_id))
-        flow_summary = None
-        if templates_dir is not None:
-            found = _find_template_state(templates_dir, state_id, slug)
-            if found:
-                _, meta = found
-                flow_summary = _page_op_flow_summary(meta.get("page_op_flow"))
+        flow_summary = flow_by_state_id.get(state_id)
         result.append(
             {
                 "state_id": state_id,
@@ -1613,6 +1757,23 @@ def _enabled_nodes(graph: dict[str, Any], graph_path: Path = GRAPH_PATH) -> list
             }
         )
     return result
+
+
+def _page_op_flow_index(templates_dir: Path) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    if not templates_dir.exists():
+        return out
+    for path in sorted(templates_dir.glob("*/state.json")):
+        data = _load_json(path)
+        if not isinstance(data, dict):
+            continue
+        state_id = str(data.get("state_id", ""))
+        if not state_id:
+            continue
+        summary = _page_op_flow_summary(data.get("page_op_flow"))
+        if summary.get("present"):
+            out[state_id] = summary
+    return out
 
 
 def _enabled_edges(graph: dict[str, Any], node_ids: set[str]) -> list[dict[str, Any]]:
@@ -1799,6 +1960,9 @@ def _page_op_flow_summary(flow: Any) -> dict[str, Any]:
             continue
         stats = raw.get("stats") if isinstance(raw.get("stats"), dict) else {}
         action = raw.get("action") if isinstance(raw.get("action"), dict) else {}
+        visibility_conditions = raw.get("visibility_conditions") if isinstance(raw.get("visibility_conditions"), list) else []
+        readiness_conditions = raw.get("readiness_conditions") if isinstance(raw.get("readiness_conditions"), list) else []
+        rejected_conditions = raw.get("rejected_conditions") if isinstance(raw.get("rejected_conditions"), list) else []
         status = str(raw.get("status", "active"))
         effectless = bool(raw.get("effectless", False))
         if effectless:
@@ -1815,6 +1979,12 @@ def _page_op_flow_summary(flow: Any) -> dict[str, Any]:
                 "status": status,
                 "effectless": effectless,
                 "effectless_reason": str(raw.get("effectless_reason", "")),
+                "repair_note": str(raw.get("repair_note", "")),
+                "condition_counts": {
+                    "visibility": len(visibility_conditions),
+                    "readiness": len(readiness_conditions),
+                    "rejected": len(rejected_conditions),
+                },
                 "action": {
                     "type": str(action.get("type", "")),
                     "x": action.get("x"),
@@ -1841,11 +2011,20 @@ def _page_op_flow_summary(flow: Any) -> dict[str, Any]:
         if not isinstance(raw, dict):
             continue
         tried_ops = raw.get("tried_ops") if isinstance(raw.get("tried_ops"), dict) else {}
+        tried_ops_out: dict[str, dict[str, Any]] = {}
+        for op_id, result in tried_ops.items():
+            if isinstance(result, dict):
+                tried_ops_out[str(op_id)] = {
+                    "last_result": str(result.get("last_result", "")),
+                    "updated_at": str(result.get("updated_at", "")),
+                }
+            else:
+                tried_ops_out[str(op_id)] = {"last_result": str(result), "updated_at": ""}
         children = raw.get("children") if isinstance(raw.get("children"), dict) else {}
         tree_nodes[str(node_id)] = {
             "node_id": str(raw.get("node_id", node_id)),
             "visits": int(raw.get("visits", 0) or 0),
-            "tried_ops": tried_ops,
+            "tried_ops": tried_ops_out,
             "children": {str(k): str(v) for k, v in children.items()},
             "updated_at": str(raw.get("updated_at", "")),
         }

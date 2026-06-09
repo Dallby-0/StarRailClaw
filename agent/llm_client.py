@@ -69,7 +69,12 @@ class DoubaoClient:
         self.image_model = str(os.getenv("ARK_IMAGE_MODEL", "") or cfg.get("image_model", "doubao-image-v1")).strip()
         self.reasoning = cfg.get("reasoning")
         self.reasoning_effort = cfg.get("reasoning_effort")
-        self.timeout_s = timeout_s
+        self.timeout_s = self._config_int("ARK_TIMEOUT_S", cfg.get("timeout_s"), timeout_s)
+        self.max_retries = self._config_int("ARK_MAX_RETRIES", cfg.get("max_retries"), 3)
+        self.retry_backoff_s = self._config_float("ARK_RETRY_BACKOFF_S", cfg.get("retry_backoff_s"), 2.0)
+        self.pre_call_sleep_s = self._config_float("ARK_PRE_CALL_SLEEP_S", cfg.get("pre_call_sleep_s"), 4.0)
+        self.max_tokens = self._config_int("ARK_MAX_TOKENS", cfg.get("max_tokens"), 4096)
+        self.usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         self.session = requests.Session()
         self.cache = SessionMessageCache(ttl_seconds=cache_ttl_seconds)
 
@@ -88,6 +93,26 @@ class DoubaoClient:
             return {}
 
     @staticmethod
+    def _config_int(env_name: str, config_value: Any, default: int) -> int:
+        raw = os.getenv(env_name, "")
+        value = raw if raw.strip() else config_value
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return parsed if parsed > 0 else default
+
+    @staticmethod
+    def _config_float(env_name: str, config_value: Any, default: float) -> float:
+        raw = os.getenv(env_name, "")
+        value = raw if raw.strip() else config_value
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return default
+        return parsed if parsed > 0 else default
+
+    @staticmethod
     def encode_image_to_data_url(image_rgb) -> str:
         image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
         ok, buf = cv2.imencode(".png", image_bgr)
@@ -101,19 +126,98 @@ class DoubaoClient:
         raw = json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-    def _post_chat(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        resp = self.session.post(
-            f"{self.base_url}/chat/completions",
-            headers={
+    @staticmethod
+    def _retry_after_s(resp: requests.Response) -> float | None:
+        raw = resp.headers.get("Retry-After", "").strip()
+        if not raw:
+            return None
+        try:
+            value = float(raw)
+        except ValueError:
+            return None
+        return value if value > 0 else None
+
+    def _sleep_before_retry(self, attempt: int, resp: requests.Response | None = None, exc: Exception | None = None) -> None:
+        retry_after = self._retry_after_s(resp) if resp is not None else None
+        delay = retry_after if retry_after is not None else self.retry_backoff_s * (2 ** (attempt - 1))
+        reason = f"status={resp.status_code}" if resp is not None else f"error={type(exc).__name__}"
+        print(f"[llm][retry] {reason} attempt={attempt}/{self.max_retries} sleep_s={delay:.1f}")
+        time.sleep(delay)
+
+    def _sleep_before_request(self, path: str) -> None:
+        if self.pre_call_sleep_s <= 0:
+            return
+        print(f"[llm][pre-call-wait] path={path} sleep_s={self.pre_call_sleep_s:.1f}")
+        time.sleep(self.pre_call_sleep_s)
+
+    def _post_json(self, path: str, payload: Dict[str, Any], *, error_label: str) -> Dict[str, Any]:
+        url = f"{self.base_url}/{path.lstrip('/')}"
+        headers = {
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=self.timeout_s,
+        }
+        last_exc: requests.RequestException | None = None
+        for attempt in range(1, self.max_retries + 2):
+            try:
+                self._sleep_before_request(path)
+                resp = self.session.post(url, headers=headers, json=payload, timeout=self.timeout_s)
+            except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as exc:
+                last_exc = exc
+                if attempt <= self.max_retries:
+                    self._sleep_before_retry(attempt, exc=exc)
+                    continue
+                raise
+            if resp.status_code == 429 or 500 <= resp.status_code < 600:
+                if attempt <= self.max_retries:
+                    self._sleep_before_retry(attempt, resp=resp)
+                    continue
+            if resp.status_code >= 400:
+                raise RuntimeError(f"{error_label} {resp.status_code}: {resp.text}")
+            return resp.json()
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"{error_label}: request failed after retries")
+
+    def _post_chat(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        data = self._post_json("chat/completions", payload, error_label="ARK API error")
+        self._log_chat_response_status(data)
+        return data
+
+    @staticmethod
+    def _usage_int(usage: dict[str, Any], key: str) -> int:
+        try:
+            return int(usage.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _token_k(tokens: int) -> str:
+        return f"{tokens / 1000:.1f}k"
+
+    def _log_chat_response_status(self, data: Dict[str, Any]) -> None:
+        choices = data.get("choices")
+        choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+        finish_reason = str(choice.get("finish_reason", "") or "")
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        prompt_tokens = self._usage_int(usage, "prompt_tokens")
+        completion_tokens = self._usage_int(usage, "completion_tokens")
+        total_tokens = self._usage_int(usage, "total_tokens")
+        if total_tokens <= 0:
+            total_tokens = prompt_tokens + completion_tokens
+        if total_tokens > 0:
+            self.usage_totals["prompt_tokens"] += prompt_tokens
+            self.usage_totals["completion_tokens"] += completion_tokens
+            self.usage_totals["total_tokens"] += total_tokens
+        print(
+            "[llm][response] "
+            f"finish_reason={finish_reason or '-'} "
+            f"current={self._token_k(total_tokens)} "
+            f"prompt={self._token_k(prompt_tokens)} "
+            f"completion={self._token_k(completion_tokens)} "
+            f"run_total={self._token_k(self.usage_totals['total_tokens'])}"
         )
-        if resp.status_code >= 400:
-            raise RuntimeError(f"ARK API error {resp.status_code}: {resp.text}")
-        return resp.json()
+        if finish_reason == "length":
+            print("[llm][response][warning] completion truncated by max output tokens")
 
     def get_image_tools(self) -> List[Dict[str, Any]]:
         return [
@@ -142,18 +246,7 @@ class DoubaoClient:
             "n": 1,
             "response_format": "b64_json",
         }
-        resp = self.session.post(
-            f"{self.base_url}/images/generations",
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=self.timeout_s,
-        )
-        if resp.status_code >= 400:
-            raise RuntimeError(f"ARK image API error {resp.status_code}: {resp.text}")
-        data = resp.json()
+        data = self._post_json("images/generations", payload, error_label="ARK image API error")
         b64_image = data["data"][0]["b64_json"]
         return f"data:image/png;base64,{b64_image}"
 
@@ -215,6 +308,7 @@ class DoubaoClient:
             "model": self.model,
             "messages": request_messages,
             "temperature": temperature,
+            "max_tokens": self.max_tokens,
             "thinking": {"type": "disabled"},
             "tools": tools or [],
             "tool_choice": tool_choice,

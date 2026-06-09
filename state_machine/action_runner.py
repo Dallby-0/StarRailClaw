@@ -17,6 +17,7 @@ from state_machine.llm_tasks import (
 from state_machine.logger import FsmRunLogger, summarize_match
 from state_machine.matching import MatchResult, _find_match_by_state
 from state_machine.presets import run_preset
+from state_machine.screen import _wait_for_screen_stable
 from state_machine.transition_policy import _defer_unknown_transition, _pick_reachable_transition_candidate
 
 
@@ -277,7 +278,7 @@ def _execute_state_action(
             return False, frame_before
         if not _execute_action_steps(emulator, mapper, vision, state_dir, [{"type": "run_preset", "name": name, "brief": str(controller.get("brief", ""))}], state_id, matches_provider, logger=logger, action_id=action_id, attempt="controller:preset"):
             return False, frame_before
-        post = emulator.screenshot(prefer_png=True)
+        post = _wait_for_screen_stable(emulator, logger=logger, label="action-post", event="action_post_stability_check", max_checks=3)
         status, out = _resolve_controller_post_frame(
             state_id=state_id,
             action_id=action_id,
@@ -304,7 +305,7 @@ def _execute_state_action(
             _log(logger, f"[fsm][controller][seed] state={state_id}", "controller_seed_action", state_id=state_id, action_id=action_id, action=seed_action)
             if not _execute_action_steps(emulator, mapper, vision, state_dir, [seed_action], state_id, matches_provider, logger=logger, action_id=action_id, attempt="controller:seed"):
                 return False, frame_before
-            post_seed = emulator.screenshot(prefer_png=True)
+            post_seed = _wait_for_screen_stable(emulator, logger=logger, label="action-seed", event="action_seed_stability_check", max_checks=3)
             status, out = _resolve_controller_post_frame(
                 state_id=state_id,
                 action_id=action_id,
