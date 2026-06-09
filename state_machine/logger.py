@@ -74,6 +74,9 @@ class FsmRunLogger:
                 "page_local_enters": 0,
                 "page_local_steps": 0,
                 "page_local_changed_steps": 0,
+                "page_handler_enters": 0,
+                "page_handler_steps": 0,
+                "page_handler_changed_steps": 0,
                 "transition_reachable_misses": 0,
                 "transitions_to_unknown": 0,
                 "state_misidentified": 0,
@@ -253,9 +256,9 @@ def _event_delta(event: str, row: dict[str, Any]) -> dict[str, Any]:
         delta["actions"] = 1
     elif event == "action_attempt":
         delta["actions"] = 1
-    elif event == "action_click":
+    elif event in {"action_click", "page_handler_click"}:
         delta["clicks"] = 1
-    elif event == "action_preset":
+    elif event in {"action_preset", "page_handler_preset"}:
         delta["presets"] = 1
     elif event == "transition":
         delta["transitions"] = 1
@@ -269,7 +272,7 @@ def _event_delta(event: str, row: dict[str, Any]) -> dict[str, Any]:
             delta["last_state_id"] = row.get("to_state")
     elif event == "graph_edge_added":
         delta["edges_added"] = 1
-    elif event == "controller_exhausted":
+    elif event in {"controller_exhausted", "page_handler_no_decision", "page_handler_no_progress", "page_handler_max_steps"}:
         delta["page_op_failures"] = 1
     elif event == "ocr_summary":
         delta["ocr_calls"] = int(row.get("calls", 0) or 0)
@@ -373,6 +376,12 @@ def _apply_mechanism_stats(summary: dict[str, Any], event: str, row: dict[str, A
         _incr(mechanisms, "page_local_steps")
         if bool(row.get("changed")):
             _incr(mechanisms, "page_local_changed_steps")
+    elif event == "page_handler_enter":
+        _incr(mechanisms, "page_handler_enters")
+    elif event == "page_handler_step_result":
+        _incr(mechanisms, "page_handler_steps")
+        if bool(row.get("changed")):
+            _incr(mechanisms, "page_handler_changed_steps")
     elif event == "transition_reachable_miss":
         _incr(mechanisms, "transition_reachable_misses")
     elif event == "transition":
@@ -410,6 +419,7 @@ def _refresh_rates(summary: dict[str, Any]) -> None:
     transitions = int(summary.get("transitions", 0) or 0)
     stability_checks = int(mechanisms.get("unknown_stability_checks", 0) or 0)
     page_local_steps = int(mechanisms.get("page_local_steps", 0) or 0)
+    page_handler_steps = int(mechanisms.get("page_handler_steps", 0) or 0)
 
     rates = {
         "unknown_per_loop": _ratio(summary.get("unknown_states"), loops),
@@ -420,6 +430,8 @@ def _refresh_rates(summary: dict[str, Any]) -> None:
         "page_op_failures_per_action": _ratio(summary.get("page_op_failures"), actions),
         "page_local_enters_per_action": _ratio(mechanisms.get("page_local_enters"), actions),
         "page_local_changed_step_rate": _ratio(mechanisms.get("page_local_changed_steps"), page_local_steps),
+        "page_handler_enters_per_action": _ratio(mechanisms.get("page_handler_enters"), actions),
+        "page_handler_changed_step_rate": _ratio(mechanisms.get("page_handler_changed_steps"), page_handler_steps),
         "unknown_stability_stable_rate": _ratio(mechanisms.get("unknown_stability_stable"), stability_checks),
         "merge_accept_rate": _ratio(
             int(summary.get("states_merged", 0) or 0) + int(summary.get("states_created", 0) or 0),

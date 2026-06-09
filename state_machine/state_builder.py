@@ -123,11 +123,11 @@ def _controller_from_actions(actions: list[dict[str, Any]]) -> dict[str, Any]:
         }
     if first:
         return {
-            "type": "page_op_flow",
+            "type": "page_handler",
             "seed_action": first,
             "source": "llm_action",
         }
-    return {"type": "page_op_flow", "source": "default"}
+    return {"type": "page_handler", "source": "default"}
 
 
 def _create_state_from_llm(

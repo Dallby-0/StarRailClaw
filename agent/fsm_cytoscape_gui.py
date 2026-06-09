@@ -1737,6 +1737,7 @@ def _file_mtime_ns(path: Path) -> int:
 def _enabled_nodes(graph: dict[str, Any], graph_path: Path = GRAPH_PATH) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     flow_by_state_id = _page_op_flow_index(_templates_dir_for_graph(graph_path))
+    handler_by_state_id = _page_handler_index(_templates_dir_for_graph(graph_path))
     for node in graph.get("nodes", []):
         if not isinstance(node, dict) or not node.get("enabled", True):
             continue
@@ -1745,15 +1746,21 @@ def _enabled_nodes(graph: dict[str, Any], graph_path: Path = GRAPH_PATH) -> list
             continue
         slug = str(node.get("slug", state_id))
         flow_summary = flow_by_state_id.get(state_id)
+        handler_summary = handler_by_state_id.get(state_id)
+        has_handler = bool(handler_summary and handler_summary.get("present"))
+        has_flow = bool(flow_summary and flow_summary.get("present"))
+        flow_label = ""
+        if has_handler:
+            flow_label = f"handler {handler_summary.get('template_count', 0)} templates"
+        elif has_flow:
+            flow_label = f"flow {flow_summary.get('op_count', 0)} ops"
         result.append(
             {
                 "state_id": state_id,
                 "slug": slug,
                 "enabled": True,
-                "has_page_op_flow": bool(flow_summary and flow_summary.get("present")),
-                "page_op_flow_label": (
-                    f"flow {flow_summary.get('op_count', 0)} ops" if flow_summary and flow_summary.get("present") else ""
-                ),
+                "has_page_op_flow": has_handler or has_flow,
+                "page_op_flow_label": flow_label,
             }
         )
     return result
@@ -1771,6 +1778,23 @@ def _page_op_flow_index(templates_dir: Path) -> dict[str, dict[str, Any]]:
         if not state_id:
             continue
         summary = _page_op_flow_summary(data.get("page_op_flow"))
+        if summary.get("present"):
+            out[state_id] = summary
+    return out
+
+
+def _page_handler_index(templates_dir: Path) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    if not templates_dir.exists():
+        return out
+    for path in sorted(templates_dir.glob("*/state.json")):
+        data = _load_json(path)
+        if not isinstance(data, dict):
+            continue
+        state_id = str(data.get("state_id", ""))
+        if not state_id:
+            continue
+        summary = _page_handler_summary(data.get("page_handler"))
         if summary.get("present"):
             out[state_id] = summary
     return out
@@ -2042,6 +2066,50 @@ def _page_op_flow_summary(flow: Any) -> dict[str, Any]:
     }
 
 
+def _page_handler_summary(handler: Any) -> dict[str, Any]:
+    if not isinstance(handler, dict):
+        return {"present": False}
+    templates_raw = handler.get("action_templates")
+    if not isinstance(templates_raw, dict):
+        templates_raw = {}
+    templates: list[dict[str, Any]] = []
+    active_count = 0
+    disabled_count = 0
+    for template_id, raw in templates_raw.items():
+        if not isinstance(raw, dict):
+            continue
+        status = str(raw.get("status", "active"))
+        if status == "active":
+            active_count += 1
+        else:
+            disabled_count += 1
+        templates.append(
+            {
+                "template_id": str(template_id),
+                "kind": str(raw.get("kind", "")),
+                "label": str(raw.get("label", "")),
+                "status": status,
+                "confidence": str(raw.get("confidence", "mid")),
+                "success_count": int(raw.get("success_count", 0) or 0),
+                "fail_count": int(raw.get("fail_count", 0) or 0),
+                "bbox": raw.get("bbox"),
+                "slots": raw.get("slots", []) if isinstance(raw.get("slots"), list) else [],
+            }
+        )
+    trace = handler.get("episode_trace") if isinstance(handler.get("episode_trace"), list) else []
+    return {
+        "present": True,
+        "schema_version": str(handler.get("schema_version", "")),
+        "template_count": len(templates),
+        "active_count": active_count,
+        "disabled_count": disabled_count,
+        "supported_intents": handler.get("supported_intents", []) if isinstance(handler.get("supported_intents"), list) else [],
+        "trace_count": len(trace),
+        "recent_trace": trace[-10:],
+        "templates": templates,
+    }
+
+
 class FsmStateHandler(BaseHTTPRequestHandler):
     graph_path = GRAPH_PATH
     runtime_path = RUNTIME_PATH
@@ -2171,6 +2239,7 @@ class FsmStateHandler(BaseHTTPRequestHandler):
             "conditions": conditions,
             "actions": state.get("actions", []),
             "page_op_flow": _page_op_flow_summary(state.get("page_op_flow")),
+            "page_handler": _page_handler_summary(state.get("page_handler")),
         }
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         self._send_bytes(body, "application/json; charset=utf-8")

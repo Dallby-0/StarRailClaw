@@ -161,21 +161,8 @@ def _controller_from_state(state_meta: dict[str, Any]) -> dict[str, Any]:
     if first and str(first.get("type", "click")) == "run_preset":
         return {"type": "preset", "name": str(first.get("name", "")), "source": "inferred_from_action"}
     if first:
-        return {"type": "page_op_flow", "seed_action": first, "source": "inferred_from_action"}
-    return {"type": "page_op_flow", "source": "default"}
-
-
-def _has_active_page_ops(state_meta: dict[str, Any]) -> bool:
-    flow = state_meta.get("page_op_flow")
-    if not isinstance(flow, dict):
-        return False
-    catalog = flow.get("op_catalog")
-    if not isinstance(catalog, dict):
-        return False
-    ops = catalog.get("ops")
-    if not isinstance(ops, list):
-        return False
-    return any(isinstance(op, dict) and op.get("status", "active") == "active" and not bool(op.get("effectless", False)) for op in ops)
+        return {"type": "page_handler", "seed_action": first, "source": "inferred_from_action"}
+    return {"type": "page_handler", "source": "default"}
 
 
 def _force_state_resolution(
@@ -264,12 +251,12 @@ def _execute_state_action(
     entry_context: dict[str, Any] | None = None,
     logger: FsmRunLogger | None = None,
 ) -> tuple[bool, Any]:
-    from state_machine.page_op_flow import _run_page_op_flow
+    from state_machine.page_handler import run_page_handler
 
     state_meta = _load_json(state_dir / "state.json")
     action_id, action_steps = _first_enabled_action_steps(state_meta)
     controller = _controller_from_state(state_meta)
-    ctype = str(controller.get("type", "page_op_flow"))
+    ctype = str(controller.get("type", "page_handler"))
     _log(logger, f"[fsm][controller] state={state_id} type={ctype}", "controller_start", state_id=state_id, action_id=action_id, controller=controller)
 
     if ctype == "preset":
@@ -294,33 +281,14 @@ def _execute_state_action(
             return True, out
         last_failure_frame = out
         last_failure_matches = matches_provider(last_failure_frame)
-    elif ctype == "page_op_flow":
+    elif ctype in {"page_handler", "page_op_flow"}:
         seed_action = controller.get("seed_action") if isinstance(controller.get("seed_action"), dict) else None
         if seed_action is None and action_steps and isinstance(action_steps[0], dict) and str(action_steps[0].get("type", "click")) != "run_preset":
             seed_action = action_steps[0]
-        if _has_active_page_ops(state_meta):
-            seed_action = None
         start_frame = frame_before
-        if isinstance(seed_action, dict):
-            _log(logger, f"[fsm][controller][seed] state={state_id}", "controller_seed_action", state_id=state_id, action_id=action_id, action=seed_action)
-            if not _execute_action_steps(emulator, mapper, vision, state_dir, [seed_action], state_id, matches_provider, logger=logger, action_id=action_id, attempt="controller:seed"):
-                return False, frame_before
-            post_seed = _wait_for_screen_stable(emulator, logger=logger, label="action-seed", event="action_seed_stability_check", max_checks=3)
-            status, out = _resolve_controller_post_frame(
-                state_id=state_id,
-                action_id=action_id,
-                frame=post_seed,
-                matches_provider=matches_provider,
-                runtime=runtime,
-                graph=graph,
-                prefer_reachable_first=prefer_reachable_first,
-                logger=logger,
-                reason_suffix="-seed",
-            )
-            if status in {"transition", "unknown"}:
-                return True, out
-            start_frame = out
-        local_ok, local_frame = _run_page_op_flow(
+        if ctype == "page_op_flow":
+            _log(logger, f"[fsm][controller] page_op_flow is deprecated; route to page_handler state={state_id}", "page_op_flow_deprecated", state_id=state_id, action_id=action_id)
+        local_ok, local_frame = run_page_handler(
             emulator=emulator,
             mapper=mapper,
             vision=vision,
@@ -336,6 +304,8 @@ def _execute_state_action(
             graph=graph,
             prefer_reachable_first=prefer_reachable_first,
             state_slug=str(state_meta.get("slug", state_id)),
+            controller=controller,
+            seed_action=seed_action,
             entry_context=entry_context,
             logger=logger,
         )
