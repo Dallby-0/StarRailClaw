@@ -163,7 +163,12 @@ def _try_strengthen_winner_conditions(
     winner_meta["updated_at"] = _now_iso()
     _save_json(winner_dir / "state.json", winner_meta)
     if logger is not None:
-        logger.event("disambiguation_strengthened_winner", state_id=winner.state_id, added_condition_ids=[c.get("id") for c in selected], remaining_losers=sorted(remaining))
+        logger.event(
+            "disambiguation_strengthened_winner",
+            state_id=winner.state_id,
+            added_condition_ids=[c.get("id") for c in selected],
+            remaining_losers=sorted(l.state_id for l in losers),
+        )
     return True
 
 
@@ -210,7 +215,22 @@ def _disambiguate_matches(
         return None
     winner = by_id[winner_id]
     losers = [m for m in successes if m.state_id != winner_id]
-    strengthened = _try_exclude_current_from_losers(winner=winner, losers=losers, metas=metas, vision=vision, frame_rgb=frame_rgb, logger=logger)
+    strengthened = _try_exclude_current_from_losers(
+        winner=winner,
+        losers=losers,
+        metas=metas,
+        vision=vision,
+        frame_rgb=frame_rgb,
+        logger=logger,
+    )
     if len(strengthened) < len(losers):
-        _try_strengthen_winner_conditions(winner=winner, losers=losers, metas=metas, vision=vision, frame_rgb=frame_rgb, logger=logger)
+        remaining_losers = [m for m in losers if m.state_id not in strengthened]
+        _try_strengthen_winner_conditions(
+            winner=winner,
+            losers=remaining_losers,
+            metas=metas,
+            vision=vision,
+            frame_rgb=frame_rgb,
+            logger=logger,
+        )
     return winner
