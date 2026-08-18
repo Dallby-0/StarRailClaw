@@ -11,6 +11,7 @@ from state_machine.constants import SCHEMA_VERSION
 from state_machine.io import _normalize_page_type, _now_iso, _save_frame, _save_json, _slugify
 from state_machine.logger import FsmRunLogger
 from state_machine.matching import _level, _select_enabled_conditions
+from state_machine.page_handler.store import handler_from_bootstrap, materialize_strategy_templates
 from state_machine.state_store import _allocate_state_id, _ensure_unique_state_dir
 
 
@@ -96,40 +97,6 @@ def _limit_enable_conditions(conditions: list[dict[str, Any]]) -> list[dict[str,
     return conditions
 
 
-def _normalize_actions(raw_actions: list[Any]) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    for a in raw_actions:
-        if not isinstance(a, dict):
-            continue
-        atype = str(a.get("type", "click"))
-        brief = str(a.get("brief", ""))
-        if atype == "run_preset":
-            out.append({"type": "run_preset", "name": str(a.get("name", "")), "brief": brief})
-            continue
-        x = int(a.get("x", 500))
-        y = int(a.get("y", 500))
-        out.append({"type": "click", "x": x, "y": y, "brief": brief})
-    return out
-
-
-def _controller_from_actions(actions: list[dict[str, Any]]) -> dict[str, Any]:
-    first = actions[0] if actions and isinstance(actions[0], dict) else None
-    if first and str(first.get("type", "click")) == "run_preset":
-        return {
-            "type": "preset",
-            "name": str(first.get("name", "")),
-            "brief": str(first.get("brief", "")),
-            "source": "llm_action",
-        }
-    if first:
-        return {
-            "type": "page_handler",
-            "seed_action": first,
-            "source": "llm_action",
-        }
-    return {"type": "page_handler", "source": "default"}
-
-
 def _create_state_from_llm(
     llm_payload: dict[str, Any],
     frame_rgb,
@@ -143,7 +110,15 @@ def _create_state_from_llm(
     conds = _conditions_from_elements(llm_payload.get("elements", []))
     conds = _extract_region_templates(frame_rgb, mapper, state_dir, conds)
     conds, weak_match = _select_enabled_conditions(conds, vision, frame_rgb)
-    actions = _normalize_actions(llm_payload.get("actions", []))
+    handler = handler_from_bootstrap(llm_payload.get("bootstrap_operations", []))
+    strategy_ids = {
+        str(strategy.get("strategy_id"))
+        for policy in handler.get("operation_policies", {}).values()
+        if isinstance(policy, dict)
+        for strategy in policy.get("strategies", [])
+        if isinstance(strategy, dict)
+    }
+    materialize_strategy_templates(handler, state_dir, frame_rgb, vision, strategy_ids)
 
     state_meta = {
         "schema_version": SCHEMA_VERSION,
@@ -166,15 +141,7 @@ def _create_state_from_llm(
             }
         ],
         "match_conditions": conds,
-        "controller": _controller_from_actions(actions),
-        "actions": [
-            {
-                "action_id": "action_main",
-                "enabled": True,
-                "version": 1,
-                "steps": actions,
-            }
-        ],
+        "page_handler": handler,
     }
     _save_json(state_dir / "state.json", state_meta)
     if logger is not None:
@@ -186,7 +153,7 @@ def _create_state_from_llm(
             page_type=state_meta["page_type"],
             weak_match=weak_match,
             elements_count=len(llm_payload.get("elements", [])),
-            actions_count=len(llm_payload.get("actions", [])),
+            bootstrap_operations_count=len(llm_payload.get("bootstrap_operations", [])),
             conditions=conds,
             screenshot_path=state_dir / "screenshot_1.png",
         )

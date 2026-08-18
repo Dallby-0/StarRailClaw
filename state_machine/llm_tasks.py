@@ -9,6 +9,7 @@ from agent.llm_client import DoubaoClient
 
 from . import constants
 from .constants import LLM_PARSE_RETRY
+from .protocol import parse_state_payload
 
 
 def _normalize_assistant_text(content: Any) -> str:
@@ -43,17 +44,7 @@ def _build_user_message_from_two_frames(image_a_rgb, image_b_rgb, text: str) -> 
 
 
 def _parse_llm_payload(text: str) -> dict[str, Any] | None:
-    try:
-        payload = json.loads(text)
-    except Exception:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    required = {"page_summary", "slug", "elements", "actions"}
-    if not required.issubset(payload.keys()):
-        return None
-    payload.setdefault("possible_page_type", "none")
-    return payload
+    return parse_state_payload(text)
 
 
 def _parse_llm_failure_diagnosis(text: str) -> dict[str, Any] | None:
@@ -121,14 +112,20 @@ def _request_llm_payload(
     frame_rgb,
     system_prompt: str,
     page_summaries: list[dict[str, Any]] | None = None,
+    active_intent: dict[str, Any] | None = None,
     raw_debug_dir: Path | None = None,
 ) -> dict[str, Any] | None:
     context = {
         "mode": "NORMAL",
         "known_page_types": page_summaries or [],
+        "active_intent": active_intent or {},
         "instruction": (
             "请按 system 约定输出 JSON。先照常输出用于建立新状态的页面元素信息；"
             "possible_page_type 必须从 known_page_types.page_type 中选择，若都不像则输出 none。"
+            "同时给出最多两个 bootstrap operation；固定点是首选，步骤必须包含 expected_after。"
+            "如果 active_intent 非空，判断页面与 intent 的关系，并只为该 intent 或透明阻塞层提出操作。"
+            "如果 active_intent 为空，仅当页面存在同识别异操作或操作必须跨多个页面保持语义时，才输出 intent_proposal；"
+            "普通唯一推进页面不得创建 intent_proposal。"
         ),
     }
     msg = _build_user_message_from_frame(frame_rgb, json.dumps(context, ensure_ascii=False))

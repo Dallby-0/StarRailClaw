@@ -2069,33 +2069,36 @@ def _page_op_flow_summary(flow: Any) -> dict[str, Any]:
 def _page_handler_summary(handler: Any) -> dict[str, Any]:
     if not isinstance(handler, dict):
         return {"present": False}
-    templates_raw = handler.get("action_templates")
-    if not isinstance(templates_raw, dict):
-        templates_raw = {}
+    policies = handler.get("operation_policies")
+    if not isinstance(policies, dict):
+        policies = {}
     templates: list[dict[str, Any]] = []
     active_count = 0
     disabled_count = 0
-    for template_id, raw in templates_raw.items():
-        if not isinstance(raw, dict):
+    for operation, policy in policies.items():
+        if not isinstance(policy, dict):
             continue
-        status = str(raw.get("status", "active"))
-        if status == "active":
-            active_count += 1
-        else:
-            disabled_count += 1
-        templates.append(
-            {
-                "template_id": str(template_id),
-                "kind": str(raw.get("kind", "")),
-                "label": str(raw.get("label", "")),
-                "status": status,
-                "confidence": str(raw.get("confidence", "mid")),
-                "success_count": int(raw.get("success_count", 0) or 0),
-                "fail_count": int(raw.get("fail_count", 0) or 0),
-                "bbox": raw.get("bbox"),
-                "slots": raw.get("slots", []) if isinstance(raw.get("slots"), list) else [],
-            }
-        )
+        for strategy in policy.get("strategies", []):
+            if not isinstance(strategy, dict):
+                continue
+            status = str(strategy.get("status", "proposed"))
+            if status == "active":
+                active_count += 1
+            else:
+                disabled_count += 1
+            templates.append(
+                {
+                    "template_id": str(strategy.get("strategy_id", "")),
+                    "kind": str(operation),
+                    "label": f"level {int(strategy.get('level', 0) or 0)}",
+                    "status": status,
+                    "confidence": "verified" if int(strategy.get("success_count", 0) or 0) > 0 else "unverified",
+                    "success_count": int(strategy.get("success_count", 0) or 0),
+                    "fail_count": int(strategy.get("fail_count", 0) or 0),
+                    "bbox": None,
+                    "slots": [],
+                }
+            )
     trace = handler.get("episode_trace") if isinstance(handler.get("episode_trace"), list) else []
     return {
         "present": True,
@@ -2103,7 +2106,9 @@ def _page_handler_summary(handler: Any) -> dict[str, Any]:
         "template_count": len(templates),
         "active_count": active_count,
         "disabled_count": disabled_count,
-        "supported_intents": handler.get("supported_intents", []) if isinstance(handler.get("supported_intents"), list) else [],
+        "supported_intents": sorted({str(kind) for route in handler.get("intent_routes", []) if isinstance(route, dict) for kind in (route.get("intent_kinds") if isinstance(route.get("intent_kinds"), list) else [route.get("intent_kind")]) if kind}),
+        "default_operation": handler.get("default_operation"),
+        "operation_count": len(policies),
         "trace_count": len(trace),
         "recent_trace": trace[-10:],
         "templates": templates,

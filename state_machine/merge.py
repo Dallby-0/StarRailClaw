@@ -13,6 +13,7 @@ from state_machine.io import _backup_json, _load_frame, _normalize_page_type, _n
 from state_machine.llm_tasks import _request_llm_condition_revision
 from state_machine.logger import FsmRunLogger
 from state_machine.matching import _condition_passed, _level, _select_enabled_conditions
+from state_machine.page_handler.store import apply_handler_patch, ensure_page_handler, handler_from_bootstrap, materialize_strategy_templates
 from state_machine.state_store import (
     _latest_screenshot_path,
     _latest_state_for_page_type,
@@ -213,6 +214,17 @@ def _try_merge_page_type(
             }
         )
     latest_meta["match_conditions"] = revised
+    handler = ensure_page_handler(latest_meta)
+    bootstrap_raw = llm_payload.get("bootstrap_operations", [])
+    touched = apply_handler_patch(handler, {"operations": bootstrap_raw})
+    bootstrap = handler_from_bootstrap(bootstrap_raw)
+    if handler.get("default_operation") is None and bootstrap.get("default_operation") is not None:
+        handler["default_operation"] = bootstrap["default_operation"]
+    known_routes = {str(item) for item in handler.get("intent_routes", []) if isinstance(item, dict)}
+    for route in bootstrap.get("intent_routes", []):
+        if isinstance(route, dict) and str(route) not in known_routes:
+            handler["intent_routes"].append(route)
+    materialize_strategy_templates(handler, latest_dir, frame_rgb, vision, touched)
     latest_meta["updated_at"] = _now_iso()
     latest_meta["page_type"] = page_type
     latest_meta.setdefault("model_info", {})

@@ -23,6 +23,7 @@ from state_machine.io import (
     _load_runtime,
     _save_runtime,
 )
+from state_machine.intent import active_intent, adopt_intent_proposal, ensure_intent_runtime, intent_projection
 from state_machine.llm_tasks import _request_llm_payload
 from state_machine.logger import FsmRunLogger, summarize_match
 from state_machine.matching import _eval_state_match, _select_best_for_unknown
@@ -102,6 +103,7 @@ def run_agent_loop_fsm(
     runtime.setdefault("same_external_state_count", 0)
     runtime.setdefault("force_state_resolution", False)
     runtime.setdefault("force_exclude_state_id", None)
+    ensure_intent_runtime(runtime)
     _save_runtime(runtime)
     logger = FsmRunLogger(session_id, str(runtime["run_id"]))
     logger.event(
@@ -230,7 +232,15 @@ def run_agent_loop_fsm(
                 continue
             frame = stable_frame
             logger.text("[fsm] unknown state, requesting llm", "unknown_state")
-            payload = _request_llm_payload(llm, llm_session_id, frame, system_prompt, _page_type_summaries(metas_for_resolution), raw_debug_dir=logger.llm_raw_dir)
+            payload = _request_llm_payload(
+                llm,
+                llm_session_id,
+                frame,
+                system_prompt,
+                _page_type_summaries(metas_for_resolution),
+                active_intent=intent_projection(active_intent(runtime)),
+                raw_debug_dir=logger.llm_raw_dir,
+            )
             runtime["llm_turn_count"] = int(runtime.get("llm_turn_count", 0)) + 1
             _save_runtime(runtime)
             if payload is None:
@@ -243,8 +253,12 @@ def run_agent_loop_fsm(
                 slug=payload.get("slug"),
                 possible_page_type=payload.get("possible_page_type"),
                 elements_count=len(payload.get("elements", [])),
-                actions_count=len(payload.get("actions", [])),
+                bootstrap_operations_count=len(payload.get("bootstrap_operations", [])),
             )
+            proposed_intent = adopt_intent_proposal(runtime, payload.get("intent_proposal"))
+            if proposed_intent is not None:
+                _save_runtime(runtime)
+                logger.event("intent_created_from_state_assessment", intent=intent_projection(proposed_intent))
             merged = _try_merge_page_type(
                 llm=llm,
                 session_id=llm_session_id,

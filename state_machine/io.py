@@ -113,16 +113,22 @@ def _ensure_fsm_resources() -> None:
                 "same_external_state_count": 0,
                 "force_state_resolution": False,
                 "force_exclude_state_id": None,
+                "pending_operation": None,
+                "intent_runtime": {
+                    "active_intent_id": None,
+                    "intents": {},
+                    "intent_stack": [],
+                },
             },
         )
     _save_json(
         FSM_SCHEMA_PATH,
         {
             "schema_version": SCHEMA_VERSION,
-            "required_fields": ["page_summary", "slug", "possible_page_type", "elements", "actions"],
+            "required_fields": ["page_summary", "slug", "possible_page_type", "elements", "bootstrap_operations"],
             "element_types": ["text_line", "pattern"],
             "element_levels": ["high", "mid", "low"],
-            "action_types": ["click", "run_preset"],
+            "resolver_types": ["fixed_point", "region_template", "run_preset"],
         },
     )
 

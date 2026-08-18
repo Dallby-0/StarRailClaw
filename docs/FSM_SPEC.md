@@ -1,5 +1,7 @@
 # FSM Spec
 
+> 注意：本文描述旧版状态资源。全新的 v2 intent-aware progressive handler 不兼容旧状态文件，权威规范见 `INTENT_PROGRESSIVE_HANDLER_V2.md`。
+
 本文档描述当前 `state_machine/` 实现所支持的 FSM 运行时规范。范围只包含状态机核心：资源文件、状态模型、匹配、动作、状态图、状态学习、合并、修复、同页局部流、预置动作和日志。GUI、具体 LLM client、ADB/模拟器底层实现不在本文档范围内。
 
 ## 1. 目标和边界

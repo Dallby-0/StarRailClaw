@@ -12,7 +12,7 @@ EXPERIENCE_PATH = FSM_DIR / "experience.md"
 TASK_SUMMARY_PATH = FSM_DIR / "task_summary.md"
 EXPERIENCE_WRITE_ENABLED = False
 
-SCHEMA_VERSION = "1.1.0"
+SCHEMA_VERSION = "2.0.0"
 ACTION_CLICK_WAIT_S = 1.0
 UNKNOWN_STABILITY_DIFF_THRESHOLD = 0.1
 UNKNOWN_STABILITY_SAMPLE_INTERVAL_S = 0.5
@@ -39,7 +39,7 @@ LLM_FSM_PROMPT_BASE = """你是视觉驱动游戏自动化的状态标注器和�
 
 你将收到一张游戏截图。你的任务：
 1) 识别并输出用于区分该页面的关键信息，按匹配价值排序：优先高 stability 且高 discrimination 的 pattern，其次是稳定 text_line。
-2) 输出推进流程的动作序列（1000x1000逻辑坐标）。
+2) 在同一次响应中输出最多两个 bootstrap operation，用于低成本推进当前页面。
 
 强约束：
 - 必须输出严格 JSON 对象，字段必须符合约定。
@@ -75,9 +75,16 @@ LLM_FSM_PROMPT_BASE = """你是视觉驱动游戏自动化的状态标注器和�
     - 页面标题、固定图标、固定按钮、固定交互控件通常更稳定。
 - slug: 英文小写+下划线，简短可读。
 - possible_page_type: 如果当前页面可能属于已知页面类型，输出该类型英文名；否则输出 "none"。不要把具体实例名称当作页面类型。
-- actions: 数组，每项仅允许两类：
-  - 点击：{"type":"click","x":整数,"y":整数,"brief":"..."}
-  - 预置动作：{"type":"run_preset","name":"wait_till_combat_end","brief":"..."}
+- bootstrap_operations: 数组。每项表示一种操作语义及其初始渐进策略，而不是无条件 state action。
+  - operation 必须是稳定的短语义名，例如 dismiss_overlay、confirm、advance、select_candidate。
+  - intent_scope 只能是 intent_invariant 或 intent_specific。只有纯提示/透明阻塞弹窗才使用 intent_invariant。
+  - intent_effect 只能是 preserve、advance、complete 或 none。
+  - safety 只能是 low_risk、reversible、commit 或 destructive。commit/destructive 不可作为无条件默认操作。
+  - 最多输出两个 steps；每一步都必须提供 expected_after，runtime 会在每步后重新截图，禁止设计无条件连点宏。
+  - 初始策略优先 resolver.type=fixed_point，坐标为 1000x1000 逻辑坐标。
+  - 只有明显需要预置动作时才使用 resolver.type=run_preset。
+  - 若 active_intent 存在，intent_routes 应说明哪些 intent kind/phase 映射到这个 operation。
+  - 预置动作：resolver={"type":"run_preset","name":"wait_till_combat_end"}
     - 预置动作 wait_till_combat_end 若当前是战斗状态，则调用该动作，会挂起至战斗结束，此时自动战斗 
     - 预制动作 find_and_interact_with_next_object 会在当前场景寻找并移动至下一个可交互对象并与其交互,只要是在场景中需要与物体交互，都调用这个，包括与前方怪物战斗、与NPC、机关、门互动等
 - 注意在3D场景中不要尝试点击物体触发交互，这没有任何效果，若发现需要在3D场景中需要与物体交互，请使用预置动作 find_and_interact_with_next_object。
@@ -88,6 +95,30 @@ LLM_FSM_PROMPT_BASE = """你是视觉驱动游戏自动化的状态标注器和�
   "slug": "...",
   "possible_page_type": "none 或 已知/候选页面类型英文名",
   "elements": [...],
-  "actions": [...]
+  "intent_assessment": {"relation":"expected_step|blocking_overlay|completion_evidence|unrelated|contradiction|unknown","reason":"..."},
+  "intent_proposal": null 或 {
+    "kind":"稳定语义名",
+    "phase":"start",
+    "params":{},
+    "facts":{},
+    "transitions":[{"from_phase":"start","event":"事件名","next_phase":"下一阶段","status":"running|completed","fact_patch":{}}],
+    "completion":{"event":"完成事件"}
+  },
+  "bootstrap_operations": [{
+    "operation":"dismiss_overlay",
+    "is_default":true,
+    "intent_scope":"intent_invariant",
+    "intent_effect":"preserve",
+    "safety":"low_risk",
+    "expected_event":"overlay_dismissed",
+    "intent_routes":[],
+    "steps":[{
+      "step_id":"dismiss",
+      "resolver":{"type":"fixed_point","x":500,"y":850},
+      "expected_after":{"screen_should_change":true,"exit_likely":true},
+      "emits_on_success":{"type":"overlay_dismissed"},
+      "brief":"..."
+    }]
+  }]
 }
 """
