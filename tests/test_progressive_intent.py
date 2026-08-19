@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from state_machine.command import resolve_effective_command, step_preconditions_pass
+from state_machine.command import classify_strategy_result, resolve_effective_command, step_preconditions_pass
 from state_machine.intent import active_intent, adopt_intent_proposal, create_intent, push_child_intent, reduce_intent_event
 from state_machine.page_handler.store import handler_from_bootstrap, mark_strategy_result, select_strategy
 from state_machine.protocol import parse_state_payload
@@ -57,6 +57,23 @@ def test_active_intent_route_overrides_default_operation() -> None:
     assert command.intent_id == "intent_x"
 
 
+def test_compact_llm_intent_route_is_normalized_to_executable_route() -> None:
+    handler = handler_from_bootstrap([
+        {
+            "operation": "start_run",
+            "is_default": True,
+            "intent_scope": "intent_specific",
+            "intent_effect": "advance",
+            "safety": "low_risk",
+            "steps": [{"resolver": {"type": "fixed_point", "x": 845, "y": 900}}],
+            "intent_routes": [{"kind": "clear_universe", "phase": "start"}],
+        }
+    ])
+    assert handler["intent_routes"] == [{"intent_kinds": ["clear_universe"], "phases": ["start"], "operation": "start_run", "intent_effect": "advance", "expected_event": None, "params": {}}]
+    intent = {"intent_id": "intent_x", "kind": "clear_universe", "phase": "start", "params": {}, "facts": {}}
+    assert resolve_effective_command(_state(handler), intent).operation == "start_run"
+
+
 def test_active_intent_only_allows_transparent_default_fallback() -> None:
     unsafe_handler = handler_from_bootstrap([
         {
@@ -87,7 +104,24 @@ def test_active_intent_only_allows_transparent_default_fallback() -> None:
     assert command.intent_effect == "preserve"
 
 
-def test_bootstrap_operation_is_not_default_without_explicit_opt_in() -> None:
+def test_explicit_safe_default_from_first_llm_call_executes_without_intent() -> None:
+    handler = handler_from_bootstrap([
+        {
+            "operation": "start_run",
+            "is_default": True,
+            "intent_scope": "intent_specific",
+            "intent_effect": "advance",
+            "safety": "low_risk",
+            "steps": [{"resolver": {"type": "fixed_point", "x": 845, "y": 900}, "expected_after": {"exit_likely": True}}],
+        }
+    ])
+    command = resolve_effective_command(_state(handler), None)
+    assert command is not None
+    assert command.operation == "start_run"
+    assert command.source == "state_default"
+
+
+def test_single_safe_bootstrap_operation_becomes_default_without_second_llm_call() -> None:
     handler = handler_from_bootstrap([
         {
             "operation": "select_candidate",
@@ -97,8 +131,20 @@ def test_bootstrap_operation_is_not_default_without_explicit_opt_in() -> None:
             "steps": [{"resolver": {"type": "fixed_point", "x": 400, "y": 500}}],
         }
     ])
-    assert handler["default_operation"] is None
-    assert resolve_effective_command(_state(handler), None) is None
+    assert handler["default_operation"]["operation"] == "select_candidate"
+    assert resolve_effective_command(_state(handler), None).operation == "select_candidate"
+
+
+def test_ambiguous_or_high_risk_bootstrap_does_not_become_implicit_default() -> None:
+    multiple = handler_from_bootstrap([
+        {"operation": "inspect", "safety": "low_risk", "steps": [{"resolver": {"type": "fixed_point", "x": 400, "y": 400}}]},
+        {"operation": "leave", "safety": "low_risk", "steps": [{"resolver": {"type": "fixed_point", "x": 50, "y": 50}}]},
+    ])
+    assert multiple["default_operation"] is None
+    destructive = handler_from_bootstrap([
+        {"operation": "delete", "safety": "destructive", "steps": [{"resolver": {"type": "fixed_point", "x": 800, "y": 850}}]},
+    ])
+    assert destructive["default_operation"] is None
 
 
 def test_operation_safety_is_inherited_by_its_strategies() -> None:
@@ -132,6 +178,26 @@ def test_two_step_preconditions_are_explicit_and_fail_closed() -> None:
     assert ok and reason == "ok"
     ok, reason = step_preconditions_pass({"confirm_enabled": True}, previous_step_verified=True, previous_event=None, current_state_matches=True, intent=None)
     assert not ok and reason.startswith("unsupported_preconditions")
+
+
+def test_no_visual_change_intermediate_step_continues_to_confirmation() -> None:
+    result = classify_strategy_result(
+        changed=False,
+        left_state=True,  # transient matcher miss must not end an intermediate step
+        expected={"screen_should_change": False, "exit_likely": False},
+        final_step=False,
+    )
+    assert result == "partial_progress"
+
+
+def test_final_exit_step_accepts_changed_screen_before_new_state_is_known() -> None:
+    result = classify_strategy_result(
+        changed=True,
+        left_state=False,
+        expected={"screen_should_change": True, "exit_likely": True},
+        final_step=True,
+    )
+    assert result == "verified_success"
 
 
 def test_intent_survives_page_events_until_completion_event() -> None:
@@ -200,6 +266,26 @@ def test_failed_cheap_strategy_escalates_to_stronger_strategy() -> None:
     assert select_strategy(handler, "dismiss_overlay")["strategy_id"] == "template"
 
 
+def test_degraded_strategy_gets_one_rehabilitation_canary_before_llm_repair() -> None:
+    handler = handler_from_bootstrap([
+        {
+            "operation": "select_and_confirm",
+            "safety": "reversible",
+            "strategies": [{
+                "strategy_id": "two_step",
+                "level": 0,
+                "status": "degraded",
+                "steps": [
+                    {"resolver": {"type": "fixed_point", "x": 235, "y": 480}, "expected_after": {"screen_should_change": False, "exit_likely": False}},
+                    {"resolver": {"type": "fixed_point", "x": 850, "y": 885}, "expected_after": {"screen_should_change": True, "exit_likely": True}},
+                ],
+            }],
+        }
+    ])
+    assert select_strategy(handler, "select_and_confirm")["strategy_id"] == "two_step"
+    assert select_strategy(handler, "select_and_confirm", excluded={"two_step"}) is None
+
+
 def test_state_payload_requires_bootstrap_operations_not_legacy_actions() -> None:
     payload = {
         "page_summary": "popup",
@@ -211,3 +297,22 @@ def test_state_payload_requires_bootstrap_operations_not_legacy_actions() -> Non
     assert parse_state_payload(json.dumps(payload)) == payload
     legacy = {"page_summary": "popup", "slug": "popup", "elements": [], "actions": []}
     assert parse_state_payload(json.dumps(legacy)) is None
+
+
+def test_state_payload_locally_repairs_missing_bbox_commas_without_llm_retry() -> None:
+    malformed = r'''{
+      "page_summary": "blessing select",
+      "slug": "blessing_select",
+      "possible_page_type": "none",
+      "elements": [{"type":"pattern","bbox":[26 25, 62 80]}],
+      "bootstrap_operations": [{
+        "operation":"select_first",
+        "steps":[
+          {"resolver":{"type":"fixed_point","x":235,"y":480},"expected_after":{"screen_should_change":false,"exit_likely":false}},
+          {"resolver":{"type":"fixed_point","x":850,"y":885},"expected_after":{"screen_should_change":true,"exit_likely":true}}
+        ]
+      }]
+    }'''
+    payload = parse_state_payload(malformed)
+    assert payload is not None
+    assert payload["elements"][0]["bbox"] == [26, 25, 62, 80]

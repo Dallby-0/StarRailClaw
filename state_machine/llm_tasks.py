@@ -6,10 +6,11 @@ from pathlib import Path
 from typing import Any
 
 from agent.llm_client import DoubaoClient
+from agent.responses_protocol import response_output_text
 
 from . import constants
 from .constants import LLM_PARSE_RETRY
-from .protocol import parse_state_payload
+from .protocol import parse_state_payload, state_bootstrap_json_schema
 
 
 def _normalize_assistant_text(content: Any) -> str:
@@ -128,24 +129,20 @@ def _request_llm_payload(
             "普通唯一推进页面不得创建 intent_proposal。"
         ),
     }
-    msg = _build_user_message_from_frame(frame_rgb, json.dumps(context, ensure_ascii=False))
-    prompt_fix = "上次JSON无效或不完整。只输出一个完整JSON对象，不要省略字段，不要解释文字。"
-    for attempt in range(1, LLM_PARSE_RETRY + 2):
-        payload_msg = msg if attempt == 1 else {"role": "user", "content": [{"type": "text", "text": prompt_fix}]}
-        resp = llm.chat_with_session(
-            session_id=session_id,
-            system_prompt=system_prompt,
-            user_message=payload_msg,
-            tools=[],
-            tool_choice="none",
-        )
-        text = _normalize_assistant_text(resp["choices"][0]["message"].get("content"))
-        _save_llm_raw_debug(session_id, attempt, text, "normal", raw_debug_dir)
-        print(f"[fsm][llm] raw(attempt={attempt})={text[:600]}")
-        parsed = _parse_llm_payload(text)
-        if parsed is not None:
-            return parsed
-    return None
+    # State recognition and bootstrap action planning share exactly one image
+    # request. Responses JSON Schema enforces syntax and shape server-side;
+    # this call is deliberately independent from accumulated chat history.
+    resp = llm.responses_json_schema(
+        system_prompt=system_prompt,
+        user_text=json.dumps(context, ensure_ascii=False),
+        image_data_urls=[DoubaoClient.encode_image_to_data_url(frame_rgb)],
+        schema_name="fsm_state_bootstrap",
+        schema=state_bootstrap_json_schema(),
+    )
+    text = response_output_text(resp)
+    _save_llm_raw_debug(session_id, 1, text, "normal", raw_debug_dir)
+    print(f"[fsm][llm][responses][json_schema] raw={text[:600]}")
+    return _parse_llm_payload(text)
 
 
 def _request_llm_condition_revision(

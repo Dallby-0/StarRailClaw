@@ -82,7 +82,11 @@ def resolve_effective_command(state_meta: dict[str, Any], intent: dict[str, Any]
             intent_effect="preserve",
             expected_event=str(default.get("expected_event") or "") or None,
         )
-    if intent_scope != "intent_invariant" or safety not in {"low_risk", "reversible"}:
+    # With no active intent, an explicitly configured default operation is the
+    # state author's decision for the ordinary path.  intent_scope only controls
+    # whether that default may interrupt an *existing* intent; it must not make
+    # the same bootstrap operation unusable on the state that just learned it.
+    if safety not in {"low_risk", "reversible"}:
         return None
     return EffectiveCommand(
         operation=operation,
@@ -117,3 +121,18 @@ def step_preconditions_pass(
     if expected_phase and str((intent or {}).get("phase") or "") != expected_phase:
         return False, "intent_phase_mismatch"
     return True, "ok"
+
+
+def classify_strategy_result(*, changed: bool, left_state: bool, expected: dict[str, Any], final_step: bool) -> str:
+    exit_likely = bool(expected.get("exit_likely", False))
+    change_expectation = expected.get("screen_should_change")
+    success = "verified_success" if final_step else "partial_progress"
+    if exit_likely:
+        return success if left_state or changed else "no_effect"
+    if change_expectation is False:
+        return success
+    if change_expectation is True:
+        return success if changed else "no_effect"
+    if bool(expected.get("same_page_likely", False)):
+        return success if changed else "no_effect"
+    return success if changed else "no_effect"

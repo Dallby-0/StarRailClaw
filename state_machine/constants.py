@@ -89,36 +89,5 @@ LLM_FSM_PROMPT_BASE = """你是视觉驱动游戏自动化的状态标注器和�
     - 预制动作 find_and_interact_with_next_object 会在当前场景寻找并移动至下一个可交互对象并与其交互,只要是在场景中需要与物体交互，都调用这个，包括与前方怪物战斗、与NPC、机关、门互动等
 - 注意在3D场景中不要尝试点击物体触发交互，这没有任何效果，若发现需要在3D场景中需要与物体交互，请使用预置动作 find_and_interact_with_next_object。
 
-输出字段：
-{
-  "page_summary": "...",
-  "slug": "...",
-  "possible_page_type": "none 或 已知/候选页面类型英文名",
-  "elements": [...],
-  "intent_assessment": {"relation":"expected_step|blocking_overlay|completion_evidence|unrelated|contradiction|unknown","reason":"..."},
-  "intent_proposal": null 或 {
-    "kind":"稳定语义名",
-    "phase":"start",
-    "params":{},
-    "facts":{},
-    "transitions":[{"from_phase":"start","event":"事件名","next_phase":"下一阶段","status":"running|completed","fact_patch":{}}],
-    "completion":{"event":"完成事件"}
-  },
-  "bootstrap_operations": [{
-    "operation":"dismiss_overlay",
-    "is_default":true,
-    "intent_scope":"intent_invariant",
-    "intent_effect":"preserve",
-    "safety":"low_risk",
-    "expected_event":"overlay_dismissed",
-    "intent_routes":[],
-    "steps":[{
-      "step_id":"dismiss",
-      "resolver":{"type":"fixed_point","x":500,"y":850},
-      "expected_after":{"screen_should_change":true,"exit_likely":true},
-      "emits_on_success":{"type":"overlay_dismissed"},
-      "brief":"..."
-    }]
-  }]
-}
+字段、枚举、必填项和嵌套结构由 Responses API 的 JSON Schema 提供，不要输出 schema 之外的字段。
 """

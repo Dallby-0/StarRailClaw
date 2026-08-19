@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Tuple
 import cv2
 import requests
 
+from agent.responses_protocol import build_json_schema_response_input
+
 
 @dataclass
 class SessionMessageCache:
@@ -183,6 +185,11 @@ class DoubaoClient:
         self._log_chat_response_status(data)
         return data
 
+    def _post_response(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        data = self._post_json("responses", payload, error_label="ARK Responses API error")
+        self._log_responses_status(data)
+        return data
+
     @staticmethod
     def _usage_int(usage: dict[str, Any], key: str) -> int:
         try:
@@ -218,6 +225,50 @@ class DoubaoClient:
         )
         if finish_reason == "length":
             print("[llm][response][warning] completion truncated by max output tokens")
+
+    def _log_responses_status(self, data: Dict[str, Any]) -> None:
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        input_tokens = self._usage_int(usage, "input_tokens")
+        output_tokens = self._usage_int(usage, "output_tokens")
+        total_tokens = self._usage_int(usage, "total_tokens")
+        if total_tokens <= 0:
+            total_tokens = input_tokens + output_tokens
+        if total_tokens > 0:
+            self.usage_totals["prompt_tokens"] += input_tokens
+            self.usage_totals["completion_tokens"] += output_tokens
+            self.usage_totals["total_tokens"] += total_tokens
+        status = str(data.get("status", "") or "-")
+        incomplete = data.get("incomplete_details")
+        print(
+            "[llm][responses] "
+            f"status={status} "
+            f"current={self._token_k(total_tokens)} "
+            f"input={self._token_k(input_tokens)} "
+            f"output={self._token_k(output_tokens)} "
+            f"run_total={self._token_k(self.usage_totals['total_tokens'])}"
+        )
+        if incomplete:
+            print(f"[llm][responses][warning] incomplete_details={incomplete}")
+
+    def responses_json_schema(
+        self,
+        *,
+        system_prompt: str,
+        user_text: str,
+        image_data_urls: List[str],
+        schema_name: str,
+        schema: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Run a self-contained Responses request constrained by JSON Schema."""
+        payload = build_json_schema_response_input(
+            system_prompt=system_prompt,
+            user_text=user_text,
+            image_data_urls=image_data_urls,
+            schema_name=schema_name,
+            schema=schema,
+        )
+        payload["model"] = self.model
+        return self._post_response(payload)
 
     def get_image_tools(self) -> List[Dict[str, Any]]:
         return [

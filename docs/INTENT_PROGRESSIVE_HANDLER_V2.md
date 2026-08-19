@@ -2,6 +2,12 @@
 
 本规范覆盖旧的 state-scoped intent、`actions`、`controller.seed_action` 和 `action_templates` 设计。v2 面向全新状态机资源，不兼容旧状态文件。
 
+## 0. Unknown-state LLM protocol
+
+新状态的首次识别使用 Volcano Ark `POST /api/v3/responses`，并在同一个请求中完成页面特征、intent 判断和 1–2 步 bootstrap operation 的生成。请求使用 `text.format.type=json_schema`；所有对象关闭额外字段，关键枚举、四元坐标和步骤数量由 schema 约束。
+
+该调用是无会话的一次性请求，不携带 Chat Completions 历史，也不会因 JSON 解析失败再次上传同一截图。底层 HTTP 客户端仍可对超时、429 或 5xx 做传输级重试；这与再次让模型分析页面的语义重试不同。handler 已有策略全部失效后触发的 repair LLM 是另一个、按需发生的升级阶段。
+
 ## 1. 职责边界
 
 - 外部 FSM 识别当前页面状态并确认页面转移。
@@ -117,9 +123,13 @@ level 4: LLM repair proposal
 
 策略最多包含两个条件步骤。每一步执行后必须重新截图、等待稳定、匹配状态并验证 `expected_after`，不得盲目连续点击。
 
+中间步骤若声明 `screen_should_change=false`，无明显画面变化是合法结果；瞬时 matcher miss 也不代表已经离开页面。runner 应继续执行同一 bootstrap strategy 的下一条件步骤。只有最终步骤或明确声明 `exit_likely=true` 的步骤才能触发全局状态交接。
+
 ## 6. 一次看图同时建立状态和 bootstrap policy
 
 未知状态 LLM payload 必须包含：
+
+同一张未知状态截图只允许一次网络 LLM 调用。响应 JSON 的轻微格式错误（当前支持数字 bbox 坐标之间漏逗号）在本地修复；不得以 `attempt=2` 再次上传图片。无法本地解析时本次 one-shot 识别失败，由调用方记录失败，而不是在同一次请求函数中重试。
 
 ```json
 {
@@ -138,7 +148,9 @@ level 4: LLM repair proposal
 
 仅当无 active intent 且页面确实存在同页异操作或跨页语义时，LLM 才能提出 `intent_proposal`。普通唯一推进页面必须保持为 null。
 
-Bootstrap operation 必须显式设置 `is_default=true` 才会成为默认操作。即使设为默认，也只有 `intent_invariant + low_risk/reversible` 能自动执行。
+Bootstrap operation 显式设置 `is_default=true` 时会成为默认操作。若响应中只有一个 `low_risk/reversible` operation，系统也会把这个无歧义结果作为默认操作，避免在刚完成“识别 + 行动建议”的同一轮之后再次调用 LLM。多个候选以及 `commit/destructive` operation 不会被隐式提升。
+
+无 active intent 时，显式或无歧义推导出的安全 default 可以直接执行；`intent_scope` 只控制 active intent 已存在时该 default 能否插入并保持原 intent。换言之，`intent_specific` 不会让首次响应里已经选定的普通 default 失效。
 
 ## 7. 执行与验证
 

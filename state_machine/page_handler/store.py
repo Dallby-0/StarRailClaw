@@ -128,6 +128,29 @@ def normalize_operation(raw: Any, *, index: int = 1) -> dict[str, Any] | None:
     }
 
 
+def _normalize_intent_route(raw: Any, operation: str) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    kinds = raw.get("intent_kinds")
+    if not isinstance(kinds, list):
+        kind = raw.get("intent_kind") or raw.get("kind")
+        kinds = [kind] if kind else []
+    phases = raw.get("phases")
+    if not isinstance(phases, list):
+        phase = raw.get("phase")
+        phases = [phase] if phase else ["*"]
+    if not kinds:
+        return None
+    return {
+        "intent_kinds": [str(value) for value in kinds if str(value)],
+        "phases": [str(value) for value in phases if str(value)] or ["*"],
+        "operation": str(raw.get("operation") or operation),
+        "intent_effect": str(raw.get("intent_effect", "advance")),
+        "expected_event": str(raw.get("expected_event") or "") or None,
+        "params": dict(raw.get("params") or {}),
+    }
+
+
 def handler_from_bootstrap(bootstrap_operations: Any) -> dict[str, Any]:
     handler = {"schema_version": HANDLER_SCHEMA_VERSION, "default_operation": None, "intent_routes": [], "operation_policies": {}, "episode_trace": [], "created_at": _now_iso(), "updated_at": _now_iso()}
     if not isinstance(bootstrap_operations, list):
@@ -141,7 +164,22 @@ def handler_from_bootstrap(bootstrap_operations: Any) -> dict[str, Any]:
         if bool(raw.get("is_default", False)):
             handler["default_operation"] = {"operation": name, "intent_scope": operation["intent_scope"], "intent_effect": operation["intent_effect"], "safety": operation["safety"], "expected_event": operation["expected_event"]}
         routes = raw.get("intent_routes") if isinstance(raw.get("intent_routes"), list) else []
-        handler["intent_routes"].extend(route for route in routes if isinstance(route, dict))
+        handler["intent_routes"].extend(route for item in routes if (route := _normalize_intent_route(item, name)) is not None)
+    # A single low-risk bootstrap operation is an unambiguous answer to the
+    # combined "identify + advance" request.  Treat it as the default even if
+    # the model omitted is_default or emitted a contradictory intent_scope.
+    # Multiple choices and commit/destructive operations still require an
+    # explicit command/intent and therefore remain unresolved.
+    if handler["default_operation"] is None and len(handler["operation_policies"]) == 1:
+        only = next(iter(handler["operation_policies"].values()))
+        if isinstance(only, dict) and str(only.get("safety")) in {"low_risk", "reversible"}:
+            handler["default_operation"] = {
+                "operation": str(only["operation"]),
+                "intent_scope": str(only.get("intent_scope", "intent_specific")),
+                "intent_effect": str(only.get("intent_effect", "none")),
+                "safety": str(only.get("safety")),
+                "expected_event": only.get("expected_event"),
+            }
     return handler
 
 
@@ -166,6 +204,11 @@ def select_strategy(handler: dict[str, Any], operation: str, *, excluded: set[st
         return None
     excluded = excluded or set()
     candidates = [item for item in policy.get("strategies", []) if isinstance(item, dict) and str(item.get("strategy_id")) not in excluded and str(item.get("status", "proposed")) in {"proposed", "probation", "active"}]
+    if not candidates:
+        # A previous runner bug may have degraded an otherwise valid strategy.
+        # Rehabilitate each degraded strategy at most once per handler run
+        # (excluded guards repeated attempts) before paying for an LLM repair.
+        candidates = [item for item in policy.get("strategies", []) if isinstance(item, dict) and str(item.get("strategy_id")) not in excluded and str(item.get("status")) == "degraded"]
     if not candidates:
         return None
     candidates.sort(key=lambda item: (int(item.get("level", 0) or 0), 0 if item.get("status") == "active" else 1, -int(item.get("success_count", 0) or 0)))
@@ -199,7 +242,13 @@ def apply_handler_patch(handler: dict[str, Any], patch: Any) -> set[str]:
     if isinstance(patch.get("default_operation"), dict):
         handler["default_operation"] = dict(patch["default_operation"])
     if isinstance(patch.get("intent_routes"), list):
-        handler["intent_routes"] = [item for item in patch["intent_routes"] if isinstance(item, dict)]
+        normalized_routes = []
+        for item in patch["intent_routes"]:
+            operation = str(item.get("operation") or "") if isinstance(item, dict) else ""
+            route = _normalize_intent_route(item, operation)
+            if route is not None:
+                normalized_routes.append(route)
+        handler["intent_routes"] = normalized_routes
     handler["updated_at"] = _now_iso()
     return touched
 

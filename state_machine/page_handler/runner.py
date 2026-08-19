@@ -7,7 +7,7 @@ from agent.behavior_tree.coord_mapper import CoordinateMapper
 from agent.behavior_tree.vision import VisionEngine
 from agent.llm_client import DoubaoClient
 from sr_tools.emulator import EmulatorClient
-from state_machine.command import EffectiveCommand, resolve_effective_command, step_preconditions_pass
+from state_machine.command import EffectiveCommand, classify_strategy_result, resolve_effective_command, step_preconditions_pass
 from state_machine.constants import LOCAL_FLOW_MAX_STEPS, LOCAL_FLOW_NO_PROGRESS_LIMIT
 from state_machine.intent import active_intent, intent_projection, reduce_intent_event
 from state_machine.io import _load_json, _now_iso, _save_json, _save_runtime
@@ -49,16 +49,6 @@ def _event_for_success(command: EffectiveCommand, step_info: dict[str, Any], *, 
     if final_step and command.expected_event:
         return {"type": command.expected_event}
     return None
-
-
-def _strategy_result(*, changed: bool, left_state: bool, expected: dict[str, Any], final_step: bool) -> str:
-    if bool(expected.get("exit_likely", False)):
-        return "verified_success" if left_state else "no_effect"
-    if bool(expected.get("same_page_likely", False)):
-        return ("verified_success" if final_step else "partial_progress") if changed and not left_state else "wrong_transition" if left_state else "no_effect"
-    if left_state or changed:
-        return "verified_success" if final_step or left_state else "partial_progress"
-    return "no_effect"
 
 
 def run_page_handler(
@@ -204,7 +194,7 @@ def run_page_handler(
             left_state = current_match is None or not current_match.success
             current_state_matches = not left_state
             final_step = step_index == len(steps) - 1
-            result = _strategy_result(changed=changed, left_state=left_state, expected=action_info.get("expected_after", {}), final_step=final_step)
+            result = classify_strategy_result(changed=changed, left_state=left_state, expected=action_info.get("expected_after", {}), final_step=final_step)
             allowed = action_info.get("expected_after", {}).get("allowed_state_ids")
             if left_state and isinstance(allowed, list):
                 observed = {m.state_id for m in matches if m.success}
@@ -226,7 +216,7 @@ def run_page_handler(
             _save_json(state_path, state_meta)
             _save_runtime(runtime)
             if logger is not None:
-                logger.event("page_handler_step_result", state_id=state_id, action_id=action_id, operation=command.operation, strategy_id=strategy_id, step=step_index + 1, result=result, changed=changed, diff_score=diff_score, event=event, candidates=[summarize_match(m) for m in matches])
+                logger.event("page_handler_step_result", state_id=state_id, action_id=action_id, operation=command.operation, strategy_id=strategy_id, step=step_index + 1, result=result, changed=changed, diff_score=diff_score, semantic_event=event, candidates=[summarize_match(m) for m in matches])
 
             if result in {"no_effect", "wrong_transition", "unsafe_effect"}:
                 failed_attempts.append({"strategy_id": strategy_id, "step_index": step_index, "result": result, "diff_score": diff_score})
@@ -240,11 +230,13 @@ def run_page_handler(
                     return _defer_unknown_transition(runtime=runtime, state_id=state_id, action_id=action_id, logger=logger, frame=post, reason="page-handler-failed-policy-left-state")
                 break
 
-            nxt = _resolve_transition_after_progress(state_id=state_id, action_id=action_id, matches=matches, graph=graph, runtime=runtime, prefer_reachable_first=prefer_reachable_first, logger=logger, reason_suffix="-page-handler")
-            if nxt is not None:
-                return True, post
-            if left_state:
-                return _defer_unknown_transition(runtime=runtime, state_id=state_id, action_id=action_id, logger=logger, frame=post, reason="page-handler-original-state-no-longer-matched")
+            expected_exit = bool(action_info.get("expected_after", {}).get("exit_likely", False))
+            if final_step or expected_exit:
+                nxt = _resolve_transition_after_progress(state_id=state_id, action_id=action_id, matches=matches, graph=graph, runtime=runtime, prefer_reachable_first=prefer_reachable_first, logger=logger, reason_suffix="-page-handler")
+                if nxt is not None:
+                    return True, post
+                if left_state:
+                    return _defer_unknown_transition(runtime=runtime, state_id=state_id, action_id=action_id, logger=logger, frame=post, reason="page-handler-original-state-no-longer-matched")
             current = post
 
         if strategy_failed:
