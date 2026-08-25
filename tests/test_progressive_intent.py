@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import json
-
-from state_machine.command import classify_strategy_result, resolve_effective_command, step_preconditions_pass
+from state_machine.command import resolve_effective_command, step_preconditions_pass
 from state_machine.intent import active_intent, adopt_intent_proposal, create_intent, push_child_intent, reduce_intent_event
-from state_machine.page_handler.store import handler_from_bootstrap, mark_strategy_result, select_strategy
+from state_machine.page_handler.store import continuation_patch_from_sibling, handler_from_bootstrap, mark_strategy_result, select_strategy
 from state_machine.protocol import parse_state_payload
 
 
@@ -20,7 +19,7 @@ def test_safe_default_needs_no_persistent_intent() -> None:
             "intent_scope": "intent_invariant",
             "intent_effect": "preserve",
             "safety": "low_risk",
-            "steps": [{"resolver": {"type": "fixed_point", "x": 500, "y": 850}, "expected_after": {"exit_likely": True}}],
+            "steps": [{"resolver": {"type": "fixed_point", "x": 500, "y": 850}, "expected_after": {"state_relation": "must_leave", "reentry_policy": "forbid"}}],
         }
     ])
     command = resolve_effective_command(_state(handler), None)
@@ -74,7 +73,7 @@ def test_compact_llm_intent_route_is_normalized_to_executable_route() -> None:
     assert resolve_effective_command(_state(handler), intent).operation == "start_run"
 
 
-def test_active_intent_only_allows_transparent_default_fallback() -> None:
+def test_active_intent_allows_safe_intent_invariant_default_fallback() -> None:
     unsafe_handler = handler_from_bootstrap([
         {
             "operation": "confirm_purchase",
@@ -103,6 +102,21 @@ def test_active_intent_only_allows_transparent_default_fallback() -> None:
     assert command.operation == "dismiss_tutorial"
     assert command.intent_effect == "preserve"
 
+    advancing_handler = handler_from_bootstrap([
+        {
+            "operation": "select_and_confirm",
+            "is_default": True,
+            "intent_scope": "intent_invariant",
+            "intent_effect": "advance",
+            "safety": "reversible",
+            "steps": [{"resolver": {"type": "fixed_point", "x": 500, "y": 450}}],
+        }
+    ])
+    command = resolve_effective_command(_state(advancing_handler), intent)
+    assert command is not None
+    assert command.operation == "select_and_confirm"
+    assert command.intent_effect == "advance"
+
 
 def test_explicit_safe_default_from_first_llm_call_executes_without_intent() -> None:
     handler = handler_from_bootstrap([
@@ -112,7 +126,7 @@ def test_explicit_safe_default_from_first_llm_call_executes_without_intent() -> 
             "intent_scope": "intent_specific",
             "intent_effect": "advance",
             "safety": "low_risk",
-            "steps": [{"resolver": {"type": "fixed_point", "x": 845, "y": 900}, "expected_after": {"exit_likely": True}}],
+            "steps": [{"resolver": {"type": "fixed_point", "x": 845, "y": 900}, "expected_after": {"state_relation": "must_leave", "reentry_policy": "forbid"}}],
         }
     ])
     command = resolve_effective_command(_state(handler), None)
@@ -161,6 +175,37 @@ def test_operation_safety_is_inherited_by_its_strategies() -> None:
     assert strategy["safety"] == "commit"
 
 
+def test_split_select_and_confirm_can_reuse_confirm_as_current_continuation() -> None:
+    handler = handler_from_bootstrap([
+        {
+            "operation": "select_card",
+            "is_default": True,
+            "intent_scope": "intent_invariant",
+            "intent_effect": "advance",
+            "safety": "reversible",
+            "steps": [{"resolver": {"type": "fixed_point", "x": 220, "y": 500}, "expected_after": {"state_relation": "must_remain", "reentry_policy": "same_visit"}}],
+        },
+        {
+            "operation": "confirm_selection",
+            "intent_scope": "intent_invariant",
+            "intent_effect": "advance",
+            "safety": "commit",
+            "steps": [{"resolver": {"type": "fixed_point", "x": 625, "y": 900}, "expected_after": {"state_relation": "must_leave", "reentry_policy": "new_visit"}}],
+        },
+    ])
+    patch = continuation_patch_from_sibling(handler, "select_card")
+    assert patch is not None
+    operation = patch["operations"][0]
+    assert operation["operation"] == "select_card"
+    assert operation["safety"] == "reversible"
+    assert operation["strategies"][0]["steps"][0]["resolver"] == {"type": "fixed_point", "x": 625, "y": 900}
+
+    default_strategy = handler["operation_policies"]["select_card"]["strategies"][0]
+    assert len(default_strategy["steps"]) == 2
+    assert default_strategy["steps"][1]["resolver"] == {"type": "fixed_point", "x": 625, "y": 900}
+    assert default_strategy["safety"] == "reversible"
+
+
 def test_two_step_preconditions_are_explicit_and_fail_closed() -> None:
     handler = handler_from_bootstrap([
         {
@@ -178,26 +223,6 @@ def test_two_step_preconditions_are_explicit_and_fail_closed() -> None:
     assert ok and reason == "ok"
     ok, reason = step_preconditions_pass({"confirm_enabled": True}, previous_step_verified=True, previous_event=None, current_state_matches=True, intent=None)
     assert not ok and reason.startswith("unsupported_preconditions")
-
-
-def test_no_visual_change_intermediate_step_continues_to_confirmation() -> None:
-    result = classify_strategy_result(
-        changed=False,
-        left_state=True,  # transient matcher miss must not end an intermediate step
-        expected={"screen_should_change": False, "exit_likely": False},
-        final_step=False,
-    )
-    assert result == "partial_progress"
-
-
-def test_final_exit_step_accepts_changed_screen_before_new_state_is_known() -> None:
-    result = classify_strategy_result(
-        changed=True,
-        left_state=False,
-        expected={"screen_should_change": True, "exit_likely": True},
-        final_step=True,
-    )
-    assert result == "verified_success"
 
 
 def test_intent_survives_page_events_until_completion_event() -> None:
@@ -266,7 +291,7 @@ def test_failed_cheap_strategy_escalates_to_stronger_strategy() -> None:
     assert select_strategy(handler, "dismiss_overlay")["strategy_id"] == "template"
 
 
-def test_degraded_strategy_gets_one_rehabilitation_canary_before_llm_repair() -> None:
+def test_degraded_strategy_stays_disabled_until_explicit_repair() -> None:
     handler = handler_from_bootstrap([
         {
             "operation": "select_and_confirm",
@@ -276,13 +301,13 @@ def test_degraded_strategy_gets_one_rehabilitation_canary_before_llm_repair() ->
                 "level": 0,
                 "status": "degraded",
                 "steps": [
-                    {"resolver": {"type": "fixed_point", "x": 235, "y": 480}, "expected_after": {"screen_should_change": False, "exit_likely": False}},
-                    {"resolver": {"type": "fixed_point", "x": 850, "y": 885}, "expected_after": {"screen_should_change": True, "exit_likely": True}},
+                    {"resolver": {"type": "fixed_point", "x": 235, "y": 480}, "expected_after": {"state_relation": "must_remain", "reentry_policy": "same_visit"}},
+                    {"resolver": {"type": "fixed_point", "x": 850, "y": 885}, "expected_after": {"state_relation": "must_leave", "reentry_policy": "new_visit"}},
                 ],
             }],
         }
     ])
-    assert select_strategy(handler, "select_and_confirm")["strategy_id"] == "two_step"
+    assert select_strategy(handler, "select_and_confirm") is None
     assert select_strategy(handler, "select_and_confirm", excluded={"two_step"}) is None
 
 
@@ -308,8 +333,8 @@ def test_state_payload_locally_repairs_missing_bbox_commas_without_llm_retry() -
       "bootstrap_operations": [{
         "operation":"select_first",
         "steps":[
-          {"resolver":{"type":"fixed_point","x":235,"y":480},"expected_after":{"screen_should_change":false,"exit_likely":false}},
-          {"resolver":{"type":"fixed_point","x":850,"y":885},"expected_after":{"screen_should_change":true,"exit_likely":true}}
+          {"resolver":{"type":"fixed_point","x":235,"y":480},"expected_after":{"state_relation":"must_remain","reentry_policy":"same_visit"}},
+          {"resolver":{"type":"fixed_point","x":850,"y":885},"expected_after":{"state_relation":"must_leave","reentry_policy":"new_visit"}}
         ]
       }]
     }'''

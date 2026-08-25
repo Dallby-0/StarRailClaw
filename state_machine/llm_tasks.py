@@ -48,19 +48,6 @@ def _parse_llm_payload(text: str) -> dict[str, Any] | None:
     return parse_state_payload(text)
 
 
-def _parse_llm_failure_diagnosis(text: str) -> dict[str, Any] | None:
-    try:
-        payload = json.loads(text)
-    except Exception:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    diagnosis = payload.get("diagnosis")
-    if diagnosis not in {"state_misidentified", "action_wrong", "action_partial", "wait_needed", "unknown"}:
-        return None
-    return payload
-
-
 def _parse_llm_disambiguation(text: str) -> dict[str, Any] | None:
     try:
         payload = json.loads(text)
@@ -124,6 +111,8 @@ def _request_llm_payload(
             "请按 system 约定输出 JSON。先照常输出用于建立新状态的页面元素信息；"
             "possible_page_type 必须从 known_page_types.page_type 中选择，若都不像则输出 none。"
             "同时给出最多两个 bootstrap operation；固定点是首选，步骤必须包含 expected_after。"
+            "默认 operation 必须完成当前页面的一次完整推进：若需先选卡再确认，必须是同一个 operation 的两个 steps，"
+            "禁止拆成两个并列 operations；多个 operations 只表示不同 intent 下互斥的操作。"
             "如果 active_intent 非空，判断页面与 intent 的关系，并只为该 intent 或透明阻塞层提出操作。"
             "如果 active_intent 为空，仅当页面存在同识别异操作或操作必须跨多个页面保持语义时，才输出 intent_proposal；"
             "普通唯一推进页面不得创建 intent_proposal。"
@@ -217,54 +206,6 @@ def _request_llm_condition_revision(
         _save_llm_raw_debug(session_id, attempt, raw, "merge_condition", raw_debug_dir)
         print(f"[fsm][merge][llm] raw(attempt={attempt})={raw[:600]}")
         parsed = _parse_llm_condition_revision(raw)
-        if parsed is not None:
-            return parsed
-    return None
-
-
-def _request_llm_failure_diagnosis(
-    llm: DoubaoClient,
-    session_id: str,
-    frame_rgb,
-    system_prompt: str,
-    *,
-    believed_state: dict[str, Any],
-    action_steps: list[dict[str, Any]],
-    runtime_observation: dict[str, Any],
-    raw_debug_dir: Path | None = None,
-) -> dict[str, Any] | None:
-    text = json.dumps(
-        {
-            "mode": "FAILURE_DIAGNOSIS",
-            "instruction": (
-                "当前系统执行动作后没有得到明确转移。请先诊断失败原因，而不是直接修动作。"
-                "重点判断：系统认为的当前状态是否可能和截图不一致。只输出严格 JSON。"
-            ),
-            "believed_state": believed_state,
-            "action_steps": action_steps,
-            "runtime_observation": runtime_observation,
-            "output_schema": {
-                "diagnosis": "state_misidentified|action_wrong|action_partial|wait_needed|unknown",
-                "same_as_believed_state": "boolean",
-                "possible_existing_state_id": "string or none",
-                "needs_new_state": "boolean",
-                "reason": "string",
-            },
-        },
-        ensure_ascii=False,
-    )
-    for attempt in range(1, LLM_PARSE_RETRY + 2):
-        msg = _build_user_message_from_frame(frame_rgb, text)
-        resp = llm.chat_with_session(
-            session_id=session_id,
-            system_prompt=system_prompt,
-            user_message=msg,
-            tools=[],
-            tool_choice="none",
-        )
-        raw = _normalize_assistant_text(resp["choices"][0]["message"].get("content"))
-        _save_llm_raw_debug(session_id, attempt, raw, "failure_diagnosis", raw_debug_dir)
-        parsed = _parse_llm_failure_diagnosis(raw)
         if parsed is not None:
             return parsed
     return None

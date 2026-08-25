@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +10,8 @@ import cv2
 from agent.behavior_tree.coord_mapper import CoordinateMapper
 from agent.behavior_tree.vision import VisionEngine
 from agent.llm_client import DoubaoClient
-from state_machine.io import _backup_json, _load_frame, _normalize_page_type, _now_iso, _save_frame, _save_json, _state_page_type
+from state_machine import constants
+from state_machine.io import _backup_json, _load_frame, _load_json, _normalize_page_type, _now_iso, _save_frame, _save_json, _state_page_type
 from state_machine.llm_tasks import _request_llm_condition_revision
 from state_machine.logger import FsmRunLogger
 from state_machine.matching import _condition_passed, _level, _select_enabled_conditions
@@ -20,6 +22,138 @@ from state_machine.state_store import (
     _sample_screenshot_paths,
     _states_for_page_type,
 )
+
+
+def _handler_operation_names(meta: dict[str, Any]) -> set[str]:
+    handler = meta.get("page_handler") if isinstance(meta.get("page_handler"), dict) else {}
+    policies = handler.get("operation_policies") if isinstance(handler.get("operation_policies"), dict) else {}
+    return {str(name) for name in policies}
+
+
+def _rewrite_graph_after_state_merge(winner_id: str, loser_ids: set[str]) -> None:
+    graph = _load_json(constants.FSM_GRAPH_PATH)
+    nodes = [
+        node for node in graph.get("nodes", [])
+        if isinstance(node, dict) and str(node.get("state_id")) not in loser_ids
+    ]
+    edges: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for raw in graph.get("edges", []):
+        if not isinstance(raw, dict):
+            continue
+        edge = dict(raw)
+        source = str(edge.get("from_state_id") or "")
+        target = str(edge.get("to_state_id") or "")
+        if source in loser_ids:
+            source = winner_id
+        if target in loser_ids:
+            target = winner_id
+        edge["from_state_id"] = source
+        edge["to_state_id"] = target
+        key = (source, str(edge.get("action_id") or ""), target)
+        if key in seen:
+            continue
+        seen.add(key)
+        edges.append(edge)
+    graph["nodes"] = nodes
+    graph["edges"] = edges
+    graph["updated_at"] = _now_iso()
+    _save_json(constants.FSM_GRAPH_PATH, graph)
+
+
+def _try_merge_ambiguous_states(
+    *,
+    winner,
+    losers: list,
+    metas: list[tuple[Path, dict[str, Any]]],
+    vision: VisionEngine,
+    frame_rgb,
+    logger: FsmRunLogger | None = None,
+) -> set[str]:
+    """Conservatively merge indistinguishable duplicate states.
+
+    This is the terminal fallback of disambiguation.  It only merges states
+    with the same explicit page type and the same operation surface, and only
+    when one common condition set covers every stored positive sample.  A
+    failed attempt is logged and leaves both states untouched.
+    """
+    winner_item = next(((d, m) for d, m in metas if str(m.get("state_id")) == winner.state_id), None)
+    if winner_item is None:
+        return set()
+    winner_dir, winner_meta = winner_item
+    merged: set[str] = set()
+    for loser in losers:
+        loser_item = next(((d, m) for d, m in metas if str(m.get("state_id")) == loser.state_id), None)
+        if loser_item is None:
+            continue
+        loser_dir, loser_meta = loser_item
+        winner_type = _normalize_page_type(_state_page_type(winner_meta))
+        loser_type = _normalize_page_type(_state_page_type(loser_meta))
+        reason = ""
+        if not winner_type or winner_type != loser_type:
+            reason = "different_or_missing_page_type"
+        elif _handler_operation_names(winner_meta) != _handler_operation_names(loser_meta):
+            reason = "different_operation_surface"
+
+        frames: list[Any] = [frame_rgb]
+        if not reason:
+            for state_dir, meta in ((winner_dir, winner_meta), (loser_dir, loser_meta)):
+                for path in _sample_screenshot_paths([state_dir]):
+                    image = _load_frame(path)
+                    if image is not None:
+                        frames.append(image)
+        combined = [
+            deepcopy(cond)
+            for meta in (winner_meta, loser_meta)
+            for cond in meta.get("match_conditions", [])
+            if isinstance(cond, dict) and cond.get("condition_status", "active") == "active"
+        ]
+        common = [cond for cond in combined if not reason and all(_condition_passed(cond, vision, image) for image in frames)]
+        if not reason and not common:
+            reason = "no_common_condition_set"
+        if reason:
+            _log(logger, f"[fsm][disambiguation][merge] reject winner={winner.state_id} loser={loser.state_id} reason={reason}", "disambiguation_merge_rejected", winner_state_id=winner.state_id, loser_state_id=loser.state_id, reason=reason)
+            continue
+
+        common, weak_match = _select_enabled_conditions(common, vision, frame_rgb)
+        if not _conditions_pass_all(common, vision, frames):
+            _log(logger, f"[fsm][disambiguation][merge] reject winner={winner.state_id} loser={loser.state_id} reason=common_conditions_failed_validation", "disambiguation_merge_rejected", winner_state_id=winner.state_id, loser_state_id=loser.state_id, reason="common_conditions_failed_validation")
+            continue
+        false_positive = _selected_conditions_match_other_page(common, vision, metas, winner_type)
+        if false_positive:
+            _log(logger, f"[fsm][disambiguation][merge] reject winner={winner.state_id} loser={loser.state_id} reason=false_positive other={false_positive}", "disambiguation_merge_rejected", winner_state_id=winner.state_id, loser_state_id=loser.state_id, reason="false_positive", other=false_positive)
+            continue
+
+        _backup_json(winner_dir / "state.json")
+        _backup_json(loser_dir / "state.json")
+        winner_meta["match_conditions"] = common
+        winner_samples = winner_meta.setdefault("samples", [])
+        known_paths = {str(item.get("path")) for item in winner_samples if isinstance(item, dict)} if isinstance(winner_samples, list) else set()
+        if isinstance(winner_samples, list):
+            for sample in loser_meta.get("samples", []):
+                if isinstance(sample, dict) and str(sample.get("path")) not in known_paths:
+                    winner_samples.append(dict(sample))
+        winner_meta.setdefault("model_info", {})
+        if isinstance(winner_meta["model_info"], dict):
+            winner_meta["model_info"]["weak_match"] = weak_match
+            winner_meta["model_info"].setdefault("merged_state_ids", []).append(loser.state_id)
+        winner_meta["updated_at"] = _now_iso()
+        _save_json(winner_dir / "state.json", winner_meta)
+
+        for condition in loser_meta.get("match_conditions", []):
+            if isinstance(condition, dict):
+                condition["enabled"] = False
+        loser_meta.setdefault("model_info", {})
+        if isinstance(loser_meta["model_info"], dict):
+            loser_meta["model_info"]["merged_into_state_id"] = winner.state_id
+        loser_meta["updated_at"] = _now_iso()
+        _save_json(loser_dir / "state.json", loser_meta)
+        merged.add(loser.state_id)
+        _log(logger, f"[fsm][disambiguation][merge] accepted winner={winner.state_id} loser={loser.state_id}", "disambiguation_merge_accepted", winner_state_id=winner.state_id, loser_state_id=loser.state_id, page_type=winner_type)
+
+    if merged:
+        _rewrite_graph_after_state_merge(winner.state_id, merged)
+    return merged
 
 
 def _log(logger: FsmRunLogger | None, message: str, event: str = "console", **fields: Any) -> None:

@@ -121,9 +121,11 @@ level 3: OCR / detector（后续扩展）
 level 4: LLM repair proposal
 ```
 
-策略最多包含两个条件步骤。每一步执行后必须重新截图、等待稳定、匹配状态并验证 `expected_after`，不得盲目连续点击。
+策略最多包含两个条件步骤。每一步执行后等待稳定并重新匹配状态，不得盲目连续点击。
 
-中间步骤若声明 `screen_should_change=false`，无明显画面变化是合法结果；瞬时 matcher miss 也不代表已经离开页面。runner 应继续执行同一 bootstrap strategy 的下一条件步骤。只有最终步骤或明确声明 `exit_likely=true` 的步骤才能触发全局状态交接。
+`expected_after.state_relation` 使用 `must_leave|must_remain|may_leave`，`reentry_policy` 使用 `forbid|new_visit|same_visit`。页面内选择步骤使用 `must_remain/same_visit`；确认后可能连续出现同类选择页面时使用 `must_leave/new_visit`；普通关闭弹窗使用 `must_leave/forbid`。
+
+若最终落到不同状态，runtime 直接结算成功；若最终仍是同一状态，单次 LLM 复核同时比较操作前后截图、判断完整操作语义是否完成，并可在同一响应里提供后续或修正策略。`partial_needs_continue`（例如卡片已选中但仍需确认）与 `ineffective` 都不会重复执行原策略，而会优先执行复核生成的新策略。该复核每个 visit/operation 最多调用一次，仍保留 visit 级尝试上限和熔断器。
 
 ## 6. 一次看图同时建立状态和 bootstrap policy
 

@@ -77,10 +77,22 @@ LLM_FSM_PROMPT_BASE = """你是视觉驱动游戏自动化的状态标注器和�
 - possible_page_type: 如果当前页面可能属于已知页面类型，输出该类型英文名；否则输出 "none"。不要把具体实例名称当作页面类型。
 - bootstrap_operations: 数组。每项表示一种操作语义及其初始渐进策略，而不是无条件 state action。
   - operation 必须是稳定的短语义名，例如 dismiss_overlay、confirm、advance、select_candidate。
+  - 默认 operation 必须表达“完成当前页面的一次完整推进”，不能只表达一个尚未结束页面的局部点击。
+    - 如果页面需要先选择卡片再点击确认，必须输出一个 select_and_confirm operation，并把选择、确认写成同一 strategy 的两个 steps。
+    - 禁止把前后顺序必做的步骤拆成两个并列 bootstrap_operations；多个 operation 仅用于不同 intent/业务语义下互斥的操作选择。
+    - 页面上存在已经可见的确认/继续/提交按钮时，不能在只完成选择高亮后就把默认 operation 视为完成。
   - intent_scope 只能是 intent_invariant 或 intent_specific。只有纯提示/透明阻塞弹窗才使用 intent_invariant。
   - intent_effect 只能是 preserve、advance、complete 或 none。
   - safety 只能是 low_risk、reversible、commit 或 destructive。commit/destructive 不可作为无条件默认操作。
-  - 最多输出两个 steps；每一步都必须提供 expected_after，runtime 会在每步后重新截图，禁止设计无条件连点宏。
+    - 普通游戏流程中的选卡并确认、领取奖励、关闭弹窗属于 low_risk/reversible；不要仅因为按钮文字是“确认”就标成 commit。
+    - 只有消费稀缺资源、购买、覆盖存档、放弃进度或其他显著不可逆业务结果才使用 commit/destructive。
+  - 最多输出两个 steps；每一步都必须提供 expected_after，runtime 会在每步后观察多帧轨迹，禁止设计无条件连点宏。
+  - expected_after.state_relation 只能是 must_leave、must_remain、may_leave。
+    - 选择卡片等页面内步骤使用 must_remain。
+    - 确认、关闭、推进等必须退出当前页面实例的步骤使用 must_leave。
+  - expected_after.reentry_policy 只能是 forbid、new_visit、same_visit。
+    - 同类事件可能连续弹出（例如确认一轮卡片后又弹出下一轮卡片）时使用 new_visit。
+    - 普通关闭弹窗使用 forbid；页面内步骤使用 same_visit。
   - 初始策略优先 resolver.type=fixed_point，坐标为 1000x1000 逻辑坐标。
   - 只有明显需要预置动作时才使用 resolver.type=run_preset。
   - 若 active_intent 存在，intent_routes 应说明哪些 intent kind/phase 映射到这个 operation。

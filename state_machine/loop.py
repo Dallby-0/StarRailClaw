@@ -29,6 +29,7 @@ from state_machine.logger import FsmRunLogger, summarize_match
 from state_machine.matching import _eval_state_match, _select_best_for_unknown
 from state_machine.merge import _try_merge_page_type
 from state_machine.screen import _wait_for_unknown_screen_stable
+from state_machine.settlement import settle_pending_operation
 from state_machine.session_runtime import _maybe_rotate_session, _refresh_session_if_needed
 from state_machine.state_builder import _create_state_from_llm
 from state_machine.state_store import (
@@ -147,7 +148,12 @@ def run_agent_loop_fsm(
 
         def matches_provider(img):
             vision.reset_ocr_stats()
-            matches = [_eval_state_match(meta, sdir, vision, img) for sdir, meta in metas]
+            # State creation/merge may happen before this outer iteration ends.
+            # Reload metadata so the first bootstrap action can observe the
+            # state that was just persisted instead of matching against a
+            # stale pre-creation snapshot.
+            live_metas = _iter_state_meta()
+            matches = [_eval_state_match(meta, sdir, vision, img) for sdir, meta in live_metas]
             ocr_stats = vision.consume_ocr_stats()
             calls = int(ocr_stats["calls"])
             if calls > 0:
@@ -280,16 +286,13 @@ def run_agent_loop_fsm(
             pending_from = runtime.get("pending_from_state_id")
             pending_action = runtime.get("pending_action_id")
             if isinstance(pending_from, str) and pending_from and isinstance(pending_action, str) and pending_action:
-                _append_graph_edge(pending_from, pending_action, new_state_id, logger=logger, reason="pending-unknown-resolution", confidence="llm_verified")
-                logger.text(
-                    f"[fsm][edge][added] from={pending_from} action={pending_action} "
-                    f"to={new_state_id} reason=pending-unknown-resolution",
-                    "edge_added",
-                    from_state=pending_from,
-                    action_id=pending_action,
-                    to_state=new_state_id,
-                    reason="pending-unknown-resolution",
-                )
+                settlement = settle_pending_operation(runtime, new_state_id)
+                allow_edge = pending_from != new_state_id or bool(settlement and settlement.get("allow_self_edge"))
+                if allow_edge:
+                    transition_kind = "reentry" if pending_from == new_state_id else "normal"
+                    _append_graph_edge(pending_from, pending_action, new_state_id, logger=logger, reason="pending-unknown-resolution", confidence="llm_verified", transition_kind=transition_kind)
+                else:
+                    logger.text(f"[fsm][edge][skipped-self] state={new_state_id} settlement={settlement}", "edge_self_skipped", state_id=new_state_id, settlement=settlement)
                 runtime["pending_from_state_id"] = None
                 runtime["pending_action_id"] = None
             runtime["force_state_resolution"] = False
@@ -325,20 +328,16 @@ def run_agent_loop_fsm(
         pending_from2 = runtime.get("pending_from_state_id")
         pending_action2 = runtime.get("pending_action_id")
         if isinstance(pending_from2, str) and pending_from2 and isinstance(pending_action2, str) and pending_action2:
-            _append_graph_edge(pending_from2, pending_action2, best.state_id, logger=logger, reason="pending-unknown-resolved-to-existing", confidence=pending_resolution_confidence)
-            best_meta_item = _meta_for_state(metas, best.state_id)
-            if best_meta_item is not None:
-                _add_state_sample(best_meta_item[0], best_meta_item[1], frame, role="positive", source="pending_existing", confidence=0.8, logger=logger)
-            logger.text(
-                f"[fsm][edge][added] from={pending_from2} action={pending_action2} "
-                f"to={best.state_id} reason=pending-unknown-resolved-to-existing confidence={pending_resolution_confidence}",
-                "edge_added",
-                from_state=pending_from2,
-                action_id=pending_action2,
-                to_state=best.state_id,
-                reason="pending-unknown-resolved-to-existing",
-                confidence=pending_resolution_confidence,
-            )
+            settlement = settle_pending_operation(runtime, best.state_id)
+            allow_edge = pending_from2 != best.state_id or bool(settlement and settlement.get("allow_self_edge"))
+            if allow_edge:
+                transition_kind = "reentry" if pending_from2 == best.state_id else "normal"
+                _append_graph_edge(pending_from2, pending_action2, best.state_id, logger=logger, reason="pending-unknown-resolved-to-existing", confidence=pending_resolution_confidence, transition_kind=transition_kind)
+                best_meta_item = _meta_for_state(metas, best.state_id)
+                if best_meta_item is not None:
+                    _add_state_sample(best_meta_item[0], best_meta_item[1], frame, role="positive", source="pending_existing", confidence=0.8, logger=logger)
+            else:
+                logger.text(f"[fsm][edge][skipped-self] state={best.state_id} settlement={settlement}", "edge_self_skipped", state_id=best.state_id, settlement=settlement)
             runtime["pending_from_state_id"] = None
             runtime["pending_action_id"] = None
         if force_state_resolution:

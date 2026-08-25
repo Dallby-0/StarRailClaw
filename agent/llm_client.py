@@ -162,13 +162,30 @@ class DoubaoClient:
         for attempt in range(1, self.max_retries + 2):
             try:
                 self._sleep_before_request(path)
+                started = time.monotonic()
+                print(
+                    f"[llm][http-start] path={path} "
+                    f"attempt={attempt}/{self.max_retries + 1} "
+                    f"timeout_s={self.timeout_s}"
+                )
                 resp = self.session.post(url, headers=headers, json=payload, timeout=self.timeout_s)
             except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as exc:
+                elapsed = time.monotonic() - started
+                print(
+                    f"[llm][http-error] path={path} attempt={attempt} "
+                    f"error={type(exc).__name__} elapsed_s={elapsed:.2f}"
+                )
                 last_exc = exc
                 if attempt <= self.max_retries:
                     self._sleep_before_retry(attempt, exc=exc)
                     continue
                 raise
+            elapsed = time.monotonic() - started
+            print(
+                f"[llm][http-end] path={path} attempt={attempt} "
+                f"status={resp.status_code} elapsed_s={elapsed:.2f} "
+                f"response_bytes={len(resp.content)}"
+            )
             if resp.status_code == 429 or 500 <= resp.status_code < 600:
                 if attempt <= self.max_retries:
                     self._sleep_before_retry(attempt, resp=resp)

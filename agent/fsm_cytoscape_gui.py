@@ -1736,7 +1736,6 @@ def _file_mtime_ns(path: Path) -> int:
 
 def _enabled_nodes(graph: dict[str, Any], graph_path: Path = GRAPH_PATH) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
-    flow_by_state_id = _page_op_flow_index(_templates_dir_for_graph(graph_path))
     handler_by_state_id = _page_handler_index(_templates_dir_for_graph(graph_path))
     for node in graph.get("nodes", []):
         if not isinstance(node, dict) or not node.get("enabled", True):
@@ -1745,42 +1744,21 @@ def _enabled_nodes(graph: dict[str, Any], graph_path: Path = GRAPH_PATH) -> list
         if not state_id:
             continue
         slug = str(node.get("slug", state_id))
-        flow_summary = flow_by_state_id.get(state_id)
         handler_summary = handler_by_state_id.get(state_id)
         has_handler = bool(handler_summary and handler_summary.get("present"))
-        has_flow = bool(flow_summary and flow_summary.get("present"))
         flow_label = ""
         if has_handler:
             flow_label = f"handler {handler_summary.get('template_count', 0)} templates"
-        elif has_flow:
-            flow_label = f"flow {flow_summary.get('op_count', 0)} ops"
         result.append(
             {
                 "state_id": state_id,
                 "slug": slug,
                 "enabled": True,
-                "has_page_op_flow": has_handler or has_flow,
+                "has_page_op_flow": has_handler,
                 "page_op_flow_label": flow_label,
             }
         )
     return result
-
-
-def _page_op_flow_index(templates_dir: Path) -> dict[str, dict[str, Any]]:
-    out: dict[str, dict[str, Any]] = {}
-    if not templates_dir.exists():
-        return out
-    for path in sorted(templates_dir.glob("*/state.json")):
-        data = _load_json(path)
-        if not isinstance(data, dict):
-            continue
-        state_id = str(data.get("state_id", ""))
-        if not state_id:
-            continue
-        summary = _page_op_flow_summary(data.get("page_op_flow"))
-        if summary.get("present"):
-            out[state_id] = summary
-    return out
 
 
 def _page_handler_index(templates_dir: Path) -> dict[str, dict[str, Any]]:
@@ -2243,7 +2221,6 @@ class FsmStateHandler(BaseHTTPRequestHandler):
             "screenshot_height": size[1] if size else None,
             "conditions": conditions,
             "actions": state.get("actions", []),
-            "page_op_flow": _page_op_flow_summary(state.get("page_op_flow")),
             "page_handler": _page_handler_summary(state.get("page_handler")),
         }
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+from copy import deepcopy
 from typing import Any
 
 from state_machine.time_utils import now_iso as _now_iso
 
 HANDLER_SCHEMA_VERSION = "progressive_handler.v1"
 TRACE_LIMIT = 40
-STRATEGY_RESULTS = {"verified_success", "partial_progress", "no_effect", "wrong_transition", "unsafe_effect", "state_mismatch", "transient_unknown"}
+STRATEGY_RESULTS = {"verified_success", "verified_reentry", "partial_progress", "no_effect", "wrong_transition", "unsafe_effect", "state_mismatch", "transient_unknown"}
 
 
 def _slug(raw: Any, fallback: str) -> str:
@@ -31,6 +32,7 @@ def ensure_page_handler(meta: dict[str, Any]) -> dict[str, Any]:
         handler["operation_policies"] = {}
     if not isinstance(handler.get("episode_trace"), list):
         handler["episode_trace"] = []
+    _fold_single_exit_sibling_into_default(handler)
     handler["updated_at"] = _now_iso()
     return handler
 
@@ -76,14 +78,14 @@ def normalize_strategy(raw: Any, *, operation: str, index: int = 1) -> dict[str,
             "step_id": _slug(step.get("step_id"), f"step_{step_idx}"),
             "resolver": resolver,
             "preconditions": dict(step.get("preconditions") or {}),
-            "expected_after": dict(step.get("expected_after") or {}),
+            "expected_after": dict(step.get("expected_after") or {"state_relation": "may_leave", "reentry_policy": "forbid"}),
             "emits_on_success": dict(step.get("emits_on_success") or {}),
             "brief": str(step.get("brief") or step.get("label") or ""),
         })
     if not steps:
         return None
     status = str(raw.get("status", "proposed"))
-    if status not in {"proposed", "probation", "active", "degraded", "quarantined"}:
+    if status not in {"proposed", "active", "degraded", "quarantined"}:
         status = "proposed"
     return {
         "strategy_id": strategy_id,
@@ -180,7 +182,53 @@ def handler_from_bootstrap(bootstrap_operations: Any) -> dict[str, Any]:
                 "safety": str(only.get("safety")),
                 "expected_event": only.get("expected_event"),
             }
+    _fold_single_exit_sibling_into_default(handler)
     return handler
+
+
+def _fold_single_exit_sibling_into_default(handler: dict[str, Any]) -> bool:
+    """Normalize a model-split `select` + `confirm` into one two-step strategy."""
+    default = handler.get("default_operation") if isinstance(handler.get("default_operation"), dict) else None
+    policies = handler.get("operation_policies") if isinstance(handler.get("operation_policies"), dict) else {}
+    if not isinstance(default, dict):
+        return False
+    default_name = str(default.get("operation") or "")
+    current = policies.get(default_name)
+    if not isinstance(current, dict):
+        return False
+    current_strategies = [item for item in current.get("strategies", []) if isinstance(item, dict)]
+    if not current_strategies or any(len(item.get("steps", [])) != 1 for item in current_strategies):
+        return False
+    if not all(
+        str(item["steps"][0].get("expected_after", {}).get("state_relation")) == "must_remain"
+        for item in current_strategies
+    ):
+        return False
+
+    candidates: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for name, policy in policies.items():
+        if name == default_name or not isinstance(policy, dict):
+            continue
+        for strategy in policy.get("strategies", []):
+            if not isinstance(strategy, dict):
+                continue
+            steps = strategy.get("steps") if isinstance(strategy.get("steps"), list) else []
+            if len(steps) == 1 and str(steps[0].get("expected_after", {}).get("state_relation")) == "must_leave":
+                candidates.append((policy, strategy))
+    if len(candidates) != 1:
+        return False
+
+    continuation_policy, continuation_strategy = candidates[0]
+    continuation_step = continuation_strategy["steps"][0]
+    safety = str(current.get("safety", "reversible"))
+    for strategy in current_strategies:
+        strategy["steps"].append(deepcopy(continuation_step))
+        strategy["strategy_id"] = _slug(f"{strategy.get('strategy_id')}_and_{continuation_strategy.get('strategy_id')}", f"{default_name}_two_step")
+        strategy["safety"] = safety
+    current["expected_event"] = continuation_policy.get("expected_event") or current.get("expected_event")
+    default["expected_event"] = current.get("expected_event")
+    handler["updated_at"] = _now_iso()
+    return True
 
 
 def handler_summary(handler: dict[str, Any], *, limit_trace: int = 8) -> dict[str, Any]:
@@ -197,18 +245,62 @@ def handler_summary(handler: dict[str, Any], *, limit_trace: int = 8) -> dict[st
     return {"schema_version": handler.get("schema_version"), "default_operation": handler.get("default_operation"), "intent_routes": handler.get("intent_routes", []), "operation_policies": compact, "recent_trace": trace[-limit_trace:]}
 
 
+def continuation_patch_from_sibling(handler: dict[str, Any], operation: str) -> dict[str, Any] | None:
+    """Reuse an already learned sibling operation that exits the current page.
+
+    This repairs a common bootstrap modeling error where the model emits
+    `select` and `confirm` as parallel operations even though they are ordered
+    steps of one default page advance operation.
+    """
+    policies = handler.get("operation_policies") if isinstance(handler.get("operation_policies"), dict) else {}
+    current = policies.get(operation) if isinstance(policies.get(operation), dict) else {}
+    for sibling_name, policy in policies.items():
+        if sibling_name == operation or not isinstance(policy, dict):
+            continue
+        for strategy in policy.get("strategies", []):
+            if not isinstance(strategy, dict):
+                continue
+            steps = strategy.get("steps") if isinstance(strategy.get("steps"), list) else []
+            if not steps or not any(
+                isinstance(step, dict)
+                and isinstance(step.get("expected_after"), dict)
+                and str(step["expected_after"].get("state_relation")) == "must_leave"
+                for step in steps
+            ):
+                continue
+            copied = deepcopy(strategy)
+            copied["strategy_id"] = _slug(f"{operation}_continue_{strategy.get('strategy_id')}", f"{operation}_continuation")
+            copied["operation"] = operation
+            copied["level"] = max(1, int(copied.get("level", 0) or 0) + 1)
+            copied["status"] = "proposed"
+            # The sibling is being folded into an already authorized default
+            # page advance operation. Keep the default operation's safety
+            # boundary instead of importing a model's overly broad "commit"
+            # label for an ordinary card-confirm button.
+            copied["safety"] = str(current.get("safety", "reversible"))
+            copied.pop("success_count", None)
+            copied.pop("fail_count", None)
+            copied.pop("result_counts", None)
+            return {
+                "operations": [{
+                    "operation": operation,
+                    "intent_scope": str(current.get("intent_scope", "intent_specific")),
+                    "intent_effect": str(current.get("intent_effect", "advance")),
+                    "safety": str(current.get("safety", "reversible")),
+                    "expected_event": policy.get("expected_event") or current.get("expected_event") or "",
+                    "strategies": [copied],
+                }]
+            }
+    return None
+
+
 def select_strategy(handler: dict[str, Any], operation: str, *, excluded: set[str] | None = None) -> dict[str, Any] | None:
     policies = handler.get("operation_policies") if isinstance(handler.get("operation_policies"), dict) else {}
     policy = policies.get(operation)
     if not isinstance(policy, dict):
         return None
     excluded = excluded or set()
-    candidates = [item for item in policy.get("strategies", []) if isinstance(item, dict) and str(item.get("strategy_id")) not in excluded and str(item.get("status", "proposed")) in {"proposed", "probation", "active"}]
-    if not candidates:
-        # A previous runner bug may have degraded an otherwise valid strategy.
-        # Rehabilitate each degraded strategy at most once per handler run
-        # (excluded guards repeated attempts) before paying for an LLM repair.
-        candidates = [item for item in policy.get("strategies", []) if isinstance(item, dict) and str(item.get("strategy_id")) not in excluded and str(item.get("status")) == "degraded"]
+    candidates = [item for item in policy.get("strategies", []) if isinstance(item, dict) and str(item.get("strategy_id")) not in excluded and str(item.get("status", "proposed")) in {"proposed", "active"}]
     if not candidates:
         return None
     candidates.sort(key=lambda item: (int(item.get("level", 0) or 0), 0 if item.get("status") == "active" else 1, -int(item.get("success_count", 0) or 0)))
@@ -297,9 +389,14 @@ def mark_strategy_result(handler: dict[str, Any], operation: str, strategy_id: s
     counts = strategy.get("result_counts") if isinstance(strategy.get("result_counts"), dict) else {}
     strategy["result_counts"] = counts
     counts[result] = int(counts.get(result, 0) or 0) + 1
-    if result in {"verified_success", "partial_progress"}:
+    if result in {"verified_success", "verified_reentry"}:
         strategy["success_count"] = int(strategy.get("success_count", 0) or 0) + 1
         strategy["status"] = "active"
+    elif result == "partial_progress":
+        # An intermediate step is not evidence that the complete strategy
+        # works.  In particular, do not promote a multi-step strategy whose
+        # confirm/exit step has never succeeded.
+        pass
     elif result in {"no_effect", "wrong_transition", "unsafe_effect"}:
         strategy["fail_count"] = int(strategy.get("fail_count", 0) or 0) + 1
         strategy["status"] = "quarantined" if result == "unsafe_effect" else "degraded"

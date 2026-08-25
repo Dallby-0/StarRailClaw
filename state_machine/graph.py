@@ -23,17 +23,26 @@ def _append_graph_edge(
     logger: FsmRunLogger | None = None,
     reason: str = "",
     confidence: str = "strong",
+    transition_kind: str = "normal",
 ) -> None:
     if not from_state_id:
         return
     graph = _load_json(constants.FSM_GRAPH_PATH)
     for e in graph.get("edges", []):
         if e.get("from_state_id") == from_state_id and e.get("action_id") == action_id and e.get("to_state_id") == to_state_id:
+            changed = False
             if confidence in {"strong", "llm_verified"} and e.get("confidence") == "tentative":
                 e["confidence"] = confidence
                 e["enabled"] = True
                 e["reason"] = reason
                 e["updated_at"] = _now_iso()
+                changed = True
+            if transition_kind == "reentry" and e.get("transition_kind") != "reentry":
+                e["transition_kind"] = "reentry"
+                e["reason"] = reason
+                e["updated_at"] = _now_iso()
+                changed = True
+            if changed:
                 graph["updated_at"] = _now_iso()
                 _save_json(constants.FSM_GRAPH_PATH, graph)
             return
@@ -46,6 +55,7 @@ def _append_graph_edge(
             "weight": 1.0,
             "confidence": confidence,
             "reason": reason,
+            "transition_kind": transition_kind,
             "created_at": _now_iso(),
         }
     )
@@ -59,6 +69,7 @@ def _append_graph_edge(
             to_state_id=to_state_id,
             reason=reason,
             confidence=confidence,
+            transition_kind=transition_kind,
         )
 
 

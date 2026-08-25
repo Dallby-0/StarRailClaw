@@ -69,7 +69,7 @@ def resolve_effective_command(state_meta: dict[str, Any], intent: dict[str, Any]
     intent_effect = str(default.get("intent_effect", "none"))
     intent_scope = str(default.get("intent_scope", "intent_specific"))
     if isinstance(intent, dict):
-        if intent_scope != "intent_invariant" or intent_effect != "preserve":
+        if intent_scope != "intent_invariant" or safety not in {"low_risk", "reversible"}:
             return None
         return EffectiveCommand(
             operation=operation,
@@ -79,7 +79,7 @@ def resolve_effective_command(state_meta: dict[str, Any], intent: dict[str, Any]
             intent_phase=str(intent.get("phase") or "") or None,
             params=dict(default.get("params") or {}),
             persistent=False,
-            intent_effect="preserve",
+            intent_effect=intent_effect,
             expected_event=str(default.get("expected_event") or "") or None,
         )
     # With no active intent, an explicitly configured default operation is the
@@ -121,18 +121,3 @@ def step_preconditions_pass(
     if expected_phase and str((intent or {}).get("phase") or "") != expected_phase:
         return False, "intent_phase_mismatch"
     return True, "ok"
-
-
-def classify_strategy_result(*, changed: bool, left_state: bool, expected: dict[str, Any], final_step: bool) -> str:
-    exit_likely = bool(expected.get("exit_likely", False))
-    change_expectation = expected.get("screen_should_change")
-    success = "verified_success" if final_step else "partial_progress"
-    if exit_likely:
-        return success if left_state or changed else "no_effect"
-    if change_expectation is False:
-        return success
-    if change_expectation is True:
-        return success if changed else "no_effect"
-    if bool(expected.get("same_page_likely", False)):
-        return success if changed else "no_effect"
-    return success if changed else "no_effect"

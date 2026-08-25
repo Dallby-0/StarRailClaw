@@ -1,0 +1,89 @@
+from __future__ import annotations
+
+from pathlib import Path
+import sys
+import types
+
+import cv2
+import numpy as np
+
+# The isolated unit-test runtime need not install the HTTP client because this
+# test exercises pure matching logic and never constructs an emulator or LLM.
+sys.modules.setdefault("requests", types.ModuleType("requests"))
+
+from state_machine.disambiguation import _try_exclude_current_from_losers
+from state_machine.matching import MatchResult, _eval_state_match
+from state_machine.merge import _try_merge_ambiguous_states
+
+
+class _PixelVision:
+    def ocr(self, frame, rect, white_text=False):
+        del rect, white_text
+        text = "common loser-only" if int(frame[0, 0, 0]) == 10 else "common winner"
+        return [{"text": text}]
+
+
+def _text_condition(condition_id: str, text: str, *, enabled: bool) -> dict:
+    return {
+        "id": condition_id,
+        "kind": "text_line_contains",
+        "enabled": enabled,
+        "condition_status": "active",
+        "params": {"text": text, "rect": [0, 0, 1, 1]},
+        "stability": "high",
+        "discrimination": "high",
+    }
+
+
+def test_loser_strengthening_is_verified_with_real_matcher(tmp_path: Path) -> None:
+    winner_dir = tmp_path / "winner"
+    loser_dir = tmp_path / "loser"
+    winner_dir.mkdir()
+    loser_dir.mkdir()
+    loser_sample = np.full((2, 2, 3), 10, dtype=np.uint8)
+    current = np.full((2, 2, 3), 20, dtype=np.uint8)
+    sample_path = loser_dir / "screenshot_1.png"
+    cv2.imwrite(str(sample_path), cv2.cvtColor(loser_sample, cv2.COLOR_RGB2BGR))
+
+    winner_meta = {"state_id": "winner", "match_conditions": [_text_condition("winner", "winner", enabled=True)]}
+    loser_meta = {
+        "state_id": "loser",
+        "samples": [{"path": str(sample_path)}],
+        "match_conditions": [
+            _text_condition("broad", "common", enabled=True),
+            _text_condition("loser-exclusive", "loser-only", enabled=False),
+        ],
+    }
+    # Keep the initial loser match explicit; the strengthening helper only
+    # mutates conditions and verifies the post-mutation state itself.
+    winner = MatchResult("winner", winner_dir, 1, 1, True, 1, 1)
+    loser = MatchResult("loser", loser_dir, 1, 1, True, 1, 2)
+    strengthened = _try_exclude_current_from_losers(
+        winner=winner,
+        losers=[loser],
+        metas=[(winner_dir, winner_meta), (loser_dir, loser_meta)],
+        vision=_PixelVision(),
+        frame_rgb=current,
+    )
+
+    assert strengthened == {"loser": "loser-exclusive"}
+    assert not _eval_state_match(loser_meta, loser_dir, _PixelVision(), current).success
+
+
+def test_ambiguous_merge_rejects_different_page_types(tmp_path: Path) -> None:
+    winner_dir = tmp_path / "winner"
+    loser_dir = tmp_path / "loser"
+    winner_dir.mkdir()
+    loser_dir.mkdir()
+    winner_meta = {"state_id": "winner", "page_type": "story", "match_conditions": []}
+    loser_meta = {"state_id": "loser", "page_type": "story_with_options", "match_conditions": []}
+    winner = MatchResult("winner", winner_dir, 1, 1, True, 1, 1)
+    loser = MatchResult("loser", loser_dir, 1, 1, True, 1, 1)
+    merged = _try_merge_ambiguous_states(
+        winner=winner,
+        losers=[loser],
+        metas=[(winner_dir, winner_meta), (loser_dir, loser_meta)],
+        vision=_PixelVision(),
+        frame_rgb=np.full((2, 2, 3), 20, dtype=np.uint8),
+    )
+    assert merged == set()

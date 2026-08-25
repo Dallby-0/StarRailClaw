@@ -20,6 +20,20 @@ FIND_NEXT_INTERACT_POS = (639, 562)
 FIND_NEXT_ATTACK_POS = (818, 735)
 
 
+def _still_in_state(*, emulator, state_id: str, matches_provider, find_match_by_state) -> bool:
+    """Return whether the latest frame still matches the preset's entry state.
+
+    This probe deliberately resolves the specific state rather than merely
+    checking that *some* state matched.  A successful match for another state
+    means the interaction completed and lets the outer FSM settle the
+    transition normally.
+    """
+    frame = emulator.screenshot(prefer_png=True)
+    matches = matches_provider(frame)
+    current = find_match_by_state(matches, state_id)
+    return current is not None and bool(current.success)
+
+
 def _run_wait_till_combat_end(emulator, vision) -> bool:
     template_path = WAIT_TILL_COMBAT_END_TEMPLATE_PATH
     if not template_path.exists() and WAIT_TILL_COMBAT_END_LEGACY_TEMPLATE_PATH.exists():
@@ -76,6 +90,17 @@ def _run_find_and_interact_with_next_object(
         ix, iy = mapper.point_to_real(int(interact[0]), int(interact[1]))
         ax, ay = mapper.point_to_real(int(attack[0]), int(attack[1]))
         for step_idx in range(10):
+            # A previous interaction may have taken us to another GUI.  Probe
+            # immediately before each movement so neither the swipe nor the
+            # following interaction is sent to stale coordinates.
+            if not _still_in_state(
+                emulator=emulator,
+                state_id=state_id,
+                matches_provider=matches_provider,
+                find_match_by_state=find_match_by_state,
+            ):
+                print(f"[preset][find_and_interact_with_next_object] state_changed before_action from={state_id}, treat as done")
+                return True
             emulator.swipe(mx, my, mx, my, duration_ms=800)
             time.sleep(1)
             emulator.tap(ix, iy)
@@ -84,14 +109,7 @@ def _run_find_and_interact_with_next_object(
 
         print("[preset][find_and_interact_with_next_object] idle=5s")
         time.sleep(5.0)
-
-        frame = emulator.screenshot(prefer_png=True)
-        matches = matches_provider(frame)
-        curr = find_match_by_state(matches, state_id)
-        if curr is None or not curr.success:
-            print(f"[preset][find_and_interact_with_next_object] state_changed from={state_id}, treat as done")
-            return True
-        print(f"[preset][find_and_interact_with_next_object] state_unchanged={state_id}, continue next cycle")
+        print(f"[preset][find_and_interact_with_next_object] cycle={cycle_idx} complete; next state check is before movement")
 
 
 def run_preset(

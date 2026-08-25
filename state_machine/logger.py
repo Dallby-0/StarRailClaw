@@ -57,6 +57,7 @@ class FsmRunLogger:
             "states_merged": 0,
             "merge_rejected": 0,
             "actions": 0,
+            "controller_runs": 0,
             "clicks": 0,
             "presets": 0,
             "transitions": 0,
@@ -71,9 +72,6 @@ class FsmRunLogger:
                 "unknown_stability_checks": 0,
                 "unknown_stability_stable": 0,
                 "unknown_unstable_waits": 0,
-                "page_local_enters": 0,
-                "page_local_steps": 0,
-                "page_local_changed_steps": 0,
                 "page_handler_enters": 0,
                 "page_handler_steps": 0,
                 "page_handler_changed_steps": 0,
@@ -188,6 +186,7 @@ def _summary_text(summary: dict[str, Any]) -> str:
         f"states_merged: {summary.get('states_merged')}",
         f"merge_rejected: {summary.get('merge_rejected')}",
         f"actions: {summary.get('actions')}",
+        f"controller_runs: {summary.get('controller_runs')}",
         f"clicks: {summary.get('clicks')}",
         f"presets: {summary.get('presets')}",
         f"transitions: {summary.get('transitions')}",
@@ -242,6 +241,7 @@ def _event_delta(event: str, row: dict[str, Any]) -> dict[str, Any]:
     if event == "loop_start":
         delta["loops"] = 1
         delta["llm_turns_value"] = row.get("llm_turn_count")
+        delta["llm_session_id"] = row.get("llm_session_id")
     elif event == "unknown_state":
         delta["unknown_states"] = 1
     elif event == "state_created":
@@ -253,12 +253,14 @@ def _event_delta(event: str, row: dict[str, Any]) -> dict[str, Any]:
     elif event == "merge_rejected":
         delta["merge_rejected"] = 1
     elif event == "controller_start":
-        delta["actions"] = 1
+        delta["controller_runs"] = 1
     elif event == "action_attempt":
         delta["actions"] = 1
     elif event in {"action_click", "page_handler_click"}:
+        delta["actions"] = 1
         delta["clicks"] = 1
     elif event in {"action_preset", "page_handler_preset"}:
+        delta["actions"] = 1
         delta["presets"] = 1
     elif event == "transition":
         delta["transitions"] = 1
@@ -299,6 +301,7 @@ def _apply_delta(summary: dict[str, Any], delta: dict[str, Any]) -> None:
         "states_merged",
         "merge_rejected",
         "actions",
+        "controller_runs",
         "clicks",
         "presets",
         "transitions",
@@ -311,7 +314,13 @@ def _apply_delta(summary: dict[str, Any], delta: dict[str, Any]) -> None:
             _add(summary, key, int(delta[key]))
     if "llm_turns_value" in delta:
         try:
-            summary["llm_turns"] = max(int(summary.get("llm_turns", 0) or 0), int(delta["llm_turns_value"]))
+            session_id = str(delta.get("llm_session_id") or "legacy")
+            by_session = summary.get("llm_turns_by_session")
+            if not isinstance(by_session, dict):
+                by_session = {}
+                summary["llm_turns_by_session"] = by_session
+            by_session[session_id] = max(int(by_session.get(session_id, 0) or 0), int(delta["llm_turns_value"]))
+            summary["llm_turns"] = sum(int(value or 0) for value in by_session.values())
         except Exception:
             pass
     _set_if_present(summary, "last_state_id", delta.get("last_state_id"))
@@ -370,12 +379,6 @@ def _apply_mechanism_stats(summary: dict[str, Any], event: str, row: dict[str, A
             _incr(mechanisms, "unknown_stability_stable")
     elif event == "unknown_unstable_wait":
         _incr(mechanisms, "unknown_unstable_waits")
-    elif event in {"page_local_enter", "page_local_enter_after_repair"}:
-        _incr(mechanisms, "page_local_enters")
-    elif event == "page_local_step_result":
-        _incr(mechanisms, "page_local_steps")
-        if bool(row.get("changed")):
-            _incr(mechanisms, "page_local_changed_steps")
     elif event == "page_handler_enter":
         _incr(mechanisms, "page_handler_enters")
     elif event == "page_handler_step_result":
@@ -399,7 +402,7 @@ def _apply_mechanism_stats(summary: dict[str, Any], event: str, row: dict[str, A
         _incr(mechanisms, "disambiguation_started")
     elif event == "disambiguation_result":
         _incr(mechanisms, "disambiguation_results")
-    elif event == "disambiguation_strengthened_winner":
+    elif event == "disambiguation_losers_strengthened":
         _incr(mechanisms, "disambiguation_strengthened")
 
 
@@ -418,7 +421,6 @@ def _refresh_rates(summary: dict[str, Any]) -> None:
     actions = int(summary.get("actions", 0) or 0)
     transitions = int(summary.get("transitions", 0) or 0)
     stability_checks = int(mechanisms.get("unknown_stability_checks", 0) or 0)
-    page_local_steps = int(mechanisms.get("page_local_steps", 0) or 0)
     page_handler_steps = int(mechanisms.get("page_handler_steps", 0) or 0)
 
     rates = {
@@ -428,14 +430,12 @@ def _refresh_rates(summary: dict[str, Any]) -> None:
         "transitions_per_action": _ratio(transitions, actions),
         "transitions_to_unknown_per_transition": _ratio(mechanisms.get("transitions_to_unknown"), transitions),
         "page_op_failures_per_action": _ratio(summary.get("page_op_failures"), actions),
-        "page_local_enters_per_action": _ratio(mechanisms.get("page_local_enters"), actions),
-        "page_local_changed_step_rate": _ratio(mechanisms.get("page_local_changed_steps"), page_local_steps),
         "page_handler_enters_per_action": _ratio(mechanisms.get("page_handler_enters"), actions),
         "page_handler_changed_step_rate": _ratio(mechanisms.get("page_handler_changed_steps"), page_handler_steps),
         "unknown_stability_stable_rate": _ratio(mechanisms.get("unknown_stability_stable"), stability_checks),
         "merge_accept_rate": _ratio(
-            int(summary.get("states_merged", 0) or 0) + int(summary.get("states_created", 0) or 0),
-            int(summary.get("states_merged", 0) or 0) + int(summary.get("states_created", 0) or 0) + int(summary.get("merge_rejected", 0) or 0),
+            summary.get("states_merged"),
+            int(summary.get("states_merged", 0) or 0) + int(summary.get("merge_rejected", 0) or 0),
         ),
     }
     summary["rates"] = rates

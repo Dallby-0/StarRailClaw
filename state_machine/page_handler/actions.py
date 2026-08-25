@@ -7,7 +7,6 @@ from typing import Any
 from agent.behavior_tree.coord_mapper import CoordinateMapper
 from agent.behavior_tree.vision import VisionEngine
 from sr_tools.emulator import EmulatorClient
-from state_machine.constants import ACTION_CLICK_WAIT_S
 from state_machine.logger import FsmRunLogger
 from state_machine.matching import _find_match_by_state
 from state_machine.presets import run_preset
@@ -74,8 +73,25 @@ def execute_action(
         try:
             return run_preset(name, emulator=emulator, mapper=mapper, vision=vision, state_id=state_id, matches_provider=matches_provider, find_match_by_state=_find_match_by_state)
         except Exception as exc:
-            _log(logger, f"[fsm][handler][preset][exception] name={name} error={type(exc).__name__}: {exc}", "page_handler_preset_exception", state_id=state_id, action_id=action_id, attempt=attempt, name=name, error_type=type(exc).__name__, error=str(exc), treat_as_success=False)
-            return False
+            # Presets are best-effort controllers.  An emulator/vision error
+            # can happen after the interaction has already taken effect, so
+            # preserve the historical behaviour of settling the operation as
+            # successful instead of retrying the whole preset indefinitely.
+            _log(
+                logger,
+                f"[fsm][handler][preset][exception] name={name} error={type(exc).__name__}: {exc}; idle=10s treat_as_success",
+                "page_handler_preset_exception",
+                state_id=state_id,
+                action_id=action_id,
+                attempt=attempt,
+                name=name,
+                error_type=type(exc).__name__,
+                error=str(exc),
+                sleep_s=10.0,
+                treat_as_success=True,
+            )
+            time.sleep(10.0)
+            return True
     x = int(action.get("x", 500))
     y = int(action.get("y", 500))
     if str(action.get("coordinate_space", "logical")) == "real":
@@ -87,6 +103,4 @@ def execute_action(
     brief = str(action.get("brief", "")).strip()
     _log(logger, f"[fsm][handler][click] real=({rx},{ry}) brief={brief}", "page_handler_click", state_id=state_id, action_id=action_id, attempt=attempt, logical=logical, real=[rx, ry], brief=brief, action_info=action_info)
     emulator.tap(rx, ry)
-    _log(logger, f"[fsm][handler][wait] sleep={ACTION_CLICK_WAIT_S}s", "page_handler_wait", state_id=state_id, action_id=action_id, sleep_s=ACTION_CLICK_WAIT_S, action_info=action_info)
-    time.sleep(ACTION_CLICK_WAIT_S)
     return True

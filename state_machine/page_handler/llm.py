@@ -8,6 +8,7 @@ from state_machine.constants import LLM_PARSE_RETRY
 from state_machine.llm_tasks import _apply_reasoning_effort, _build_user_message_from_frame, _build_user_message_from_two_frames, _normalize_assistant_text, _save_llm_raw_debug
 from state_machine.logger import FsmRunLogger
 from state_machine.page_handler.store import handler_summary
+from state_machine.page_handler.review_protocol import parse_same_state_review
 
 
 def _log(logger: FsmRunLogger | None, message: str, event: str = "console", **fields: Any) -> None:
@@ -29,6 +30,76 @@ def parse_handler_response(text: str) -> dict[str, Any] | None:
         return None
     payload.setdefault("event", {})
     return payload
+
+
+def request_same_state_review(
+    *,
+    llm: DoubaoClient,
+    session_id: str,
+    before_frame_rgb,
+    after_frame_rgb,
+    system_prompt: str,
+    state_meta: dict[str, Any],
+    handler: dict[str, Any],
+    command: dict[str, Any],
+    executed_action: dict[str, Any],
+    logger: FsmRunLogger | None,
+) -> dict[str, Any] | None:
+    """Resolve the semantic ambiguity when an action ends in the same state class.
+
+    This is deliberately one model call. The same response both judges the
+    previous action and supplies a corrected/continuation strategy when needed.
+    """
+    context = {
+        "mode": "SAME_STATE_ACTION_REVIEW",
+        "instruction": (
+            "第一张图是执行前，第二张图是执行后。外部 matcher 认为两张图属于同一页面状态。"
+            "请判断上一个动作对 effective_command 的完整目标是否有效，而不是仅判断是否出现像素变化。"
+            "即使 effective_command 的旧名称只写了 select，也要以完成当前页面的一次推进为目标，而不是拘泥于窄名称。"
+            "若只是选中了卡片但仍需确认，应判 partial_needs_continue，并在同一次响应的 handler_patch 中给出"
+            "能完成该 effective_command 的后续/修正策略；若点击完全无效则判 ineffective 并给出替代策略。"
+            "若旧页面已经完成、第二张图是连续弹出的同类新事件，判 completed_new_visit。"
+            "如果第二张图仍有已启用的确认、继续、提交按钮，禁止判 completed_same_visit；必须判 partial_needs_continue 并给出点击该按钮的 patch。"
+            "只有操作的完整页面推进语义已经完成且确实应停留在当前页面实例时才判 completed_same_visit。"
+            "不得创建或修改 intent，patch 中 operation 必须等于 effective_command.operation。只输出严格 JSON。"
+        ),
+        "state": {"state_id": state_meta.get("state_id"), "slug": state_meta.get("slug"), "description": str(state_meta.get("description", ""))[:240]},
+        "effective_command": command,
+        "executed_action": executed_action,
+        "handler": handler_summary(handler),
+        "output_schema": {
+            "verdict": "completed_same_visit|completed_new_visit|partial_needs_continue|ineffective|wrong_effect|uncertain",
+            "reason": "short visual/semantic reason",
+            "event": {"type": "optional event only if the complete operation succeeded"},
+            "handler_patch": {
+                "operations": [{
+                    "operation": "must equal effective_command.operation",
+                    "intent_scope": "intent_specific|intent_invariant",
+                    "intent_effect": "advance|preserve|complete|none",
+                    "safety": "low_risk|reversible|commit|destructive",
+                    "expected_event": "semantic event",
+                    "strategies": [{
+                        "strategy_id": "new stable id",
+                        "level": "integer greater than failed strategy when correcting",
+                        "status": "proposed",
+                        "steps": [{
+                            "step_id": "short id",
+                            "resolver": {"type": "fixed_point|region_template|run_preset", "x": 0, "y": 0, "template_bbox": [0, 0, 0, 0], "search_rect": [0, 0, 0, 0], "threshold": 0.82, "name": ""},
+                            "expected_after": {"state_relation": "must_leave|must_remain|may_leave", "reentry_policy": "forbid|new_visit|same_visit"},
+                            "emits_on_success": {"type": "semantic event"},
+                            "brief": "short string"
+                        }]
+                    }]
+                }]
+            }
+        },
+    }
+    msg = _build_user_message_from_two_frames(before_frame_rgb, after_frame_rgb, json.dumps(context, ensure_ascii=False))
+    resp = llm.chat_with_session(session_id=session_id, system_prompt=system_prompt, user_message=msg, tools=[], tool_choice="none")
+    raw = _normalize_assistant_text(resp["choices"][0]["message"].get("content"))
+    _save_llm_raw_debug(session_id, 1, raw, "same_state_review", logger.llm_raw_dir if logger is not None else None)
+    _log(logger, f"[fsm][handler][same-state-review] raw={raw[:600]}", "llm_same_state_review_raw", raw_preview=raw[:600])
+    return parse_same_state_review(raw)
 
 
 def request_handler_repair(
@@ -53,6 +124,8 @@ def request_handler_repair(
                 "当前页面状态已确认。请只修复 effective_command 对应的页面操作策略，不要创建或修改 intent。"
                 "优先提出比已失败策略更可靠的 resolver：固定点失败后可给 region_template，使用当前图上的 template_bbox 和受限 search_rect。"
                 "最多给 2 个条件步骤；每步执行后系统都会重新截图验证，禁止无条件连点。"
+                "expected_after 必须使用 state_relation 和 reentry_policy。页面内步骤用 must_remain/same_visit；"
+                "必须退出且同类页面可能连续出现时用 must_leave/new_visit；普通关闭用 must_leave/forbid。"
                 "低风险提示页可以固定坐标；提交或破坏性动作必须带明确安全等级和视觉定位。只输出严格 JSON。"
             ),
             "state": {"state_id": state_meta.get("state_id"), "slug": state_meta.get("slug"), "page_type": state_meta.get("page_type"), "description": str(state_meta.get("description", ""))[:240]},
@@ -74,7 +147,7 @@ def request_handler_repair(
                             "steps": [{
                                 "step_id": "short id",
                                 "resolver": {"type": "fixed_point|region_template|run_preset", "x": 0, "y": 0, "template_bbox": [0, 0, 0, 0], "search_rect": [0, 0, 0, 0], "threshold": 0.82, "name": ""},
-                                "expected_after": {"screen_should_change": True, "same_page_likely": False, "exit_likely": True},
+                                "expected_after": {"state_relation": "must_leave|must_remain|may_leave", "reentry_policy": "forbid|new_visit|same_visit"},
                                 "emits_on_success": {"type": "semantic event"},
                                 "brief": "short string",
                             }],

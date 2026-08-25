@@ -56,3 +56,7 @@ def test_state_bootstrap_schema_is_closed_and_bounded() -> None:
     steps = operation["properties"]["steps"]
     assert steps["minItems"] == 1
     assert steps["maxItems"] == 2
+    expected = steps["items"]["properties"]["expected_after"]
+    assert expected["additionalProperties"] is False
+    assert expected["properties"]["state_relation"]["enum"] == ["must_leave", "must_remain", "may_leave"]
+    assert expected["properties"]["reentry_policy"]["enum"] == ["forbid", "new_visit", "same_visit"]

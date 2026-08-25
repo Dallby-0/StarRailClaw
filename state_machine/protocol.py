@@ -52,8 +52,8 @@ def state_bootstrap_json_schema() -> dict[str, Any]:
         "threshold": {"type": "number", "minimum": 0, "maximum": 1},
     })
     expected_after = _closed_object({
-        "screen_should_change": {"type": "boolean"},
-        "exit_likely": {"type": "boolean"},
+        "state_relation": {"type": "string", "enum": ["must_leave", "must_remain", "may_leave"]},
+        "reentry_policy": {"type": "string", "enum": ["forbid", "new_visit", "same_visit"]},
     })
     event = _closed_object({"type": {"type": "string"}})
     step = _closed_object({

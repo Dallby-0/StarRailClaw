@@ -8,7 +8,8 @@ from agent.llm_client import DoubaoClient
 from state_machine.io import _load_frame, _now_iso, _save_json, _save_runtime
 from state_machine.llm_tasks import _request_llm_disambiguation
 from state_machine.logger import FsmRunLogger, summarize_match
-from state_machine.matching import MatchResult, _condition_eval
+from state_machine.matching import MatchResult, _condition_eval, _eval_state_match
+from state_machine.merge import _try_merge_ambiguous_states
 from state_machine.state_store import _meta_for_state, _sample_paths_from_meta
 
 
@@ -87,8 +88,19 @@ def _try_exclude_current_from_losers(
         if not candidates:
             failures[loser.state_id] = "no_condition_passes_loser_samples_and_fails_current"
             continue
-        selected = sorted(candidates, key=_condition_rank, reverse=True)[0]
-        selected["enabled"] = True
+        selected = None
+        # Conditions are conjunctive. Enable candidates one at a time and
+        # re-run the actual matcher after every mutation; stop only when this
+        # loser no longer matches the disambiguated frame.
+        for candidate in sorted(candidates, key=_condition_rank, reverse=True):
+            candidate["enabled"] = True
+            selected = candidate
+            check = _eval_state_match(loser_meta, loser_dir, vision, frame_rgb)
+            if not check.success:
+                break
+        if selected is None or _eval_state_match(loser_meta, loser_dir, vision, frame_rgb).success:
+            failures[loser.state_id] = "enabled_candidates_did_not_exclude_current"
+            continue
         loser_meta.setdefault("model_info", {})
         if isinstance(loser_meta["model_info"], dict):
             loser_meta["model_info"]["last_exclusion_reason"] = {
@@ -124,52 +136,6 @@ def _try_exclude_current_from_losers(
                 failures=failures,
             )
     return strengthened
-
-
-def _try_strengthen_winner_conditions(
-    *,
-    winner: MatchResult,
-    losers: list[MatchResult],
-    metas: list[tuple[Path, dict[str, Any]]],
-    vision: VisionEngine,
-    frame_rgb,
-    logger: FsmRunLogger | None = None,
-) -> bool:
-    found = _meta_for_state(metas, winner.state_id)
-    if found is None:
-        return False
-    winner_dir, winner_meta = found
-    conds = [c for c in winner_meta.get("match_conditions", []) if isinstance(c, dict)]
-    disabled = [c for c in conds if not c.get("enabled", False) and c.get("condition_status", "active") == "active"]
-    selected: list[dict[str, Any]] = []
-    for cond in disabled:
-        ok, _ = _condition_eval(cond, vision, frame_rgb)
-        if ok:
-            selected.append(cond)
-            break
-    if not selected:
-        return False
-    for c in selected:
-        c["enabled"] = True
-    winner_meta.setdefault("model_info", {})
-    if isinstance(winner_meta["model_info"], dict):
-        winner_meta["model_info"]["weak_match"] = False
-        winner_meta["model_info"]["last_enabled_reason"] = {
-            "source": "runtime_disambiguation_winner_fallback",
-            "winner_against": [l.state_id for l in losers],
-            "added_condition_ids": [str(c.get("id", "")) for c in selected],
-            "created_at": _now_iso(),
-        }
-    winner_meta["updated_at"] = _now_iso()
-    _save_json(winner_dir / "state.json", winner_meta)
-    if logger is not None:
-        logger.event(
-            "disambiguation_strengthened_winner",
-            state_id=winner.state_id,
-            added_condition_ids=[c.get("id") for c in selected],
-            remaining_losers=sorted(l.state_id for l in losers),
-        )
-    return True
 
 
 def _disambiguate_matches(
@@ -225,7 +191,7 @@ def _disambiguate_matches(
     )
     if len(strengthened) < len(losers):
         remaining_losers = [m for m in losers if m.state_id not in strengthened]
-        _try_strengthen_winner_conditions(
+        _try_merge_ambiguous_states(
             winner=winner,
             losers=remaining_losers,
             metas=metas,
