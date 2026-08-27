@@ -56,10 +56,11 @@ def request_same_state_review(
             "第一张图是执行前，第二张图是执行后。外部 matcher 认为两张图属于同一页面状态。"
             "请判断上一个动作对 effective_command 的完整目标是否有效，而不是仅判断是否出现像素变化。"
             "即使 effective_command 的旧名称只写了 select，也要以完成当前页面的一次推进为目标，而不是拘泥于窄名称。"
-            "若只是选中了卡片但仍需确认，应判 partial_needs_continue，并在同一次响应的 handler_patch 中给出"
-            "能完成该 effective_command 的后续/修正策略；若点击完全无效则判 ineffective 并给出替代策略。"
+            "若动作已经推进页面但仍需重复同一动作，应判 partial_needs_continue，continuation.reuse_strategy=true，"
+            "无需生成同义 handler_patch；若只是选中了卡片且下一步需要点击不同的确认按钮，也判 partial_needs_continue，"
+            "但 continuation.reuse_strategy=false，并在 handler_patch 中给出后续策略。若点击完全无效则判 ineffective 并给出替代策略。"
             "若旧页面已经完成、第二张图是连续弹出的同类新事件，判 completed_new_visit。"
-            "如果第二张图仍有已启用的确认、继续、提交按钮，禁止判 completed_same_visit；必须判 partial_needs_continue 并给出点击该按钮的 patch。"
+            "如果第二张图仍有已启用的确认、继续、提交按钮，禁止判 completed_same_visit；必须判 partial_needs_continue。"
             "只有操作的完整页面推进语义已经完成且确实应停留在当前页面实例时才判 completed_same_visit。"
             "不得创建或修改 intent，patch 中 operation 必须等于 effective_command.operation。只输出严格 JSON。"
         ),
@@ -70,7 +71,11 @@ def request_same_state_review(
         "output_schema": {
             "verdict": "completed_same_visit|completed_new_visit|partial_needs_continue|ineffective|wrong_effect|uncertain",
             "reason": "short visual/semantic reason",
-            "event": {"type": "optional event only if the complete operation succeeded"},
+            "event": {"type": "optional observed semantic event, including page-local progress"},
+            "continuation": {
+                "reuse_strategy": "true only when repeating the executed strategy is the correct next action",
+                "max_additional_actions": "integer 1..12; omit unless partial_needs_continue"
+            },
             "handler_patch": {
                 "operations": [{
                     "operation": "must equal effective_command.operation",

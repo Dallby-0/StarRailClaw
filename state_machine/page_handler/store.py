@@ -8,7 +8,7 @@ from state_machine.time_utils import now_iso as _now_iso
 
 HANDLER_SCHEMA_VERSION = "progressive_handler.v1"
 TRACE_LIMIT = 40
-STRATEGY_RESULTS = {"verified_success", "verified_reentry", "partial_progress", "no_effect", "wrong_transition", "unsafe_effect", "state_mismatch", "transient_unknown"}
+STRATEGY_RESULTS = {"verified_success", "verified_reentry", "partial_progress", "progress_unknown", "no_effect", "wrong_transition", "unsafe_effect", "state_mismatch", "transient_unknown"}
 
 
 def _slug(raw: Any, fallback: str) -> str:
@@ -32,9 +32,65 @@ def ensure_page_handler(meta: dict[str, Any]) -> dict[str, Any]:
         handler["operation_policies"] = {}
     if not isinstance(handler.get("episode_trace"), list):
         handler["episode_trace"] = []
+    _migrate_legacy_partial_reviews(handler)
     _fold_single_exit_sibling_into_default(handler)
     handler["updated_at"] = _now_iso()
     return handler
+
+
+def _migrate_legacy_partial_reviews(handler: dict[str, Any]) -> set[str]:
+    """Correct strategies degraded by the old partial-review result mapping.
+
+    Older runtimes stored an LLM `partial_needs_continue` verdict as
+    `no_effect`, then degraded the strategy that had actually advanced the
+    page. Only episodes carrying that explicit semantic verdict are corrected;
+    ordinary degraded strategies remain untouched.
+    """
+    trace = handler.get("episode_trace") if isinstance(handler.get("episode_trace"), list) else []
+    affected: set[tuple[str, str]] = set()
+    for episode in trace:
+        if not isinstance(episode, dict) or str(episode.get("result") or "") != "no_effect":
+            continue
+        review = episode.get("same_state_review")
+        if not isinstance(review, dict) or str(review.get("verdict") or "") != "partial_needs_continue":
+            continue
+        command = episode.get("command") if isinstance(episode.get("command"), dict) else {}
+        operation = str(command.get("operation") or "")
+        strategy_id = str(episode.get("strategy_id") or "")
+        if operation and strategy_id:
+            affected.add((operation, strategy_id))
+
+    if not affected:
+        return set()
+    migrated: set[str] = set()
+    policies = handler.get("operation_policies") if isinstance(handler.get("operation_policies"), dict) else {}
+    for operation, strategy_id in affected:
+        policy = policies.get(operation)
+        if not isinstance(policy, dict):
+            continue
+        strategy = next(
+            (item for item in policy.get("strategies", []) if isinstance(item, dict) and str(item.get("strategy_id") or "") == strategy_id),
+            None,
+        )
+        if not isinstance(strategy, dict) or str(strategy.get("status") or "") != "degraded":
+            continue
+        counts = strategy.get("result_counts") if isinstance(strategy.get("result_counts"), dict) else {}
+        no_effect_count = int(counts.get("no_effect", 0) or 0)
+        if no_effect_count > 0:
+            counts["no_effect"] = no_effect_count - 1
+            if counts["no_effect"] <= 0:
+                counts.pop("no_effect", None)
+        counts["partial_progress"] = int(counts.get("partial_progress", 0) or 0) + 1
+        strategy["result_counts"] = counts
+        strategy["fail_count"] = max(0, int(strategy.get("fail_count", 0) or 0) - 1)
+        strategy["status"] = "active" if int(strategy.get("success_count", 0) or 0) > 0 else "proposed"
+        strategy["legacy_partial_review_migrated"] = True
+        strategy["updated_at"] = _now_iso()
+        migrated.add(strategy_id)
+
+    if migrated:
+        handler["updated_at"] = _now_iso()
+    return migrated
 
 
 def _normalize_resolver(raw: Any) -> dict[str, Any] | None:
@@ -126,6 +182,11 @@ def normalize_operation(raw: Any, *, index: int = 1) -> dict[str, Any] | None:
         "intent_effect": str(raw.get("intent_effect", "none")),
         "safety": str(raw.get("safety", "low_risk")),
         "expected_event": str(raw.get("expected_event") or "") or None,
+        # Optional local recovery profiles.  They are intentionally kept
+        # outside learned strategies so exploratory probing cannot poison the
+        # strategy ranking or success counts.
+        "exploration": [dict(item) for item in raw.get("exploration", []) if isinstance(item, dict)],
+        "allow_exploration": bool(raw.get("allow_exploration", False)),
         "strategies": strategies,
     }
 
@@ -239,6 +300,11 @@ def handler_summary(handler: dict[str, Any], *, limit_trace: int = 8) -> dict[st
             continue
         compact[str(operation)] = {
             "intent_scope": policy.get("intent_scope"), "intent_effect": policy.get("intent_effect"), "safety": policy.get("safety"),
+            "exploration": [
+                {"id": item.get("id"), "kind": item.get("kind")}
+                for item in policy.get("exploration", [])
+                if isinstance(item, dict)
+            ],
             "strategies": [{"strategy_id": item.get("strategy_id"), "level": item.get("level"), "status": item.get("status"), "success_count": item.get("success_count", 0), "fail_count": item.get("fail_count", 0)} for item in policy.get("strategies", []) if isinstance(item, dict)],
         }
     trace = handler.get("episode_trace") if isinstance(handler.get("episode_trace"), list) else []
@@ -294,7 +360,7 @@ def continuation_patch_from_sibling(handler: dict[str, Any], operation: str) -> 
     return None
 
 
-def select_strategy(handler: dict[str, Any], operation: str, *, excluded: set[str] | None = None) -> dict[str, Any] | None:
+def select_strategy(handler: dict[str, Any], operation: str, *, excluded: set[str] | None = None, preferred_id: str | None = None) -> dict[str, Any] | None:
     policies = handler.get("operation_policies") if isinstance(handler.get("operation_policies"), dict) else {}
     policy = policies.get(operation)
     if not isinstance(policy, dict):
@@ -303,6 +369,10 @@ def select_strategy(handler: dict[str, Any], operation: str, *, excluded: set[st
     candidates = [item for item in policy.get("strategies", []) if isinstance(item, dict) and str(item.get("strategy_id")) not in excluded and str(item.get("status", "proposed")) in {"proposed", "active"}]
     if not candidates:
         return None
+    if preferred_id:
+        preferred = next((item for item in candidates if str(item.get("strategy_id") or "") == preferred_id), None)
+        if preferred is not None:
+            return preferred
     candidates.sort(key=lambda item: (int(item.get("level", 0) or 0), 0 if item.get("status") == "active" else 1, -int(item.get("success_count", 0) or 0)))
     return candidates[0]
 
@@ -396,6 +466,11 @@ def mark_strategy_result(handler: dict[str, Any], operation: str, strategy_id: s
         # An intermediate step is not evidence that the complete strategy
         # works.  In particular, do not promote a multi-step strategy whose
         # confirm/exit step has never succeeded.
+        pass
+    elif result == "progress_unknown":
+        # A bounded continuation lease permits this action even when the local
+        # observer cannot prove page-local progress. It is neither success
+        # evidence nor a reason to degrade the strategy.
         pass
     elif result in {"no_effect", "wrong_transition", "unsafe_effect"}:
         strategy["fail_count"] = int(strategy.get("fail_count", 0) or 0) + 1

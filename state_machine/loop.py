@@ -28,6 +28,7 @@ from state_machine.llm_tasks import _request_llm_payload
 from state_machine.logger import FsmRunLogger, summarize_match
 from state_machine.matching import _eval_state_match, _select_best_for_unknown
 from state_machine.merge import _try_merge_page_type
+from state_machine.progress_guard import reset_run_local_progress
 from state_machine.screen import _wait_for_unknown_screen_stable
 from state_machine.settlement import settle_pending_operation
 from state_machine.session_runtime import _maybe_rotate_session, _refresh_session_if_needed
@@ -95,6 +96,7 @@ def run_agent_loop_fsm(
     vision = VisionEngine(mapper=mapper, log_ocr_calls=False)
 
     runtime = _load_runtime()
+    reset_run_local_progress(runtime)
     runtime["run_id"] = uuid.uuid4().hex[:8]
     runtime["last_state_id"] = None
     runtime["pending_refresh"] = True

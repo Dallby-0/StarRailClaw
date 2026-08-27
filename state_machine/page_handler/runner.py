@@ -15,10 +15,11 @@ from state_machine.io import _load_json, _now_iso, _save_json, _save_runtime
 from state_machine.logger import FsmRunLogger, summarize_match
 from state_machine.matching import _find_match_by_state
 from state_machine.page_handler.actions import execute_action, resolve_strategy_step
+from state_machine.page_handler.exploration import run_exploration
 from state_machine.page_handler.llm import request_handler_repair, request_same_state_review
 from state_machine.page_handler.review_protocol import result_for_same_state_verdict
 from state_machine.page_handler.store import apply_handler_patch, append_episode, continuation_patch_from_sibling, ensure_page_handler, mark_strategy_result, materialize_strategy_templates, promote_operation_to_default, select_strategy
-from state_machine.progress_guard import blocked_strategies, clear_visit_progress, operation_exhausted, record_attempt, record_no_progress, record_repair, repair_exhausted
+from state_machine.progress_guard import blocked_strategies, clear_continuation, clear_visit_progress, consume_continuation, continuation_for, grant_continuation, operation_exhausted, record_attempt, record_no_progress, record_repair, record_review, repair_exhausted, review_exhausted
 from state_machine.screen import _screen_changed, _wait_for_screen_stable
 from state_machine.transition_policy import _defer_unknown_transition, _resolve_transition_after_progress
 from state_machine.visit import ensure_page_visit, start_new_visit
@@ -97,11 +98,56 @@ def run_page_handler(
     _log(logger, f"[fsm][handler] enter state={state_id} visit={visit_id} operation={command.operation} source={command.source}", "page_handler_enter", state_id=state_id, visit_id=visit_id, action_id=action_id, command=command.to_dict(), intent=intent_projection(intent), entry_context=entry_context or {"mode": "normal"})
 
     while total_actions < LOCAL_FLOW_MAX_STEPS:
-        if operation_exhausted(runtime, visit_id, command.operation):
+        continuation = continuation_for(runtime, visit_id, command.operation)
+        if operation_exhausted(runtime, visit_id, command.operation) and continuation is None:
             _log(logger, f"[fsm][circuit-breaker] state={state_id} visit={visit_id} operation={command.operation} reason=attempt-limit", "page_handler_circuit_breaker", state_id=state_id, visit_id=visit_id, operation=command.operation)
             return False, current
-        strategy = select_strategy(handler, command.operation, excluded=excluded)
+        preferred_strategy_id = str(continuation.get("strategy_id") or "") if continuation is not None else None
+        strategy = select_strategy(handler, command.operation, excluded=excluded, preferred_id=preferred_strategy_id)
         if strategy is None:
+            # Before spending the operation's LLM repair budget, try one
+            # bounded, feedback-driven local exploration.  This is useful for
+            # same-family layouts whose geometry is different but whose
+            # operation surface is still known (for example 004 station
+            # selection with one vs. three cards).
+            exploration_key = f"{visit_id}|{command.operation}"
+            explored = runtime.get("visit_operation_exploration")
+            explored = explored if isinstance(explored, dict) else {}
+            if not explored.get(exploration_key):
+                explored[exploration_key] = True
+                runtime["visit_operation_exploration"] = explored
+                _save_runtime(runtime)
+                policy = handler.get("operation_policies", {}).get(command.operation, {}) if isinstance(handler.get("operation_policies"), dict) else {}
+                profiles = policy.get("exploration") if isinstance(policy, dict) else None
+                policy_safety = str(policy.get("safety", "unknown")) if isinstance(policy, dict) else "unknown"
+                allow_exploration = policy_safety in {"low_risk", "reversible"} or bool(policy.get("allow_exploration")) if isinstance(policy, dict) else False
+                exploration_ok, explored_frame, exploration_info = (False, current, {"result": "not_allowed", "actions": 0, "attempts": []})
+                if allow_exploration:
+                    exploration_ok, explored_frame, exploration_info = run_exploration(
+                        emulator=emulator,
+                        mapper=mapper,
+                        vision=vision,
+                        state_id=state_id,
+                        operation=command.operation,
+                        frame=current,
+                        matches_provider=matches_provider,
+                        profiles=profiles if isinstance(profiles, list) else None,
+                        logger=logger,
+                    )
+                current = explored_frame
+                if logger is not None:
+                    logger.event(
+                        "page_handler_exploration_result",
+                        state_id=state_id,
+                        visit_id=visit_id,
+                        operation=command.operation,
+                        result=exploration_info.get("result"),
+                        actions=exploration_info.get("actions", 0),
+                        attempts=exploration_info.get("attempts", []),
+                    )
+                if exploration_ok:
+                    made_progress = True
+                    return True, current
             if repair_exhausted(runtime, visit_id, command.operation):
                 _log(logger, f"[fsm][handler] no strategy state={state_id} operation={command.operation}", "page_handler_no_strategy", state_id=state_id, operation=command.operation, failed_attempts=failed_attempts)
                 return made_progress, current
@@ -140,7 +186,9 @@ def run_page_handler(
             continue
 
         strategy_id = str(strategy.get("strategy_id") or "")
-        record_attempt(runtime, visit_id, command.operation)
+        using_continuation = continuation is not None and str(continuation.get("strategy_id") or "") == strategy_id
+        if not using_continuation:
+            record_attempt(runtime, visit_id, command.operation)
         if command.intent_id is None and str(strategy.get("safety", "unknown")) not in {"low_risk", "reversible"}:
             failed_attempts.append({"strategy_id": strategy_id, "result": "unsafe_effect", "reason": "explicit_intent_required"})
             mark_strategy_result(handler, command.operation, strategy_id, "unsafe_effect")
@@ -173,6 +221,8 @@ def run_page_handler(
                 break
             action, action_info = resolve_strategy_step(strategy, step_index, current, vision)
             if action is None:
+                if using_continuation:
+                    clear_continuation(runtime, visit_id, command.operation)
                 failed = {"strategy_id": strategy_id, "step_index": step_index, "result": "no_effect", "reason": action_info.get("reason")}
                 failed_attempts.append(failed)
                 mark_strategy_result(handler, command.operation, strategy_id, "no_effect")
@@ -197,6 +247,8 @@ def run_page_handler(
             }
             _save_runtime(runtime)
             if not execute_action(emulator=emulator, mapper=mapper, vision=vision, state_id=state_id, action_id=action_id, action=action, action_info=action_info, matches_provider=matches_provider, logger=logger, attempt=f"strategy:{strategy_id}:{step_index + 1}"):
+                if using_continuation:
+                    clear_continuation(runtime, visit_id, command.operation)
                 runtime["pending_operation"] = None
                 _save_runtime(runtime)
                 mark_strategy_result(handler, command.operation, strategy_id, "no_effect")
@@ -215,6 +267,7 @@ def run_page_handler(
             successful_targets = [match for match in matches if match.success and str(match.state_id) != state_id]
             review = None
             review_patch: dict[str, Any] | None = None
+            switch_strategy_after_progress = False
             relation = str(action_info.get("expected_after", {}).get("state_relation") or "may_leave")
             if not left_state and not final_step and relation == "must_remain":
                 # A declared page-local intermediate step is already guarded by
@@ -222,8 +275,28 @@ def run_page_handler(
                 # known steps of the same strategy.
                 result = "partial_progress" if changed else "no_effect"
             elif not left_state:
-                if not repair_exhausted(runtime, visit_id, command.operation):
-                    record_repair(runtime, visit_id, command.operation)
+                active_continuation = continuation_for(runtime, visit_id, command.operation)
+                if active_continuation is not None and str(active_continuation.get("strategy_id") or "") != strategy_id:
+                    # The leased strategy is no longer selectable (for example
+                    # after an external handler edit). Do not let a stale lease
+                    # suppress review of a different strategy.
+                    clear_continuation(runtime, visit_id, command.operation)
+                    active_continuation = None
+                if active_continuation is not None and str(active_continuation.get("strategy_id") or "") == strategy_id:
+                    remaining = consume_continuation(runtime, visit_id, command.operation, strategy_id)
+                    result = "progress_unknown"
+                    _log(
+                        logger,
+                        f"[fsm][handler][continuation] state={state_id} visit={visit_id} operation={command.operation} strategy={strategy_id} remaining={remaining}",
+                        "page_handler_continuation_consumed",
+                        state_id=state_id,
+                        visit_id=visit_id,
+                        operation=command.operation,
+                        strategy_id=strategy_id,
+                        remaining_actions=remaining,
+                    )
+                elif not review_exhausted(runtime, visit_id, command.operation):
+                    record_review(runtime, visit_id, command.operation)
                     _save_runtime(runtime)
                     review = request_same_state_review(
                         llm=llm,
@@ -238,29 +311,65 @@ def run_page_handler(
                         logger=logger,
                     )
                     runtime["llm_turn_count"] = int(runtime.get("llm_turn_count", 0) or 0) + 1
-                verdict = str((review or {}).get("verdict") or "uncertain")
-                # A default operation that claims completion while leaving the
-                # same page would simply be selected again by the outer FSM.
-                # Treat that as an incomplete page advance and reuse a learned
-                # sibling confirm/continue operation when available.
-                if verdict == "completed_same_visit" and command.source == "state_default" and final_step:
-                    verdict = "partial_needs_continue"
-                result = result_for_same_state_verdict(verdict, final_step=final_step)
-                if result in {"no_effect", "wrong_transition"}:
-                    raw_patch = review.get("handler_patch") if isinstance(review, dict) and isinstance(review.get("handler_patch"), dict) else {}
-                    filtered_patch = dict(raw_patch)
-                    filtered_patch["operations"] = [
-                        item for item in raw_patch.get("operations", [])
-                        if isinstance(item, dict) and str(item.get("operation") or "").strip() == command.operation
-                    ]
-                    review_patch = filtered_patch
-                    sibling_patch = continuation_patch_from_sibling(handler, command.operation)
-                    if sibling_patch is not None:
-                        review_patch = sibling_patch
-                        _log(logger, f"[fsm][handler][same-state-review] reuse sibling continuation operation={command.operation}", "same_state_sibling_continuation", operation=command.operation)
+                if active_continuation is None:
+                    verdict = str((review or {}).get("verdict") or "uncertain")
+                    # A default operation that claims completion while leaving the
+                    # same page would simply be selected again by the outer FSM.
+                    # Treat that as an incomplete page advance.
+                    if verdict == "completed_same_visit" and command.source == "state_default" and final_step:
+                        verdict = "partial_needs_continue"
+                    result = result_for_same_state_verdict(verdict, final_step=final_step)
+                    if verdict == "partial_needs_continue":
+                        continuation_spec = review.get("continuation") if isinstance(review, dict) and isinstance(review.get("continuation"), dict) else {}
+                        reuse_strategy = continuation_spec.get("reuse_strategy", True) is not False
+                        if reuse_strategy:
+                            try:
+                                continuation_actions = int(continuation_spec.get("max_additional_actions", 6) or 6)
+                            except (TypeError, ValueError):
+                                continuation_actions = 6
+                            lease = grant_continuation(
+                                runtime,
+                                visit_id,
+                                command.operation,
+                                strategy_id,
+                                max_additional_actions=continuation_actions,
+                            )
+                            _log(
+                                logger,
+                                f"[fsm][handler][continuation] granted state={state_id} visit={visit_id} operation={command.operation} strategy={strategy_id} actions={lease['remaining_actions']}",
+                                "page_handler_continuation_granted",
+                                state_id=state_id,
+                                visit_id=visit_id,
+                                operation=command.operation,
+                                strategy_id=strategy_id,
+                                remaining_actions=lease["remaining_actions"],
+                            )
+                        else:
+                            raw_patch = review.get("handler_patch") if isinstance(review, dict) and isinstance(review.get("handler_patch"), dict) else {}
+                            filtered_patch = dict(raw_patch)
+                            filtered_patch["operations"] = [
+                                item for item in raw_patch.get("operations", [])
+                                if isinstance(item, dict) and str(item.get("operation") or "").strip() == command.operation
+                            ]
+                            review_patch = filtered_patch
+                            switch_strategy_after_progress = True
+                    if result in {"no_effect", "wrong_transition"}:
+                        raw_patch = review.get("handler_patch") if isinstance(review, dict) and isinstance(review.get("handler_patch"), dict) else {}
+                        filtered_patch = dict(raw_patch)
+                        filtered_patch["operations"] = [
+                            item for item in raw_patch.get("operations", [])
+                            if isinstance(item, dict) and str(item.get("operation") or "").strip() == command.operation
+                        ]
+                        review_patch = filtered_patch
+                        sibling_patch = continuation_patch_from_sibling(handler, command.operation)
+                        if sibling_patch is not None:
+                            review_patch = sibling_patch
+                            _log(logger, f"[fsm][handler][same-state-review] reuse sibling continuation operation={command.operation}", "same_state_sibling_continuation", operation=command.operation)
             elif successful_targets:
+                clear_continuation(runtime, visit_id, command.operation)
                 result = "verified_success" if final_step else "partial_progress"
             else:
+                clear_continuation(runtime, visit_id, command.operation)
                 result = "transient_unknown"
             allowed = action_info.get("expected_after", {}).get("allowed_state_ids")
             if left_state and isinstance(allowed, list):
@@ -317,7 +426,18 @@ def run_page_handler(
                     return _defer_unknown_transition(runtime=runtime, state_id=state_id, action_id=action_id, logger=logger, frame=post, reason="page-handler-failed-policy-left-state")
                 break
 
+            if switch_strategy_after_progress:
+                # The executed action was useful, but the next page-local step
+                # requires a different resolver/action. Continue immediately
+                # with the patched strategy without globally degrading the
+                # strategy that produced the partial progress.
+                excluded.add(strategy_id)
+                strategy_failed = True
+                current = post
+                break
+
             if result == "verified_reentry":
+                clear_continuation(runtime, visit_id, command.operation)
                 clear_visit_progress(runtime, visit_id)
                 new_visit = start_new_visit(runtime, state_id, reason="confirmed_reentry")
                 _append_graph_edge(state_id, action_id, state_id, logger=logger, reason="page-handler-confirmed-reentry", confidence="strong", transition_kind="reentry")
