@@ -101,6 +101,7 @@ def state_bootstrap_json_schema() -> dict[str, Any]:
         "page_summary": {"type": "string"},
         "slug": {"type": "string", "pattern": "^[a-z0-9]+(?:_[a-z0-9]+)*$"},
         "possible_page_type": {"type": "string"},
+        "page_family": {"type": "string", "pattern": "^[a-z0-9]+(?:_[a-z0-9]+)*$"},
         "elements": {"type": "array", "items": {"anyOf": [text_element, pattern_element]}, "maxItems": 8},
         "intent_assessment": _closed_object({
             "relation": {"type": "string", "enum": ["expected_step", "blocking_overlay", "completion_evidence", "unrelated", "contradiction", "unknown"]},

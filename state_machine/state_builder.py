@@ -118,6 +118,13 @@ def _create_state_from_llm(
         for strategy in policy.get("strategies", [])
         if isinstance(strategy, dict)
     }
+    strategy_ids.update(
+        str(provider.get("provider_id"))
+        for policy in handler.get("operation_policies", {}).values()
+        if isinstance(policy, dict) and isinstance(policy.get("controller"), dict)
+        for provider in policy["controller"].get("providers", [])
+        if isinstance(provider, dict)
+    )
     materialize_strategy_templates(handler, state_dir, frame_rgb, vision, strategy_ids)
 
     state_meta = {
@@ -125,6 +132,7 @@ def _create_state_from_llm(
         "state_id": state_id,
         "slug": _slugify(str(llm_payload.get("slug", "state"))),
         "page_type": _normalize_page_type(llm_payload.get("possible_page_type") or llm_payload.get("page_type")),
+        "page_family": _slugify(str(llm_payload.get("page_family") or _normalize_page_type(llm_payload.get("possible_page_type")) or llm_payload.get("slug") or "generic_page")),
         "display_name": str(llm_payload.get("slug", "state")),
         "description": str(llm_payload.get("page_summary", "")),
         "created_at": _now_iso(),

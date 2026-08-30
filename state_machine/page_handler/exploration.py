@@ -49,6 +49,17 @@ def _log(logger, message: str, event: str = "console", **fields: Any) -> None:
 
 def _points(profile: dict[str, Any]) -> list[tuple[int, int]]:
     samples = max(1, int(profile.get("samples", 1) or 1))
+    kind = str(profile.get("kind") or "horizontal_probe")
+    if kind == "vertical_probe":
+        y_start = int(profile.get("y_start", 0) or 0)
+        y_end = int(profile.get("y_end", y_start) or y_start)
+        x = int(profile.get("x", 0) or 0)
+        if samples == 1:
+            return [(x, y_start)]
+        return [
+            (x, round(y_start + (y_end - y_start) * index / (samples - 1)))
+            for index in range(samples)
+        ]
     x_start = int(profile.get("x_start", 0) or 0)
     x_end = int(profile.get("x_end", x_start) or x_start)
     y = int(profile.get("y", 0) or 0)

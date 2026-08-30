@@ -127,13 +127,16 @@ def request_handler_repair(
             "mode": "PROGRESSIVE_HANDLER_REPAIR",
             "instruction": (
                 "当前页面状态已确认。请只修复 effective_command 对应的页面操作策略，不要创建或修改 intent。"
-                "优先提出比已失败策略更可靠的 resolver：固定点失败后可给 region_template，使用当前图上的 template_bbox 和受限 search_rect。"
-                "最多给 2 个条件步骤；每步执行后系统都会重新截图验证，禁止无条件连点。"
-                "expected_after 必须使用 state_relation 和 reentry_policy。页面内步骤用 must_remain/same_visit；"
-                "必须退出且同类页面可能连续出现时用 must_leave/new_visit；普通关闭用 must_leave/forbid。"
+                "当前 handler 使用 reactive_local 控制器时，优先向同一 operation 的 controller.providers 追加一个最小立即动作，"
+                "并尽可能把本次布局差异提炼为 fallback_profiles（受限区域 OCR、水平/垂直探测、template_offset），"
+                "使同族页面的其他布局也能本地推进，而不是只增加当前截图专用的完整多步 strategy。"
+                "provider 按 cost 从低到高惰性执行；画面变化后 runtime 会重新观察，禁止生成无条件连点宏。"
+                "固定点使用 once_per_visit；OCR、模板或探索可以使用 once_per_observation。"
+                "精确动作 expected_after 必须使用 state_relation 和 reentry_policy。"
+                "页面内推进可用 may_leave/same_visit；普通退出使用 must_leave/forbid；同类页面连续出现用 must_leave/new_visit。"
                 "低风险提示页可以固定坐标；提交或破坏性动作必须带明确安全等级和视觉定位。只输出严格 JSON。"
             ),
-            "state": {"state_id": state_meta.get("state_id"), "slug": state_meta.get("slug"), "page_type": state_meta.get("page_type"), "description": str(state_meta.get("description", ""))[:240]},
+            "state": {"state_id": state_meta.get("state_id"), "slug": state_meta.get("slug"), "page_type": state_meta.get("page_type"), "page_family": state_meta.get("page_family"), "description": str(state_meta.get("description", ""))[:240]},
             "effective_command": command,
             "handler": handler_summary(handler),
             "failed_attempts": failed_attempts[-4:],
@@ -145,6 +148,35 @@ def request_handler_repair(
                         "intent_effect": "advance|preserve|complete|none",
                         "safety": "low_risk|reversible|commit|destructive",
                         "expected_event": "optional semantic event",
+                        "controller": {
+                            "type": "reactive_local",
+                            "max_actions": 12,
+                            "max_observation_rounds": 6,
+                            "providers": [{
+                                "provider_id": "stable id",
+                                "kind": "action",
+                                "cost": "0 for direct point, 1-10 for exact visual action",
+                                "repeat_policy": "once_per_visit|once_per_observation|repeatable",
+                                "status": "proposed",
+                                "resolver": {"type": "fixed_point|region_template|run_preset", "x": 0, "y": 0, "template_bbox": [0, 0, 0, 0], "search_rect": [0, 0, 0, 0], "threshold": 0.82, "name": ""},
+                                "expected_after": {"state_relation": "must_leave|must_remain|may_leave", "reentry_policy": "forbid|new_visit|same_visit"},
+                                "emits_on_success": {"type": "semantic event"},
+                                "brief": "short string"
+                            }],
+                            "fallback_profiles": [{
+                                "id": "stable id",
+                                "kind": "horizontal_probe|confirm_search|template_offset",
+                                "region": [0, 0, 0, 0],
+                                "keywords": ["确定", "确认", "继续", "前往"],
+                                "x_start": 0,
+                                "x_end": 0,
+                                "y": 0,
+                                "samples": 5,
+                                "template_path": "",
+                                "template_bbox": [0, 0, 0, 0],
+                                "click_offset": [0, 0]
+                            }]
+                        },
                         "strategies": [{
                             "strategy_id": "stable id",
                             "level": "integer; stronger than failed strategy",

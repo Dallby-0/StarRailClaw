@@ -17,9 +17,10 @@ from state_machine.matching import _find_match_by_state
 from state_machine.page_handler.actions import execute_action, resolve_strategy_step
 from state_machine.page_handler.exploration import run_exploration
 from state_machine.page_handler.llm import request_handler_repair, request_same_state_review
+from state_machine.page_handler.reactive import advance_observation, mark_provider_result, record_provider_attempt, select_provider
 from state_machine.page_handler.review_protocol import result_for_same_state_verdict
 from state_machine.page_handler.store import apply_handler_patch, append_episode, continuation_patch_from_sibling, ensure_page_handler, mark_strategy_result, materialize_strategy_templates, promote_operation_to_default, select_strategy
-from state_machine.progress_guard import blocked_strategies, clear_continuation, clear_visit_progress, consume_continuation, continuation_for, grant_continuation, operation_exhausted, record_attempt, record_no_progress, record_repair, record_review, repair_exhausted, review_exhausted
+from state_machine.progress_guard import blocked_strategies, clear_continuation, clear_reactive_cursor, clear_visit_progress, consume_continuation, continuation_for, grant_continuation, operation_exhausted, reactive_cursor_for, record_attempt, record_no_progress, record_repair, record_review, repair_exhausted, review_exhausted
 from state_machine.screen import _screen_changed, _wait_for_screen_stable
 from state_machine.transition_policy import _defer_unknown_transition, _resolve_transition_after_progress
 from state_machine.visit import ensure_page_visit, start_new_visit
@@ -59,6 +60,215 @@ def _event_for_success(command: EffectiveCommand, step_info: dict[str, Any], *, 
     return None
 
 
+def _reactive_action(provider: dict[str, Any], frame, vision: VisionEngine) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    synthetic = {
+        "strategy_id": str(provider.get("provider_id") or "reactive_provider"),
+        "level": int(provider.get("cost", 0) or 0),
+        "steps": [{
+            "step_id": str(provider.get("provider_id") or "reactive_action"),
+            "resolver": dict(provider.get("resolver") or {}),
+            "expected_after": dict(provider.get("expected_after") or {"state_relation": "may_leave", "reentry_policy": "forbid"}),
+            "emits_on_success": dict(provider.get("emits_on_success") or {}),
+            "brief": str(provider.get("brief") or ""),
+        }],
+    }
+    return resolve_strategy_step(synthetic, 0, frame, vision)
+
+
+def _run_reactive_local(
+    *,
+    emulator: EmulatorClient,
+    mapper: CoordinateMapper,
+    vision: VisionEngine,
+    state_id: str,
+    state_dir: Path,
+    state_path: Path,
+    state_meta: dict[str, Any],
+    handler: dict[str, Any],
+    policy: dict[str, Any],
+    command: EffectiveCommand,
+    visit_id: str,
+    action_id: str,
+    current,
+    matches_provider,
+    runtime: dict[str, Any],
+    graph: dict[str, Any],
+    prefer_reachable_first: bool,
+    logger: FsmRunLogger | None,
+) -> tuple[str, bool, Any, list[dict[str, Any]]]:
+    """Run the cheap local feedback loop until it exits or needs repair."""
+    controller = policy.get("controller") if isinstance(policy.get("controller"), dict) else {}
+    cursor = reactive_cursor_for(runtime, visit_id, command.operation)
+    failed_attempts: list[dict[str, Any]] = []
+    made_progress = False
+    max_actions = max(1, min(int(controller.get("max_actions", LOCAL_FLOW_MAX_STEPS) or LOCAL_FLOW_MAX_STEPS), 24))
+    max_rounds = max(1, min(int(controller.get("max_observation_rounds", 6) or 6), 12))
+
+    while int(cursor.get("total_actions", 0) or 0) < max_actions and int(cursor.get("observation_epoch", 1) or 1) <= max_rounds:
+        provider = select_provider(controller, cursor)
+        if provider is None:
+            # Preserve the existing low-risk generic exploration as the last
+            # local tier. It is lazy and therefore costs nothing on the normal
+            # one-click path.
+            epoch = str(int(cursor.get("observation_epoch", 1) or 1))
+            generic_epochs = cursor.get("generic_exploration_epochs") if isinstance(cursor.get("generic_exploration_epochs"), list) else []
+            cursor["generic_exploration_epochs"] = generic_epochs
+            allow_generic = str(policy.get("safety", "unknown")) in {"low_risk", "reversible"}
+            if allow_generic and epoch not in {str(value) for value in generic_epochs}:
+                generic_epochs.append(epoch)
+                remaining = max_actions - int(cursor.get("total_actions", 0) or 0)
+                ok, explored_frame, info = run_exploration(
+                    emulator=emulator,
+                    mapper=mapper,
+                    vision=vision,
+                    state_id=state_id,
+                    operation=command.operation,
+                    frame=current,
+                    matches_provider=matches_provider,
+                    profiles=None,
+                    logger=logger,
+                    max_actions=max(1, remaining),
+                )
+                record_provider_attempt(cursor, {"provider_id": "$generic_exploration"}, action_count=int(info.get("actions", 0) or 0))
+                current = explored_frame
+                _save_runtime(runtime)
+                if logger is not None:
+                    logger.event("page_handler_reactive_generic", state_id=state_id, visit_id=visit_id, operation=command.operation, observation_epoch=int(epoch), result=info.get("result"), actions=info.get("actions", 0), attempts=info.get("attempts", []))
+                if info.get("result") == "left_state":
+                    clear_reactive_cursor(runtime, visit_id, command.operation)
+                    clear_visit_progress(runtime, visit_id)
+                    _save_runtime(runtime)
+                    matches = matches_provider(current)
+                    nxt = _resolve_transition_after_progress(state_id=state_id, action_id=action_id, matches=matches, graph=graph, runtime=runtime, prefer_reachable_first=prefer_reachable_first, logger=logger, reason_suffix="-reactive-generic")
+                    if nxt is not None:
+                        return "done", True, current, failed_attempts
+                    ok, deferred = _defer_unknown_transition(runtime=runtime, state_id=state_id, action_id=action_id, logger=logger, frame=current, reason="reactive-generic-left-state")
+                    return "done", ok, deferred, failed_attempts
+                if ok:
+                    made_progress = True
+                    advance_observation(cursor)
+                    _save_runtime(runtime)
+                    continue
+            return "repair", made_progress, current, failed_attempts
+
+        provider_id = str(provider.get("provider_id") or "")
+        kind = str(provider.get("kind") or "action")
+        if kind == "exploration":
+            remaining = max_actions - int(cursor.get("total_actions", 0) or 0)
+            ok, post, info = run_exploration(
+                emulator=emulator,
+                mapper=mapper,
+                vision=vision,
+                state_id=state_id,
+                operation=command.operation,
+                frame=current,
+                matches_provider=matches_provider,
+                profiles=provider.get("profiles") if isinstance(provider.get("profiles"), list) else [],
+                logger=logger,
+                max_actions=max(1, remaining),
+            )
+            record_provider_attempt(cursor, provider, action_count=int(info.get("actions", 0) or 0))
+            outcome = "state_left" if info.get("result") == "left_state" else "changed_same_state" if ok else "no_change"
+            mark_provider_result(controller, provider_id, outcome)
+            append_episode(handler, {"state_id": state_id, "visit_id": visit_id, "command": command.to_dict(), "provider_id": provider_id, "controller": "reactive_local", "result": outcome, "exploration": info})
+            current = post
+            state_meta["updated_at"] = _now_iso()
+            _save_json(state_path, state_meta)
+            _save_runtime(runtime)
+            if logger is not None:
+                logger.event("page_handler_reactive_result", state_id=state_id, visit_id=visit_id, operation=command.operation, provider_id=provider_id, provider_kind=kind, observation_epoch=cursor.get("observation_epoch"), result=outcome, actions=info.get("actions", 0), attempts=info.get("attempts", []))
+            if outcome == "state_left":
+                clear_reactive_cursor(runtime, visit_id, command.operation)
+                clear_visit_progress(runtime, visit_id)
+                _save_runtime(runtime)
+                matches = matches_provider(current)
+                nxt = _resolve_transition_after_progress(state_id=state_id, action_id=action_id, matches=matches, graph=graph, runtime=runtime, prefer_reachable_first=prefer_reachable_first, logger=logger, reason_suffix="-reactive-exploration")
+                if nxt is not None:
+                    return "done", True, current, failed_attempts
+                ok, deferred = _defer_unknown_transition(runtime=runtime, state_id=state_id, action_id=action_id, logger=logger, frame=current, reason="reactive-exploration-left-state")
+                return "done", ok, deferred, failed_attempts
+            if outcome == "changed_same_state":
+                made_progress = True
+                advance_observation(cursor)
+            else:
+                failed_attempts.append({"provider_id": provider_id, "result": outcome, "reason": info.get("result")})
+            _save_runtime(runtime)
+            continue
+
+        action, action_info = _reactive_action(provider, current, vision)
+        if action is None:
+            record_provider_attempt(cursor, provider, action_count=0)
+            mark_provider_result(controller, provider_id, "resolver_miss")
+            failed_attempts.append({"provider_id": provider_id, "result": "resolver_miss", "reason": action_info.get("reason")})
+            state_meta["updated_at"] = _now_iso()
+            _save_json(state_path, state_meta)
+            _save_runtime(runtime)
+            _log(logger, f"[fsm][handler][reactive] provider={provider_id} result=resolver_miss reason={action_info.get('reason')}", "page_handler_reactive_resolver_miss", state_id=state_id, visit_id=visit_id, operation=command.operation, provider_id=provider_id, reason=action_info.get("reason"))
+            continue
+
+        runtime["pending_operation"] = {
+            "attempt_id": f"{visit_id}:{command.operation}:{provider_id}:{int(cursor.get('total_actions', 0) or 0) + 1}",
+            "intent_id": command.intent_id,
+            "state_id": state_id,
+            "state_dir": str(state_dir),
+            "visit_id": visit_id,
+            "operation": command.operation,
+            "strategy_id": provider_id,
+            "provider_id": provider_id,
+            "controller_type": "reactive_local",
+            "step_id": provider_id,
+            "expected_after": dict(provider.get("expected_after") or {}),
+            "success_event": _event_for_success(command, action_info, final_step=True),
+            "status": "issued",
+            "created_at": _now_iso(),
+        }
+        _save_runtime(runtime)
+        executed = execute_action(emulator=emulator, mapper=mapper, vision=vision, state_id=state_id, action_id=action_id, action=action, action_info=action_info, matches_provider=matches_provider, logger=logger, attempt=f"reactive:{provider_id}")
+        record_provider_attempt(cursor, provider, action_count=1 if executed else 0)
+        if not executed:
+            runtime["pending_operation"] = None
+            mark_provider_result(controller, provider_id, "action_error")
+            failed_attempts.append({"provider_id": provider_id, "result": "action_error"})
+            _save_json(state_path, state_meta)
+            _save_runtime(runtime)
+            continue
+
+        post = _wait_for_screen_stable(emulator, logger=logger, label="page-handler-reactive", event="page_handler_stability_check", max_checks=3)
+        matches = matches_provider(post)
+        changed, diff_score = _screen_changed(current, post)
+        current_match = _find_match_by_state(matches, state_id)
+        left_state = current_match is None or not current_match.success
+        outcome = "state_left" if left_state else "changed_same_state" if changed else "no_change"
+        runtime["pending_operation"] = None
+        mark_provider_result(controller, provider_id, outcome)
+        event = _event_for_success(command, action_info, final_step=left_state) if outcome in {"state_left", "changed_same_state"} else None
+        reduce_intent_event(runtime, event)
+        append_episode(handler, {"state_id": state_id, "visit_id": visit_id, "command": command.to_dict(), "provider_id": provider_id, "controller": "reactive_local", "result": outcome, "event": event, "changed": changed, "diff_score": diff_score})
+        current = post
+        state_meta["updated_at"] = _now_iso()
+        _save_json(state_path, state_meta)
+        _save_runtime(runtime)
+        if logger is not None:
+            logger.event("page_handler_reactive_result", state_id=state_id, visit_id=visit_id, action_id=action_id, operation=command.operation, provider_id=provider_id, provider_kind=kind, observation_epoch=cursor.get("observation_epoch"), result=outcome, changed=changed, diff_score=diff_score, candidates=[summarize_match(m) for m in matches])
+        if left_state:
+            clear_reactive_cursor(runtime, visit_id, command.operation)
+            clear_visit_progress(runtime, visit_id)
+            _save_runtime(runtime)
+            nxt = _resolve_transition_after_progress(state_id=state_id, action_id=action_id, matches=matches, graph=graph, runtime=runtime, prefer_reachable_first=prefer_reachable_first, logger=logger, reason_suffix="-reactive")
+            if nxt is not None:
+                return "done", True, current, failed_attempts
+            ok, deferred = _defer_unknown_transition(runtime=runtime, state_id=state_id, action_id=action_id, logger=logger, frame=current, reason="reactive-original-state-no-longer-matched")
+            return "done", ok, deferred, failed_attempts
+        if changed:
+            made_progress = True
+            advance_observation(cursor)
+        else:
+            failed_attempts.append({"provider_id": provider_id, "result": "no_change", "diff_score": diff_score})
+        _save_runtime(runtime)
+
+    return "repair", made_progress, current, failed_attempts
+
+
 def run_page_handler(
     *,
     emulator: EmulatorClient,
@@ -96,6 +306,83 @@ def run_page_handler(
     made_progress = False
 
     _log(logger, f"[fsm][handler] enter state={state_id} visit={visit_id} operation={command.operation} source={command.source}", "page_handler_enter", state_id=state_id, visit_id=visit_id, action_id=action_id, command=command.to_dict(), intent=intent_projection(intent), entry_context=entry_context or {"mode": "normal"})
+
+    policies = handler.get("operation_policies") if isinstance(handler.get("operation_policies"), dict) else {}
+    policy = policies.get(command.operation) if isinstance(policies.get(command.operation), dict) else None
+    if isinstance(policy, dict) and str(policy.get("controller", {}).get("type") if isinstance(policy.get("controller"), dict) else "") == "reactive_local":
+        reactive_failures: list[dict[str, Any]] = []
+        while True:
+            status, progressed, current, failures = _run_reactive_local(
+                emulator=emulator,
+                mapper=mapper,
+                vision=vision,
+                state_id=state_id,
+                state_dir=state_dir,
+                state_path=state_path,
+                state_meta=state_meta,
+                handler=handler,
+                policy=policy,
+                command=command,
+                visit_id=visit_id,
+                action_id=action_id,
+                current=current,
+                matches_provider=matches_provider,
+                runtime=runtime,
+                graph=graph,
+                prefer_reachable_first=prefer_reachable_first,
+                logger=logger,
+            )
+            made_progress = made_progress or progressed
+            reactive_failures.extend(failures)
+            if status == "done":
+                return True, current
+            if repair_exhausted(runtime, visit_id, command.operation):
+                _log(logger, f"[fsm][handler] reactive exhausted state={state_id} operation={command.operation}", "page_handler_no_strategy", state_id=state_id, operation=command.operation, failed_attempts=reactive_failures[-12:], controller_type="reactive_local")
+                return made_progress, current
+            record_repair(runtime, visit_id, command.operation)
+            _save_runtime(runtime)
+            response = request_handler_repair(
+                llm=llm,
+                session_id=llm_session_id,
+                frame_rgb=current,
+                previous_frame_rgb=start_frame if current is not start_frame else None,
+                system_prompt=system_prompt,
+                state_meta=state_meta,
+                handler=handler,
+                command=command.to_dict(),
+                failed_attempts=reactive_failures[-12:],
+                logger=logger,
+            )
+            runtime["llm_turn_count"] = int(runtime.get("llm_turn_count", 0) or 0) + 1
+            _save_runtime(runtime)
+            if response is None:
+                continue
+            raw_patch = response.get("handler_patch") if isinstance(response.get("handler_patch"), dict) else {}
+            filtered_patch = dict(raw_patch)
+            filtered_patch["operations"] = [
+                item for item in raw_patch.get("operations", [])
+                if isinstance(item, dict) and str(item.get("operation") or "").strip() == command.operation
+            ]
+            touched = apply_handler_patch(handler, filtered_patch)
+            materialize_strategy_templates(handler, state_dir, current, vision, touched)
+            # The pre-repair local budget describes attempts made before the
+            # new providers existed. Give the patch a fresh bounded budget,
+            # while preserving attempted-provider sets so old direct clicks
+            # are not replayed from the beginning.
+            repaired_cursor = reactive_cursor_for(runtime, visit_id, command.operation)
+            repaired_cursor["total_actions"] = 0
+            repaired_cursor["observation_epoch"] = 1
+            repaired_cursor.setdefault("attempted_by_epoch", {}).setdefault("1", [])
+            repaired_cursor["attempted_visit"] = [value for value in repaired_cursor.get("attempted_visit", []) if str(value) not in touched]
+            for attempted in repaired_cursor.get("attempted_by_epoch", {}).values():
+                if isinstance(attempted, list):
+                    attempted[:] = [value for value in attempted if str(value) not in touched]
+            reduce_intent_event(runtime, response.get("event"))
+            state_meta["updated_at"] = _now_iso()
+            _save_json(state_path, state_meta)
+            _save_runtime(runtime)
+            policies = handler.get("operation_policies") if isinstance(handler.get("operation_policies"), dict) else {}
+            policy = policies.get(command.operation) if isinstance(policies.get(command.operation), dict) else policy
 
     while total_actions < LOCAL_FLOW_MAX_STEPS:
         continuation = continuation_for(runtime, visit_id, command.operation)

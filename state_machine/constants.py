@@ -39,7 +39,7 @@ LLM_FSM_PROMPT_BASE = """你是视觉驱动游戏自动化的状态标注器和�
 
 你将收到一张游戏截图。你的任务：
 1) 识别并输出用于区分该页面的关键信息，按匹配价值排序：优先高 stability 且高 discrimination 的 pattern，其次是稳定 text_line。
-2) 在同一次响应中输出最多两个 bootstrap operation，用于低成本推进当前页面。
+2) 在同一次响应中输出最多两个 bootstrap operation；每个 operation 优先只给当前画面上最简单的直接动作。
 
 强约束：
 - 必须输出严格 JSON 对象，字段必须符合约定。
@@ -75,18 +75,19 @@ LLM_FSM_PROMPT_BASE = """你是视觉驱动游戏自动化的状态标注器和�
     - 页面标题、固定图标、固定按钮、固定交互控件通常更稳定。
 - slug: 英文小写+下划线，简短可读。
 - possible_page_type: 如果当前页面可能属于已知页面类型，输出该类型英文名；否则输出 "none"。不要把具体实例名称当作页面类型。
+- page_family: 英文小写+下划线，表示可共享同类操作经验的稳定页面族；不知道时使用与 slug 相同的值。
 - bootstrap_operations: 数组。每项表示一种操作语义及其初始渐进策略，而不是无条件 state action。
   - operation 必须是稳定的短语义名，例如 dismiss_overlay、confirm、advance、select_candidate。
-  - 默认 operation 必须表达“完成当前页面的一次完整推进”，不能只表达一个尚未结束页面的局部点击。
-    - 如果页面需要先选择卡片再点击确认，必须输出一个 select_and_confirm operation，并把选择、确认写成同一 strategy 的两个 steps。
+  - operation 必须表达“完成当前页面的一次完整推进”，但 bootstrap steps 只需描述当前截图中最明显、最低成本的下一步动作。
+    - 如果页面需要先选择卡片再点击确认，operation 应命名为 select_and_confirm；通常只输出当前可见的选择动作。只有确认按钮当前也明确可见且顺序可靠时，才可给第二个 step。
     - 禁止把前后顺序必做的步骤拆成两个并列 bootstrap_operations；多个 operation 仅用于不同 intent/业务语义下互斥的操作选择。
-    - 页面上存在已经可见的确认/继续/提交按钮时，不能在只完成选择高亮后就把默认 operation 视为完成。
+    - runtime 会在每次动作后重新观察；仍停留同页时不会把 operation 视为完成，而会尝试后续本地 provider，耗尽后才请求修复。
   - intent_scope 只能是 intent_invariant 或 intent_specific。只有纯提示/透明阻塞弹窗才使用 intent_invariant。
   - intent_effect 只能是 preserve、advance、complete 或 none。
   - safety 只能是 low_risk、reversible、commit 或 destructive。commit/destructive 不可作为无条件默认操作。
     - 普通游戏流程中的选卡并确认、领取奖励、关闭弹窗属于 low_risk/reversible；不要仅因为按钮文字是“确认”就标成 commit。
     - 只有消费稀缺资源、购买、覆盖存档、放弃进度或其他显著不可逆业务结果才使用 commit/destructive。
-  - 最多输出两个 steps；每一步都必须提供 expected_after，runtime 会在每步后观察多帧轨迹，禁止设计无条件连点宏。
+  - 优先输出一个 step，最多两个；每一步都必须提供 expected_after，runtime 会在每步后重新观察，禁止设计无条件连点宏。
   - expected_after.state_relation 只能是 must_leave、must_remain、may_leave。
     - 选择卡片等页面内步骤使用 must_remain。
     - 确认、关闭、推进等必须退出当前页面实例的步骤使用 must_leave。

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from state_machine.time_utils import now_iso as _now_iso
+from state_machine.page_handler.reactive import initial_cursor
 
 
 NO_PROGRESS_LIMIT = 2
@@ -122,6 +123,28 @@ def clear_continuation(runtime: dict[str, Any], visit_id: str, operation: str) -
     _continuations(runtime).pop(f"{visit_id}|{operation}", None)
 
 
+def _reactive_cursors(runtime: dict[str, Any]) -> dict[str, Any]:
+    value = runtime.get("visit_operation_reactive")
+    if not isinstance(value, dict):
+        value = {}
+        runtime["visit_operation_reactive"] = value
+    return value
+
+
+def reactive_cursor_for(runtime: dict[str, Any], visit_id: str, operation: str) -> dict[str, Any]:
+    key = f"{visit_id}|{operation}"
+    cursors = _reactive_cursors(runtime)
+    cursor = cursors.get(key)
+    if not isinstance(cursor, dict):
+        cursor = initial_cursor(visit_id=visit_id, operation=operation)
+        cursors[key] = cursor
+    return cursor
+
+
+def clear_reactive_cursor(runtime: dict[str, Any], visit_id: str, operation: str) -> None:
+    _reactive_cursors(runtime).pop(f"{visit_id}|{operation}", None)
+
+
 def record_no_progress(runtime: dict[str, Any], visit_id: str, operation: str, strategy_id: str, result: str) -> int:
     guard = _guard(runtime)
     key = _key(visit_id, operation, strategy_id)
@@ -176,6 +199,10 @@ def clear_visit_progress(runtime: dict[str, Any], visit_id: str) -> None:
     if isinstance(exploration, dict):
         for key in [key for key in exploration if key.startswith(f"{visit_id}|")]:
             del exploration[key]
+    reactive = runtime.get("visit_operation_reactive")
+    if isinstance(reactive, dict):
+        for key in [key for key in reactive if key.startswith(f"{visit_id}|")]:
+            del reactive[key]
 
 
 def reset_run_local_progress(runtime: dict[str, Any]) -> None:
@@ -193,5 +220,6 @@ def reset_run_local_progress(runtime: dict[str, Any]) -> None:
         "visit_operation_reviews",
         "visit_operation_continuations",
         "visit_operation_exploration",
+        "visit_operation_reactive",
     ):
         runtime[key] = {}
