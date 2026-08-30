@@ -15,6 +15,8 @@ from state_machine.io import _backup_json, _load_frame, _load_json, _normalize_p
 from state_machine.llm_tasks import _request_llm_condition_revision
 from state_machine.logger import FsmRunLogger
 from state_machine.matching import _condition_passed, _level, _select_enabled_conditions
+from state_machine.page_identity import IDENTITY_ROLES, build_match_clauses
+from state_machine.page_handler.reactive import merge_controller
 from state_machine.page_handler.store import apply_handler_patch, ensure_page_handler, handler_from_bootstrap, materialize_strategy_templates
 from state_machine.state_store import (
     _latest_screenshot_path,
@@ -87,13 +89,11 @@ def _try_merge_ambiguous_states(
         if loser_item is None:
             continue
         loser_dir, loser_meta = loser_item
-        winner_type = _normalize_page_type(_state_page_type(winner_meta))
-        loser_type = _normalize_page_type(_state_page_type(loser_meta))
+        winner_type = _normalize_page_type(winner_meta.get("page_family") or _state_page_type(winner_meta))
+        loser_type = _normalize_page_type(loser_meta.get("page_family") or _state_page_type(loser_meta))
         reason = ""
         if not winner_type or winner_type != loser_type:
-            reason = "different_or_missing_page_type"
-        elif _handler_operation_names(winner_meta) != _handler_operation_names(loser_meta):
-            reason = "different_operation_surface"
+            reason = "different_or_missing_page_family"
 
         frames: list[Any] = [frame_rgb]
         if not reason:
@@ -106,7 +106,7 @@ def _try_merge_ambiguous_states(
             deepcopy(cond)
             for meta in (winner_meta, loser_meta)
             for cond in meta.get("match_conditions", [])
-            if isinstance(cond, dict) and cond.get("condition_status", "active") == "active"
+            if isinstance(cond, dict) and cond.get("condition_status", "active") == "active" and str(cond.get("role") or "") in IDENTITY_ROLES
         ]
         common = [cond for cond in combined if not reason and all(_condition_passed(cond, vision, image) for image in frames)]
         if not reason and not common:
@@ -127,6 +127,18 @@ def _try_merge_ambiguous_states(
         _backup_json(winner_dir / "state.json")
         _backup_json(loser_dir / "state.json")
         winner_meta["match_conditions"] = common
+        winner_meta["match_clauses"] = build_match_clauses(common)
+        winner_handler = ensure_page_handler(winner_meta)
+        loser_handler = ensure_page_handler(loser_meta)
+        winner_policies = winner_handler.get("operation_policies") if isinstance(winner_handler.get("operation_policies"), dict) else {}
+        loser_policies = loser_handler.get("operation_policies") if isinstance(loser_handler.get("operation_policies"), dict) else {}
+        winner_default = winner_handler.get("default_operation") if isinstance(winner_handler.get("default_operation"), dict) else {}
+        target_name = str(winner_default.get("operation") or "")
+        target_policy = winner_policies.get(target_name) if target_name else None
+        if isinstance(target_policy, dict):
+            for loser_policy in loser_policies.values():
+                if isinstance(loser_policy, dict):
+                    target_policy["controller"] = merge_controller(target_policy.get("controller"), loser_policy.get("controller"))
         winner_samples = winner_meta.setdefault("samples", [])
         known_paths = {str(item.get("path")) for item in winner_samples if isinstance(item, dict)} if isinstance(winner_samples, list) else set()
         if isinstance(winner_samples, list):

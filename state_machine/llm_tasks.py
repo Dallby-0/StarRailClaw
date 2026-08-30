@@ -101,12 +101,15 @@ def _request_llm_payload(
     system_prompt: str,
     page_summaries: list[dict[str, Any]] | None = None,
     active_intent: dict[str, Any] | None = None,
+    previous_surface: dict[str, Any] | None = None,
+    previous_frame_rgb=None,
     raw_debug_dir: Path | None = None,
 ) -> dict[str, Any] | None:
     context = {
         "mode": "NORMAL",
         "known_page_types": page_summaries or [],
         "active_intent": active_intent or {},
+        "previous_surface": previous_surface or {},
         "instruction": (
             "请按 system 约定输出 JSON。先照常输出用于建立新状态的页面元素信息；"
             "possible_page_type 必须从 known_page_types.page_type 中选择，若都不像则输出 none。"
@@ -117,15 +120,22 @@ def _request_llm_payload(
             "如果 active_intent 非空，判断页面与 intent 的关系，并只为该 intent 或透明阻塞层提出操作。"
             "如果 active_intent 为空，仅当页面存在同识别异操作或操作必须跨多个页面保持语义时，才输出 intent_proposal；"
             "普通唯一推进页面不得创建 intent_proposal。"
+            "若 previous_surface 非空，第一张图片是前驱交互表面的样本，第二张是当前图片；"
+            "优先判断当前图是否只是同一交互表面的页内下一步，并填写 surface_relation/common_identity。"
+            "若是 same_surface_step，bootstrap operation 必须沿用 previous_surface 的完整页面目标语义，"
+            "不要按当前步骤按钮、具体事件或具体选项重新命名 operation。"
         ),
     }
     # State recognition and bootstrap action planning share exactly one image
     # request. Responses JSON Schema enforces syntax and shape server-side;
     # this call is deliberately independent from accumulated chat history.
+    images = [DoubaoClient.encode_image_to_data_url(frame_rgb)]
+    if previous_frame_rgb is not None:
+        images.insert(0, DoubaoClient.encode_image_to_data_url(previous_frame_rgb))
     resp = llm.responses_json_schema(
         system_prompt=system_prompt,
         user_text=json.dumps(context, ensure_ascii=False),
-        image_data_urls=[DoubaoClient.encode_image_to_data_url(frame_rgb)],
+        image_data_urls=images,
         schema_name="fsm_state_bootstrap",
         schema=state_bootstrap_json_schema(),
     )

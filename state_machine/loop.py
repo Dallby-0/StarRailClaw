@@ -20,6 +20,7 @@ from state_machine.io import (
     _build_system_prompt_with_experience,
     _ensure_fsm_resources,
     _load_json,
+    _load_frame,
     _load_runtime,
     _save_runtime,
 )
@@ -27,7 +28,8 @@ from state_machine.intent import active_intent, adopt_intent_proposal, ensure_in
 from state_machine.llm_tasks import _request_llm_payload
 from state_machine.logger import FsmRunLogger, summarize_match
 from state_machine.matching import _eval_state_match, _select_best_for_unknown
-from state_machine.merge import _try_merge_page_type
+from state_machine.family_merge import try_merge_same_surface
+from state_machine.page_identity import temporal_continuation_evidence
 from state_machine.progress_guard import reset_run_local_progress
 from state_machine.screen import _wait_for_unknown_screen_stable
 from state_machine.settlement import settle_pending_operation
@@ -38,6 +40,7 @@ from state_machine.state_store import (
     _iter_state_meta,
     _meta_for_state,
     _page_type_summaries,
+    _latest_screenshot_path,
 )
 from state_machine.tasks import configure_fsm_workspace, create_task_workspace, task_workspace_path
 
@@ -156,6 +159,17 @@ def run_agent_loop_fsm(
             # stale pre-creation snapshot.
             live_metas = _iter_state_meta()
             matches = [_eval_state_match(meta, sdir, vision, img) for sdir, meta in live_metas]
+            if not any(match.success for match in matches):
+                pending = runtime.get("pending_operation") if isinstance(runtime.get("pending_operation"), dict) else {}
+                temporal_state_id = str(pending.get("state_id") or runtime.get("pending_from_state_id") or "")
+                temporal_item = _meta_for_state(live_metas, temporal_state_id) if temporal_state_id else None
+                temporal_match = next((match for match in matches if match.state_id == temporal_state_id), None)
+                if temporal_item is not None and temporal_match is not None:
+                    evidence = temporal_continuation_evidence(temporal_item[1], vision, img)
+                    if evidence.get("accepted"):
+                        temporal_match.success = True
+                        temporal_match.temporal_continuation = True
+                        logger.event("temporal_surface_continuation", state_id=temporal_state_id, evidence=evidence)
             ocr_stats = vision.consume_ocr_stats()
             calls = int(ocr_stats["calls"])
             if calls > 0:
@@ -240,6 +254,27 @@ def run_agent_loop_fsm(
                 continue
             frame = stable_frame
             logger.text("[fsm] unknown state, requesting llm", "unknown_state")
+            predecessor_id = str(runtime.get("pending_from_state_id") or "")
+            predecessor_item = _meta_for_state(metas_for_resolution, predecessor_id) if predecessor_id else None
+            predecessor_frame = None
+            predecessor_context = None
+            if predecessor_item is not None:
+                predecessor_path = _latest_screenshot_path(predecessor_item[0])
+                predecessor_frame = _load_frame(predecessor_path) if predecessor_path is not None else None
+                predecessor_context = {
+                    "state_id": predecessor_id,
+                    "slug": predecessor_item[1].get("slug"),
+                    "page_type": predecessor_item[1].get("page_type"),
+                    "page_family": predecessor_item[1].get("page_family"),
+                    "description": predecessor_item[1].get("description"),
+                    "operations": list(
+                        (predecessor_item[1].get("page_handler") or {}).get("operation_policies", {}).keys()
+                    ) if isinstance(predecessor_item[1].get("page_handler"), dict) else [],
+                    "identity_elements": [
+                        {"brief": c.get("brief"), "role": c.get("role"), "kind": c.get("kind"), "params": c.get("params")}
+                        for c in predecessor_item[1].get("match_conditions", []) if isinstance(c, dict)
+                    ],
+                }
             payload = _request_llm_payload(
                 llm,
                 llm_session_id,
@@ -247,6 +282,8 @@ def run_agent_loop_fsm(
                 system_prompt,
                 _page_type_summaries(metas_for_resolution),
                 active_intent=intent_projection(active_intent(runtime)),
+                previous_surface=predecessor_context,
+                previous_frame_rgb=predecessor_frame,
                 raw_debug_dir=logger.llm_raw_dir,
             )
             runtime["llm_turn_count"] = int(runtime.get("llm_turn_count", 0)) + 1
@@ -267,15 +304,13 @@ def run_agent_loop_fsm(
             if proposed_intent is not None:
                 _save_runtime(runtime)
                 logger.event("intent_created_from_state_assessment", intent=intent_projection(proposed_intent))
-            merged = _try_merge_page_type(
-                llm=llm,
-                session_id=llm_session_id,
-                system_prompt=system_prompt,
+            merged = try_merge_same_surface(
                 frame_rgb=frame,
                 llm_payload=payload,
                 mapper=mapper,
                 vision=vision,
                 metas=metas_for_resolution,
+                predecessor_state_id=predecessor_id or None,
                 logger=logger,
             )
             if merged is None:

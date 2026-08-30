@@ -8,11 +8,12 @@ import cv2
 from agent.behavior_tree.coord_mapper import CoordinateMapper
 from agent.behavior_tree.vision import VisionEngine
 from state_machine.constants import SCHEMA_VERSION
-from state_machine.io import _normalize_page_type, _now_iso, _save_frame, _save_json, _slugify
+from state_machine.io import _load_frame, _normalize_page_type, _now_iso, _save_frame, _save_json, _slugify
 from state_machine.logger import FsmRunLogger
-from state_machine.matching import _level, _select_enabled_conditions
+from state_machine.matching import _level
+from state_machine.page_identity import IDENTITY_ROLES, build_match_clauses, initial_observations, normalize_elements, record_condition_observations
 from state_machine.page_handler.store import handler_from_bootstrap, materialize_strategy_templates
-from state_machine.state_store import _allocate_state_id, _ensure_unique_state_dir
+from state_machine.state_store import _allocate_state_id, _ensure_unique_state_dir, _iter_state_meta, _latest_screenshot_path
 
 
 def _conditions_from_elements(elements: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -21,6 +22,9 @@ def _conditions_from_elements(elements: list[dict[str, Any]]) -> list[dict[str, 
         if not isinstance(e, dict):
             continue
         etype = e.get("type")
+        role = str(e.get("role") or "diagnostic")
+        if role not in IDENTITY_ROLES or e.get("observable") is False:
+            continue
         bbox = e.get("bbox")
         if not (isinstance(bbox, list) and len(bbox) == 4):
             continue
@@ -36,11 +40,12 @@ def _conditions_from_elements(elements: list[dict[str, Any]]) -> list[dict[str, 
                     "params": {"text": text, "rect": bbox},
                     "weight": 1.0,
                     "brief": str(e.get("brief", "")),
-                    "role": str(e.get("role", "")),
+                    "role": role,
                     "stability": _level(e.get("stability"), "mid"),
                     "discrimination": _level(e.get("discrimination"), "mid"),
                     "condition_status": "active",
                     "bbox": bbox,
+                    "observations": initial_observations(),
                 }
             )
         elif etype == "pattern":
@@ -52,11 +57,12 @@ def _conditions_from_elements(elements: list[dict[str, Any]]) -> list[dict[str, 
                     "params": {"rect": bbox, "threshold": 0.8},
                     "weight": 1.0,
                     "brief": str(e.get("brief", "")),
-                    "role": str(e.get("role", "")),
+                    "role": role,
                     "stability": _level(e.get("stability"), "mid"),
                     "discrimination": _level(e.get("discrimination"), "mid"),
                     "condition_status": "active",
                     "bbox": bbox,
+                    "observations": initial_observations(),
                 }
             )
     return out
@@ -64,7 +70,7 @@ def _conditions_from_elements(elements: list[dict[str, Any]]) -> list[dict[str, 
 
 def _extract_region_templates(frame_rgb, mapper: CoordinateMapper, state_dir: Path, conditions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    t_idx = 1
+    t_idx = len(list(state_dir.glob("template_*.png"))) + 1
     for c in conditions:
         cc = dict(c)
         if cc.get("kind") == "region_template":
@@ -107,9 +113,11 @@ def _create_state_from_llm(
     state_id = _allocate_state_id()
     state_dir = _ensure_unique_state_dir(str(llm_payload.get("slug", "state")))
     _save_frame(state_dir / "screenshot_1.png", frame_rgb)
-    conds = _conditions_from_elements(llm_payload.get("elements", []))
+    elements = normalize_elements(llm_payload.get("elements", []), vision, frame_rgb)
+    conds = _conditions_from_elements(elements)
     conds = _extract_region_templates(frame_rgb, mapper, state_dir, conds)
-    conds, weak_match = _select_enabled_conditions(conds, vision, frame_rgb)
+    match_clauses = build_match_clauses(conds)
+    weak_match = len(match_clauses) == 1 and len(match_clauses[0].get("all", [])) == 1
     handler = handler_from_bootstrap(llm_payload.get("bootstrap_operations", []))
     strategy_ids = {
         str(strategy.get("strategy_id"))
@@ -138,7 +146,7 @@ def _create_state_from_llm(
         "created_at": _now_iso(),
         "updated_at": _now_iso(),
         "model_info": {"source": "llm", "weak_match": weak_match},
-        "elements": llm_payload.get("elements", []),
+        "elements": elements,
         "samples": [
             {
                 "path": str(state_dir / "screenshot_1.png"),
@@ -149,8 +157,20 @@ def _create_state_from_llm(
             }
         ],
         "match_conditions": conds,
+        "match_clauses": match_clauses,
         "page_handler": handler,
     }
+    record_condition_observations(state_meta, vision, frame_rgb, cohort="family_positive")
+    for other_dir, other_meta in _iter_state_meta():
+        other_family = _slugify(str(other_meta.get("page_family") or other_meta.get("page_type") or other_meta.get("slug") or ""))
+        if other_family == state_meta["page_family"]:
+            continue
+        record_condition_observations(other_meta, vision, frame_rgb, cohort="other_page")
+        _save_json(other_dir / "state.json", other_meta)
+        other_shot = _latest_screenshot_path(other_dir)
+        other_frame = _load_frame(other_shot) if other_shot is not None else None
+        if other_frame is not None:
+            record_condition_observations(state_meta, vision, other_frame, cohort="other_page")
     _save_json(state_dir / "state.json", state_meta)
     if logger is not None:
         logger.event(
@@ -160,7 +180,7 @@ def _create_state_from_llm(
             slug=state_meta["slug"],
             page_type=state_meta["page_type"],
             weak_match=weak_match,
-            elements_count=len(llm_payload.get("elements", [])),
+            elements_count=len(elements),
             bootstrap_operations_count=len(llm_payload.get("bootstrap_operations", [])),
             conditions=conds,
             screenshot_path=state_dir / "screenshot_1.png",

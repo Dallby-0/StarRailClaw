@@ -161,7 +161,7 @@ def test_provider_miss_is_not_globally_degraded() -> None:
     assert provider["fail_count"] == 1
 
 
-def test_v1_strategy_is_migrated_to_reactive_controller() -> None:
+def test_legacy_strategy_schema_is_rejected_instead_of_migrated() -> None:
     meta = {
         "page_handler": {
             "schema_version": "progressive_handler.v1",
@@ -179,10 +179,12 @@ def test_v1_strategy_is_migrated_to_reactive_controller() -> None:
             },
         }
     }
-    handler = ensure_page_handler(meta)
-    controller = _operation(handler)["controller"]
-    assert handler["schema_version"] == "progressive_handler.v2"
-    assert controller["providers"][0]["provider_id"] == "fixed_v1_click"
+    try:
+        ensure_page_handler(meta)
+    except ValueError as exc:
+        assert "fresh state workspace" in str(exc)
+    else:
+        raise AssertionError("legacy handler must not be silently migrated")
 
 
 def test_visit_cleanup_removes_reactive_cursor() -> None:

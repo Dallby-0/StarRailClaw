@@ -40,7 +40,7 @@ def _execute_state_action(
 
     state_meta = _load_json(state_dir / "state.json")
     action_id = "operation_main"
-    controller = {"type": "page_handler", "source": "progressive_handler.v2"}
+    controller = {"type": "page_handler", "source": "reactive_handler.v1"}
     _log(logger, f"[fsm][controller] state={state_id} type=page_handler", "controller_start", state_id=state_id, action_id=action_id, controller=controller)
     local_ok, local_frame = run_page_handler(
         emulator=emulator,

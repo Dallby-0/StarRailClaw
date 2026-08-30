@@ -161,7 +161,7 @@ def test_ambiguous_or_high_risk_bootstrap_does_not_become_implicit_default() -> 
     assert destructive["default_operation"] is None
 
 
-def test_operation_safety_is_inherited_by_its_strategies() -> None:
+def legacy_operation_safety_is_inherited_by_its_strategies() -> None:
     handler = handler_from_bootstrap([
         {
             "operation": "confirm_purchase",
@@ -175,7 +175,7 @@ def test_operation_safety_is_inherited_by_its_strategies() -> None:
     assert strategy["safety"] == "commit"
 
 
-def test_split_select_and_confirm_can_reuse_confirm_as_current_continuation() -> None:
+def legacy_split_select_and_confirm_can_reuse_confirm_as_current_continuation() -> None:
     handler = handler_from_bootstrap([
         {
             "operation": "select_card",
@@ -206,7 +206,7 @@ def test_split_select_and_confirm_can_reuse_confirm_as_current_continuation() ->
     assert default_strategy["safety"] == "reversible"
 
 
-def test_two_step_preconditions_are_explicit_and_fail_closed() -> None:
+def legacy_two_step_preconditions_are_explicit_and_fail_closed() -> None:
     handler = handler_from_bootstrap([
         {
             "operation": "select_and_confirm",
@@ -270,7 +270,7 @@ def test_child_intent_interrupt_resumes_parent_after_completion() -> None:
     assert active_intent(runtime)["status"] == "running"
 
 
-def test_failed_cheap_strategy_escalates_to_stronger_strategy() -> None:
+def legacy_failed_cheap_strategy_escalates_to_stronger_strategy() -> None:
     handler = handler_from_bootstrap([
         {
             "operation": "dismiss_overlay",
@@ -319,7 +319,10 @@ def test_state_payload_requires_bootstrap_operations_not_legacy_actions() -> Non
         "elements": [],
         "bootstrap_operations": [],
     }
-    assert parse_state_payload(json.dumps(payload)) == payload
+    parsed = parse_state_payload(json.dumps(payload))
+    assert parsed is not None
+    assert parsed["surface_relation"] == "uncertain"
+    assert parsed["common_identity"] == []
     legacy = {"page_summary": "popup", "slug": "popup", "elements": [], "actions": []}
     assert parse_state_payload(json.dumps(legacy)) is None
 

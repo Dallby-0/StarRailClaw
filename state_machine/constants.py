@@ -12,7 +12,7 @@ EXPERIENCE_PATH = FSM_DIR / "experience.md"
 TASK_SUMMARY_PATH = FSM_DIR / "task_summary.md"
 EXPERIENCE_WRITE_ENABLED = False
 
-SCHEMA_VERSION = "2.0.0"
+SCHEMA_VERSION = "3.0.0"
 ACTION_CLICK_WAIT_S = 1.0
 UNKNOWN_STABILITY_DIFF_THRESHOLD = 0.1
 UNKNOWN_STABILITY_SAMPLE_INTERVAL_S = 0.5
@@ -44,6 +44,8 @@ LLM_FSM_PROMPT_BASE = """你是视觉驱动游戏自动化的状态标注器和�
 强约束：
 - 必须输出严格 JSON 对象，字段必须符合约定。
 - elements: 每项必须有 type。
+  - 每项还必须标注 role：identity=跨该交互表面各步骤都稳定存在、可单独确认页面身份；identity_support=稳定但过于通用、只能与其他锚点组合；interaction=按钮/箭头/可操作控件；instance=事件名、卡片名、选项、奖励、正文等当前实例内容；diagnostic=仅供解释和排错。
+  - 只有 identity/identity_support 会进入全局 state matcher。interaction 只供 page handler 定位，instance/diagnostic 不得成为 state 身份。不要把具体事件名、选项文字、当前卡面或步骤按钮标成 identity。
   - elements 应优先服务于“页面匹配”，不是描述画面。优先输出最能稳定区分当前页面类型的元素。
   - 请尽量标注当前画面中潜在可用于匹配的 OCR 区域和模板区域；即使稳定性或区分度不高，也可以输出，但必须如实把 stability/discrimination 标为 mid 或 low，不要为了让元素看起来有用而虚高评分。
   - 低 stability 或低 discrimination 的元素仍有诊断、消歧、后续修复价值；不要因为它们不是最佳匹配条件就完全省略。
@@ -76,8 +78,11 @@ LLM_FSM_PROMPT_BASE = """你是视觉驱动游戏自动化的状态标注器和�
 - slug: 英文小写+下划线，简短可读。
 - possible_page_type: 如果当前页面可能属于已知页面类型，输出该类型英文名；否则输出 "none"。不要把具体实例名称当作页面类型。
 - page_family: 英文小写+下划线，表示可共享同类操作经验的稳定页面族；不知道时使用与 slug 相同的值。
+- surface_relation: 若提供了 previous_surface，上下两图仍是同一稳定交互表面、只是页内步骤不同，必须输出 same_surface_step；同族但应独立处理的阻塞层/结果层输出 same_family_new_surface；否则输出 different_surface；没有前图时输出 uncertain。
+- common_identity: 仅列出前后步骤共同保留的稳定身份元素，禁止填写具体事件名、选项或仅当前步骤存在的按钮。
 - bootstrap_operations: 数组。每项表示一种操作语义及其初始渐进策略，而不是无条件 state action。
   - operation 必须是稳定的短语义名，例如 dismiss_overlay、confirm、advance、select_candidate。
+  - 同一 page_family 的不同页内步骤必须复用同一个完整目标 operation；事件页建议使用 advance_event，选站页使用 select_station_and_confirm。禁止按当前按钮或具体选项另起 operation 名。
   - operation 必须表达“完成当前页面的一次完整推进”，但 bootstrap steps 只需描述当前截图中最明显、最低成本的下一步动作。
     - 如果页面需要先选择卡片再点击确认，operation 应命名为 select_and_confirm；通常只输出当前可见的选择动作。只有确认按钮当前也明确可见且顺序可靠时，才可给第二个 step。
     - 禁止把前后顺序必做的步骤拆成两个并列 bootstrap_operations；多个 operation 仅用于不同 intent/业务语义下互斥的操作选择。

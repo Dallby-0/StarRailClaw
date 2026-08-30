@@ -135,12 +135,12 @@ def _run_reactive_local(
                 if logger is not None:
                     logger.event("page_handler_reactive_generic", state_id=state_id, visit_id=visit_id, operation=command.operation, observation_epoch=int(epoch), result=info.get("result"), actions=info.get("actions", 0), attempts=info.get("attempts", []))
                 if info.get("result") == "left_state":
-                    clear_reactive_cursor(runtime, visit_id, command.operation)
-                    clear_visit_progress(runtime, visit_id)
-                    _save_runtime(runtime)
                     matches = matches_provider(current)
                     nxt = _resolve_transition_after_progress(state_id=state_id, action_id=action_id, matches=matches, graph=graph, runtime=runtime, prefer_reachable_first=prefer_reachable_first, logger=logger, reason_suffix="-reactive-generic")
                     if nxt is not None:
+                        clear_reactive_cursor(runtime, visit_id, command.operation)
+                        clear_visit_progress(runtime, visit_id)
+                        _save_runtime(runtime)
                         return "done", True, current, failed_attempts
                     ok, deferred = _defer_unknown_transition(runtime=runtime, state_id=state_id, action_id=action_id, logger=logger, frame=current, reason="reactive-generic-left-state")
                     return "done", ok, deferred, failed_attempts
@@ -178,12 +178,12 @@ def _run_reactive_local(
             if logger is not None:
                 logger.event("page_handler_reactive_result", state_id=state_id, visit_id=visit_id, operation=command.operation, provider_id=provider_id, provider_kind=kind, observation_epoch=cursor.get("observation_epoch"), result=outcome, actions=info.get("actions", 0), attempts=info.get("attempts", []))
             if outcome == "state_left":
-                clear_reactive_cursor(runtime, visit_id, command.operation)
-                clear_visit_progress(runtime, visit_id)
-                _save_runtime(runtime)
                 matches = matches_provider(current)
                 nxt = _resolve_transition_after_progress(state_id=state_id, action_id=action_id, matches=matches, graph=graph, runtime=runtime, prefer_reachable_first=prefer_reachable_first, logger=logger, reason_suffix="-reactive-exploration")
                 if nxt is not None:
+                    clear_reactive_cursor(runtime, visit_id, command.operation)
+                    clear_visit_progress(runtime, visit_id)
+                    _save_runtime(runtime)
                     return "done", True, current, failed_attempts
                 ok, deferred = _defer_unknown_transition(runtime=runtime, state_id=state_id, action_id=action_id, logger=logger, frame=current, reason="reactive-exploration-left-state")
                 return "done", ok, deferred, failed_attempts
@@ -251,11 +251,11 @@ def _run_reactive_local(
         if logger is not None:
             logger.event("page_handler_reactive_result", state_id=state_id, visit_id=visit_id, action_id=action_id, operation=command.operation, provider_id=provider_id, provider_kind=kind, observation_epoch=cursor.get("observation_epoch"), result=outcome, changed=changed, diff_score=diff_score, candidates=[summarize_match(m) for m in matches])
         if left_state:
-            clear_reactive_cursor(runtime, visit_id, command.operation)
-            clear_visit_progress(runtime, visit_id)
-            _save_runtime(runtime)
             nxt = _resolve_transition_after_progress(state_id=state_id, action_id=action_id, matches=matches, graph=graph, runtime=runtime, prefer_reachable_first=prefer_reachable_first, logger=logger, reason_suffix="-reactive")
             if nxt is not None:
+                clear_reactive_cursor(runtime, visit_id, command.operation)
+                clear_visit_progress(runtime, visit_id)
+                _save_runtime(runtime)
                 return "done", True, current, failed_attempts
             ok, deferred = _defer_unknown_transition(runtime=runtime, state_id=state_id, action_id=action_id, logger=logger, frame=current, reason="reactive-original-state-no-longer-matched")
             return "done", ok, deferred, failed_attempts

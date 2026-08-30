@@ -123,6 +123,42 @@ class VisionEngine:
             self.log_fn(f"[vision][ocr] done candidates={len(out)} logical_rect={rect}")
         return out
 
+    def ocr_blocks(self, frame_rgb: np.ndarray, rect: list[int] | None, white_text: bool = False) -> list[dict[str, Any]]:
+        """Detect individual OCR lines inside a region.
+
+        ``ocr`` intentionally remains the cheap single-line recognizer used by
+        runtime match conditions.  State construction needs the detector once
+        so an LLM bbox that accidentally spans two lines can be normalized
+        into matchable single-line elements before it is persisted.
+        """
+        real_rect = self._real_area(frame_rgb, rect)
+        self.ocr_call_count += 1
+        started = time.perf_counter()
+        try:
+            entries = sr_ocr.ocr_entries(frame_rgb, real_rect, lang="zhs", white=white_text)
+            if not entries and not white_text:
+                entries = sr_ocr.ocr_entries(frame_rgb, real_rect, lang="zhs", white=True)
+        except Exception as exc:  # noqa: BLE001
+            self.ocr_error_count += 1
+            self.ocr_elapsed_s += time.perf_counter() - started
+            self.log_fn(f"[vision][ocr-blocks] error type={type(exc).__name__} message={exc} logical_rect={rect}")
+            return []
+        ox, oy, _, _ = real_rect
+        out: list[dict[str, Any]] = []
+        for entry in entries:
+            bx, by, bw, bh = entry.get("bbox", (0, 0, 0, 0))
+            if int(bw) <= 0 or int(bh) <= 0:
+                continue
+            out.append({
+                "text": str(entry.get("text", "")).strip(),
+                "conf": float(entry.get("conf", 0.0) or 0.0),
+                "bbox": (int(bx) + ox, int(by) + oy, int(bw), int(bh)),
+            })
+        self.ocr_elapsed_s += time.perf_counter() - started
+        if out:
+            self.ocr_success_count += 1
+        return out
+
     def reset_ocr_stats(self) -> None:
         self.ocr_call_count = 0
         self.ocr_success_count = 0

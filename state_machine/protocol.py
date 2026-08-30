@@ -19,12 +19,14 @@ def state_bootstrap_json_schema() -> dict[str, Any]:
     level = {"type": "string", "enum": ["high", "mid", "low"]}
     bbox = {"type": "array", "items": {"type": "integer"}, "minItems": 4, "maxItems": 4}
     empty_object = _closed_object({})
+    role = {"type": "string", "enum": ["identity", "identity_support", "interaction", "instance", "diagnostic"]}
 
     text_element = _closed_object({
         "type": {"type": "string", "enum": ["text_line"]},
         "text": {"type": "string"},
         "bbox": bbox,
         "brief": {"type": "string"},
+        "role": role,
         "stability": level,
         "discrimination": level,
     })
@@ -32,6 +34,7 @@ def state_bootstrap_json_schema() -> dict[str, Any]:
         "type": {"type": "string", "enum": ["pattern"]},
         "bbox": bbox,
         "brief": {"type": "string"},
+        "role": role,
         "stability": level,
         "discrimination": level,
     })
@@ -102,6 +105,8 @@ def state_bootstrap_json_schema() -> dict[str, Any]:
         "slug": {"type": "string", "pattern": "^[a-z0-9]+(?:_[a-z0-9]+)*$"},
         "possible_page_type": {"type": "string"},
         "page_family": {"type": "string", "pattern": "^[a-z0-9]+(?:_[a-z0-9]+)*$"},
+        "surface_relation": {"type": "string", "enum": ["same_surface_step", "same_family_new_surface", "different_surface", "uncertain"]},
+        "common_identity": {"type": "array", "items": {"type": "string"}, "maxItems": 6},
         "elements": {"type": "array", "items": {"anyOf": [text_element, pattern_element]}, "maxItems": 8},
         "intent_assessment": _closed_object({
             "relation": {"type": "string", "enum": ["expected_step", "blocking_overlay", "completion_evidence", "unrelated", "contradiction", "unknown"]},
@@ -144,4 +149,6 @@ def parse_state_payload(text: str) -> dict[str, Any] | None:
     if not isinstance(payload.get("elements"), list) or not isinstance(payload.get("bootstrap_operations"), list):
         return None
     payload.setdefault("possible_page_type", "none")
+    payload.setdefault("surface_relation", "uncertain")
+    payload.setdefault("common_identity", [])
     return payload

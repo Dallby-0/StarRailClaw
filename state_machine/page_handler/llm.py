@@ -177,18 +177,6 @@ def request_handler_repair(
                                 "click_offset": [0, 0]
                             }]
                         },
-                        "strategies": [{
-                            "strategy_id": "stable id",
-                            "level": "integer; stronger than failed strategy",
-                            "status": "proposed",
-                            "steps": [{
-                                "step_id": "short id",
-                                "resolver": {"type": "fixed_point|region_template|run_preset", "x": 0, "y": 0, "template_bbox": [0, 0, 0, 0], "search_rect": [0, 0, 0, 0], "threshold": 0.82, "name": ""},
-                                "expected_after": {"state_relation": "must_leave|must_remain|may_leave", "reentry_policy": "forbid|new_visit|same_visit"},
-                                "emits_on_success": {"type": "semantic event"},
-                                "brief": "short string",
-                            }],
-                        }],
                     }],
                 },
                 "event": {"type": "optional event already evident on current page", "facts": {}},

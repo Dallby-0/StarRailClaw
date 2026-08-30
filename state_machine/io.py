@@ -125,8 +125,9 @@ def _ensure_fsm_resources() -> None:
         FSM_SCHEMA_PATH,
         {
             "schema_version": SCHEMA_VERSION,
-            "required_fields": ["page_summary", "slug", "possible_page_type", "page_family", "elements", "bootstrap_operations"],
+            "required_fields": ["page_summary", "slug", "possible_page_type", "page_family", "surface_relation", "common_identity", "elements", "bootstrap_operations"],
             "element_types": ["text_line", "pattern"],
+            "element_roles": ["identity", "identity_support", "interaction", "instance", "diagnostic"],
             "element_levels": ["high", "mid", "low"],
             "resolver_types": ["fixed_point", "region_template", "run_preset"],
         },

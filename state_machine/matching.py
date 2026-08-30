@@ -19,6 +19,8 @@ class MatchResult:
     passed_all: int
     total_all: int
     condition_results: list[dict[str, Any]] | None = None
+    matched_clause: int | None = None
+    temporal_continuation: bool = False
 
 
 def _ocr_lines(vision: VisionEngine, frame_rgb, rect: list[int] | None) -> list[str]:
@@ -136,7 +138,15 @@ def _eval_state_match(
     include_disabled: bool = False,
 ) -> MatchResult:
     conds = [c for c in meta.get("match_conditions", []) if isinstance(c, dict)]
-    enabled_conds = [c for c in conds if c.get("enabled", False)]
+    by_id = {str(c.get("id") or ""): c for c in conds}
+    raw_clauses = meta.get("match_clauses") if isinstance(meta.get("match_clauses"), list) else []
+    clauses = [
+        [by_id[cid] for cid in raw.get("all", []) if cid in by_id]
+        for raw in raw_clauses
+        if isinstance(raw, dict) and isinstance(raw.get("all"), list)
+    ]
+    clauses = [clause for clause in clauses if clause]
+    enabled_conds = list({id(c): c for clause in clauses for c in clause}.values()) if clauses else [c for c in conds if c.get("enabled", False)]
     eval_conds = conds if include_disabled else enabled_conds
     condition_results: list[dict[str, Any]] = []
     passed_by_id: dict[int, bool] = {}
@@ -148,7 +158,11 @@ def _eval_state_match(
     passed_all = sum(1 for c in conds if passed_by_id.get(id(c), False))
     total_enabled = len(enabled_conds)
     total_all = len(conds) if include_disabled else total_enabled
-    success = (passed_enabled == total_enabled) if total_enabled > 0 else False
+    matched_clause = next(
+        (index for index, clause in enumerate(clauses) if all(passed_by_id.get(id(c), False) for c in clause)),
+        None,
+    )
+    success = matched_clause is not None if clauses else ((passed_enabled == total_enabled) if total_enabled > 0 else False)
     return MatchResult(
         state_id=str(meta.get("state_id", "")),
         state_dir=state_dir,
@@ -158,6 +172,7 @@ def _eval_state_match(
         passed_all=passed_all,
         total_all=total_all,
         condition_results=condition_results,
+        matched_clause=matched_clause,
     )
 
 

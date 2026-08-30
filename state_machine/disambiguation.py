@@ -77,7 +77,18 @@ def _try_exclude_current_from_losers(
             failures[loser.state_id] = "no_positive_samples"
             continue
         conds = [c for c in loser_meta.get("match_conditions", []) if isinstance(c, dict)]
-        disabled = [c for c in conds if not c.get("enabled", False) and c.get("condition_status", "active") == "active"]
+        clauses = loser_meta.get("match_clauses") if isinstance(loser_meta.get("match_clauses"), list) else []
+        referenced = {
+            str(cid)
+            for clause in clauses if isinstance(clause, dict)
+            for cid in clause.get("all", []) if isinstance(clause.get("all"), list)
+        }
+        disabled = [
+            c for c in conds
+            if str(c.get("id") or "") not in referenced
+            and c.get("condition_status", "active") == "active"
+            and str(c.get("role") or "") == "identity_support"
+        ]
         candidates: list[dict[str, Any]] = []
         for cond in disabled:
             current_ok, _ = _condition_eval(cond, vision, frame_rgb)
@@ -89,11 +100,16 @@ def _try_exclude_current_from_losers(
             failures[loser.state_id] = "no_condition_passes_loser_samples_and_fails_current"
             continue
         selected = None
-        # Conditions are conjunctive. Enable candidates one at a time and
-        # re-run the actual matcher after every mutation; stop only when this
-        # loser no longer matches the disambiguated frame.
+        # Clauses are OR-of-AND. Strengthening must add the supporting anchor
+        # to every alternative clause; merely toggling ``enabled`` would not
+        # affect a v3 matcher.
         for candidate in sorted(candidates, key=_condition_rank, reverse=True):
-            candidate["enabled"] = True
+            candidate_id = str(candidate.get("id") or "")
+            for clause in clauses:
+                if not isinstance(clause, dict) or not isinstance(clause.get("all"), list):
+                    continue
+                if candidate_id not in clause["all"]:
+                    clause["all"].append(candidate_id)
             selected = candidate
             check = _eval_state_match(loser_meta, loser_dir, vision, frame_rgb)
             if not check.success:
