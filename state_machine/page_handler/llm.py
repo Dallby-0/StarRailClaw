@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from agent.llm_client import DoubaoClient
+from agent.responses_protocol import response_output_text
 from state_machine.constants import LLM_PARSE_RETRY
 from state_machine.llm_tasks import _apply_reasoning_effort, _build_user_message_from_frame, _build_user_message_from_two_frames, _normalize_assistant_text, _save_llm_raw_debug
 from state_machine.logger import FsmRunLogger
@@ -30,6 +31,124 @@ def parse_handler_response(text: str) -> dict[str, Any] | None:
         return None
     payload.setdefault("event", {})
     return payload
+
+
+def parse_progress_audit(text: str) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    verdict = str(payload.get("verdict") or "").strip().lower()
+    if verdict not in {"progressing", "new_instance", "stalled", "looping", "uncertain"}:
+        return None
+    confidence = str(payload.get("confidence") or "low").strip().lower()
+    if confidence not in {"high", "mid", "low"}:
+        confidence = "low"
+    evidence = payload.get("evidence") if isinstance(payload.get("evidence"), list) else []
+    return {
+        "verdict": verdict,
+        "confidence": confidence,
+        "reason": str(payload.get("reason") or "")[:500],
+        "evidence": [str(item)[:240] for item in evidence[:8]],
+    }
+
+
+def request_progress_audit(
+    *,
+    llm: DoubaoClient,
+    session_id: str,
+    state_meta: dict[str, Any],
+    command: dict[str, Any],
+    cursor: dict[str, Any],
+    observations: list[dict[str, Any]],
+    logger: FsmRunLogger | None,
+) -> dict[str, Any] | None:
+    """Judge a short visual trajectory; runtime alone owns capacity values."""
+    usable = [item for item in observations if isinstance(item, dict) and item.get("frame") is not None]
+    if len(usable) < 2:
+        return None
+    selected = usable if len(usable) <= 4 else [usable[0], *usable[-3:]]
+    trajectory = []
+    for index, item in enumerate(selected):
+        trajectory.append({
+            "frame_index": index,
+            "provider_id": item.get("provider_id"),
+            "provider_kind": item.get("provider_kind"),
+            "outcome": item.get("outcome"),
+            "changed": item.get("changed"),
+            "diff_score": item.get("diff_score"),
+            "action_count": item.get("action_count", 0),
+            "observation_epoch": item.get("observation_epoch"),
+            "note": str(item.get("note") or "")[:240],
+        })
+    context = {
+        "mode": "REACTIVE_PROGRESS_AUDIT",
+        "instruction": (
+            "这些图片按时间顺序展示同一 page family 最近的一段动作轨迹。"
+            "请判断流程是否在产生实际业务推进，不要把动画、闪烁、选中高亮或无意义来回切换当成推进。"
+            "如果完成了一轮操作后出现新的同类页面实例，输出 new_instance；"
+            "如果步骤或内容持续向目标前进，输出 progressing；若没有有效推进输出 stalled；"
+            "若画面和动作序列重复形成循环输出 looping；证据不足输出 uncertain。"
+            "你只负责分类，不得建议、猜测或输出任何动作次数、上限、扩容量或新操作。只输出严格 JSON。"
+        ),
+        "state": {
+            "state_id": state_meta.get("state_id"),
+            "slug": state_meta.get("slug"),
+            "page_type": state_meta.get("page_type"),
+            "page_family": state_meta.get("page_family"),
+            "description": str(state_meta.get("description") or "")[:240],
+        },
+        "effective_command": command,
+        "runtime_summary": {
+            "total_actions": int(cursor.get("total_actions", 0) or 0),
+            "observation_epoch": int(cursor.get("observation_epoch", 1) or 1),
+            "capacity_extensions": int(cursor.get("capacity_extensions", 0) or 0),
+        },
+        "trajectory": trajectory,
+        "output_schema": {
+            "verdict": "progressing|new_instance|stalled|looping|uncertain",
+            "confidence": "high|mid|low",
+            "reason": "short reason based on temporal evidence",
+            "evidence": ["short visible or action-sequence evidence"],
+        },
+    }
+    audit_system_prompt = (
+        "你是游戏自动化运行轨迹审计器。你只根据按时间排序的截图和动作摘要判断是否实际推进、"
+        "进入同类新实例、停滞或循环。不要规划动作，不要输出任何次数或容量。必须只输出约定 JSON。"
+    )
+    try:
+        resp = llm.responses_json_schema(
+            system_prompt=audit_system_prompt,
+            user_text=json.dumps(context, ensure_ascii=False),
+            image_data_urls=[DoubaoClient.encode_image_to_data_url(item["frame"]) for item in selected],
+            schema_name="reactive_progress_audit",
+            schema={
+                "type": "object",
+                "properties": {
+                    "verdict": {"type": "string", "enum": ["progressing", "new_instance", "stalled", "looping", "uncertain"]},
+                    "confidence": {"type": "string", "enum": ["high", "mid", "low"]},
+                    "reason": {"type": "string"},
+                    "evidence": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+                },
+                "required": ["verdict", "confidence", "reason", "evidence"],
+                "additionalProperties": False,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        _log(
+            logger,
+            f"[fsm][handler][progress-audit] request failed type={type(exc).__name__}",
+            "llm_progress_audit_error",
+            error_type=type(exc).__name__,
+            error_message=str(exc)[:300],
+        )
+        return None
+    raw = response_output_text(resp)
+    _save_llm_raw_debug(session_id, 1, raw, "progress_audit", logger.llm_raw_dir if logger is not None else None)
+    _log(logger, f"[fsm][handler][progress-audit] raw={raw[:600]}", "llm_progress_audit_raw", raw_preview=raw[:600])
+    return parse_progress_audit(raw)
 
 
 def request_same_state_review(

@@ -16,8 +16,8 @@ from state_machine.logger import FsmRunLogger, summarize_match
 from state_machine.matching import _find_match_by_state
 from state_machine.page_handler.actions import execute_action, resolve_strategy_step
 from state_machine.page_handler.exploration import run_exploration
-from state_machine.page_handler.llm import request_handler_repair, request_same_state_review
-from state_machine.page_handler.reactive import advance_observation, mark_provider_result, record_provider_attempt, select_provider
+from state_machine.page_handler.llm import request_handler_repair, request_progress_audit, request_same_state_review
+from state_machine.page_handler.reactive import advance_observation, apply_progress_audit, ensure_progress_capacity, mark_provider_result, progress_capacity_exhausted, record_provider_attempt, select_provider
 from state_machine.page_handler.review_protocol import result_for_same_state_verdict
 from state_machine.page_handler.store import apply_handler_patch, append_episode, continuation_patch_from_sibling, ensure_page_handler, mark_strategy_result, materialize_strategy_templates, promote_operation_to_default, select_strategy
 from state_machine.progress_guard import blocked_strategies, clear_continuation, clear_reactive_cursor, clear_visit_progress, consume_continuation, continuation_for, grant_continuation, operation_exhausted, reactive_cursor_for, record_attempt, record_no_progress, record_repair, record_review, repair_exhausted, review_exhausted
@@ -75,6 +75,14 @@ def _reactive_action(provider: dict[str, Any], frame, vision: VisionEngine) -> t
     return resolve_strategy_step(synthetic, 0, frame, vision)
 
 
+def _remember_progress_observation(history: list[dict[str, Any]], frame, **fields: Any) -> None:
+    item = {"frame": frame, **fields}
+    history.append(item)
+    if len(history) > 6:
+        # Preserve the episode entry frame and the five most recent outcomes.
+        del history[1 : len(history) - 5]
+
+
 def _run_reactive_local(
     *,
     emulator: EmulatorClient,
@@ -92,6 +100,8 @@ def _run_reactive_local(
     current,
     matches_provider,
     runtime: dict[str, Any],
+    llm: DoubaoClient,
+    llm_session_id: str,
     graph: dict[str, Any],
     prefer_reachable_first: bool,
     logger: FsmRunLogger | None,
@@ -101,10 +111,115 @@ def _run_reactive_local(
     cursor = reactive_cursor_for(runtime, visit_id, command.operation)
     failed_attempts: list[dict[str, Any]] = []
     made_progress = False
-    max_actions = max(1, min(int(controller.get("max_actions", LOCAL_FLOW_MAX_STEPS) or LOCAL_FLOW_MAX_STEPS), 24))
-    max_rounds = max(1, min(int(controller.get("max_observation_rounds", 6) or 6), 12))
+    ensure_progress_capacity(cursor, controller)
+    observations: list[dict[str, Any]] = []
+    _remember_progress_observation(
+        observations,
+        current,
+        provider_id=None,
+        provider_kind=None,
+        outcome="episode_entry",
+        changed=None,
+        diff_score=None,
+        action_count=0,
+        observation_epoch=int(cursor.get("observation_epoch", 1) or 1),
+    )
 
-    while int(cursor.get("total_actions", 0) or 0) < max_actions and int(cursor.get("observation_epoch", 1) or 1) <= max_rounds:
+    while True:
+        exhausted_reasons = progress_capacity_exhausted(cursor)
+        if exhausted_reasons:
+            total_actions = int(cursor.get("total_actions", 0) or 0)
+            observation_epoch = int(cursor.get("observation_epoch", 1) or 1)
+            already_audited = (
+                int(cursor.get("last_progress_audit_action", -1) or -1) == total_actions
+                and int(cursor.get("last_progress_audit_observation", -1) or -1) == observation_epoch
+            )
+            audit_allowed = str(policy.get("safety") or "unknown") in {"low_risk", "reversible"}
+            audit_requested = audit_allowed and not already_audited and len(observations) >= 2
+            audit = request_progress_audit(
+                llm=llm,
+                session_id=llm_session_id,
+                state_meta=state_meta,
+                command=command.to_dict(),
+                cursor=cursor,
+                observations=observations,
+                logger=logger,
+            ) if audit_requested else None
+            cursor["last_progress_audit_action"] = total_actions
+            cursor["last_progress_audit_observation"] = observation_epoch
+            if audit_requested:
+                runtime["llm_turn_count"] = int(runtime.get("llm_turn_count", 0) or 0) + 1
+            decision = apply_progress_audit(
+                cursor,
+                str(audit.get("verdict") or "invalid") if isinstance(audit, dict) else "invalid",
+                str(audit.get("confidence") or "low") if isinstance(audit, dict) else "low",
+            )
+            audit_record = {
+                "created_at": _now_iso(),
+                "reasons": exhausted_reasons,
+                "total_actions": total_actions,
+                "observation_epoch": observation_epoch,
+                "audit": audit,
+                "decision": decision,
+                "skipped_duplicate": already_audited,
+                "audit_requested": audit_requested,
+                "audit_allowed": audit_allowed,
+            }
+            audits = cursor.get("progress_audits") if isinstance(cursor.get("progress_audits"), list) else []
+            cursor["progress_audits"] = audits
+            audits.append(audit_record)
+            del audits[:-8]
+            _save_runtime(runtime)
+            if logger is not None:
+                logger.event(
+                    "page_handler_progress_capacity_audit",
+                    state_id=state_id,
+                    visit_id=visit_id,
+                    operation=command.operation,
+                    exhausted_reasons=exhausted_reasons,
+                    audit=audit,
+                    decision=decision,
+                    total_actions=total_actions,
+                    observation_epoch=observation_epoch,
+                    skipped_duplicate=already_audited,
+                    audit_requested=audit_requested,
+                    audit_allowed=audit_allowed,
+                )
+            if decision.get("granted"):
+                _log(
+                    logger,
+                    f"[fsm][handler][capacity] extended state={state_id} operation={command.operation} "
+                    f"kind={decision.get('grant_kind')} before={decision.get('before')} after={decision.get('after')}",
+                    "page_handler_capacity_extended",
+                    state_id=state_id,
+                    visit_id=visit_id,
+                    operation=command.operation,
+                    audit=audit,
+                    decision=decision,
+                )
+                continue
+            _log(
+                logger,
+                f"[fsm][handler][capacity] denied state={state_id} operation={command.operation} "
+                f"reasons={exhausted_reasons} verdict={audit.get('verdict') if isinstance(audit, dict) else 'invalid'}",
+                "page_handler_capacity_denied",
+                state_id=state_id,
+                visit_id=visit_id,
+                operation=command.operation,
+                exhausted_reasons=exhausted_reasons,
+                audit=audit,
+                decision=decision,
+            )
+            failed_attempts.append({
+                "provider_id": "$progress_audit",
+                "result": "capacity_not_extended",
+                "reasons": exhausted_reasons,
+                "audit": audit,
+                "decision": decision,
+            })
+            return "repair", made_progress, current, failed_attempts
+
+        action_capacity = int(cursor.get("action_capacity", LOCAL_FLOW_MAX_STEPS) or LOCAL_FLOW_MAX_STEPS)
         provider = select_provider(controller, cursor)
         if provider is None:
             # Preserve the existing low-risk generic exploration as the last
@@ -116,7 +231,8 @@ def _run_reactive_local(
             allow_generic = str(policy.get("safety", "unknown")) in {"low_risk", "reversible"}
             if allow_generic and epoch not in {str(value) for value in generic_epochs}:
                 generic_epochs.append(epoch)
-                remaining = max_actions - int(cursor.get("total_actions", 0) or 0)
+                remaining = action_capacity - int(cursor.get("total_actions", 0) or 0)
+                before_exploration = current
                 ok, explored_frame, info = run_exploration(
                     emulator=emulator,
                     mapper=mapper,
@@ -131,6 +247,19 @@ def _run_reactive_local(
                 )
                 record_provider_attempt(cursor, {"provider_id": "$generic_exploration"}, action_count=int(info.get("actions", 0) or 0))
                 current = explored_frame
+                changed, diff_score = _screen_changed(before_exploration, explored_frame)
+                _remember_progress_observation(
+                    observations,
+                    current,
+                    provider_id="$generic_exploration",
+                    provider_kind="exploration",
+                    outcome=str(info.get("result") or "unknown"),
+                    changed=changed,
+                    diff_score=diff_score,
+                    action_count=int(info.get("actions", 0) or 0),
+                    observation_epoch=int(cursor.get("observation_epoch", 1) or 1),
+                    note="generic bounded exploration",
+                )
                 _save_runtime(runtime)
                 if logger is not None:
                     logger.event("page_handler_reactive_generic", state_id=state_id, visit_id=visit_id, operation=command.operation, observation_epoch=int(epoch), result=info.get("result"), actions=info.get("actions", 0), attempts=info.get("attempts", []))
@@ -154,7 +283,8 @@ def _run_reactive_local(
         provider_id = str(provider.get("provider_id") or "")
         kind = str(provider.get("kind") or "action")
         if kind == "exploration":
-            remaining = max_actions - int(cursor.get("total_actions", 0) or 0)
+            remaining = action_capacity - int(cursor.get("total_actions", 0) or 0)
+            before_exploration = current
             ok, post, info = run_exploration(
                 emulator=emulator,
                 mapper=mapper,
@@ -169,6 +299,19 @@ def _run_reactive_local(
             )
             record_provider_attempt(cursor, provider, action_count=int(info.get("actions", 0) or 0))
             outcome = "state_left" if info.get("result") == "left_state" else "changed_same_state" if ok else "no_change"
+            changed, diff_score = _screen_changed(before_exploration, post)
+            _remember_progress_observation(
+                observations,
+                post,
+                provider_id=provider_id,
+                provider_kind="exploration",
+                outcome=outcome,
+                changed=changed,
+                diff_score=diff_score,
+                action_count=int(info.get("actions", 0) or 0),
+                observation_epoch=int(cursor.get("observation_epoch", 1) or 1),
+                note=str(info.get("result") or ""),
+            )
             mark_provider_result(controller, provider_id, outcome)
             append_episode(handler, {"state_id": state_id, "visit_id": visit_id, "command": command.to_dict(), "provider_id": provider_id, "controller": "reactive_local", "result": outcome, "exploration": info})
             current = post
@@ -239,6 +382,18 @@ def _run_reactive_local(
         current_match = _find_match_by_state(matches, state_id)
         left_state = current_match is None or not current_match.success
         outcome = "state_left" if left_state else "changed_same_state" if changed else "no_change"
+        _remember_progress_observation(
+            observations,
+            post,
+            provider_id=provider_id,
+            provider_kind=kind,
+            outcome=outcome,
+            changed=changed,
+            diff_score=diff_score,
+            action_count=1,
+            observation_epoch=int(cursor.get("observation_epoch", 1) or 1),
+            note=str(provider.get("brief") or ""),
+        )
         runtime["pending_operation"] = None
         mark_provider_result(controller, provider_id, outcome)
         event = _event_for_success(command, action_info, final_step=left_state) if outcome in {"state_left", "changed_same_state"} else None
@@ -328,6 +483,8 @@ def run_page_handler(
                 current=current,
                 matches_provider=matches_provider,
                 runtime=runtime,
+                llm=llm,
+                llm_session_id=llm_session_id,
                 graph=graph,
                 prefer_reachable_first=prefer_reachable_first,
                 logger=logger,

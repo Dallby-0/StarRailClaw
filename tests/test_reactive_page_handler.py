@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from state_machine.page_handler.reactive import (
     advance_observation,
+    apply_progress_audit,
+    ensure_progress_capacity,
     mark_provider_result,
     merge_controller,
+    progress_capacity_exhausted,
     record_provider_attempt,
     select_provider,
 )
 from state_machine.page_handler.store import apply_handler_patch, ensure_page_handler, handler_from_bootstrap
+from state_machine.page_handler.llm import parse_progress_audit
 from state_machine.progress_guard import clear_visit_progress, reactive_cursor_for
 
 
@@ -193,3 +197,76 @@ def test_visit_cleanup_removes_reactive_cursor() -> None:
     assert runtime["visit_operation_reactive"]
     clear_visit_progress(runtime, "004:1")
     assert runtime["visit_operation_reactive"] == {}
+
+
+def test_progress_capacity_expands_by_fixed_runtime_rule() -> None:
+    cursor = {
+        "total_actions": 12,
+        "observation_epoch": 7,
+        "action_capacity": 0,
+        "observation_capacity": 0,
+    }
+    ensure_progress_capacity(cursor, {"max_actions": 12, "max_observation_rounds": 6})
+    assert progress_capacity_exhausted(cursor) == ["actions", "observations"]
+
+    decision = apply_progress_audit(cursor, "progressing", "mid")
+    assert decision == {
+        "granted": True,
+        "grant_kind": "progress_extension",
+        "before": {"actions": 12, "observations": 6},
+        "after": {"actions": 20, "observations": 10},
+        "extensions": 1,
+    }
+    assert progress_capacity_exhausted(cursor) == []
+
+
+def test_progress_capacity_refuses_stall_and_limits_uncertain_probe() -> None:
+    cursor = {
+        "total_actions": 12,
+        "observation_epoch": 7,
+        "action_capacity": 12,
+        "observation_capacity": 6,
+        "capacity_extensions": 0,
+        "uncertain_probe_used": False,
+    }
+    stalled = apply_progress_audit(cursor, "stalled", "high")
+    assert stalled["granted"] is False
+    assert cursor["action_capacity"] == 12
+
+    probe = apply_progress_audit(cursor, "uncertain", "mid")
+    assert probe["grant_kind"] == "uncertain_probe"
+    assert probe["after"] == {"actions": 14, "observations": 7}
+
+    second_probe = apply_progress_audit(cursor, "uncertain", "high")
+    assert second_probe["granted"] is False
+    assert cursor["action_capacity"] == 14
+
+
+def test_progress_capacity_has_fixed_extension_count_limit() -> None:
+    cursor = {
+        "total_actions": 12,
+        "observation_epoch": 7,
+        "action_capacity": 12,
+        "observation_capacity": 6,
+        "capacity_extensions": 0,
+    }
+    for _ in range(4):
+        assert apply_progress_audit(cursor, "new_instance", "high")["granted"] is True
+    final = apply_progress_audit(cursor, "progressing", "high")
+    assert final["granted"] is False
+    assert cursor["action_capacity"] == 44
+    assert cursor["observation_capacity"] == 22
+
+
+def test_progress_audit_parser_accepts_only_classification_fields() -> None:
+    parsed = parse_progress_audit(
+        '{"verdict":"progressing","confidence":"high","reason":"new card set",'
+        '"evidence":["confirm led to another selection screen"],"grant_actions":999}'
+    )
+    assert parsed == {
+        "verdict": "progressing",
+        "confidence": "high",
+        "reason": "new card set",
+        "evidence": ["confirm led to another selection screen"],
+    }
+    assert parse_progress_audit('{"verdict":"extend_by_999","confidence":"high"}') is None

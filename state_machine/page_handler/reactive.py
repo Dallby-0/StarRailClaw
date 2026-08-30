@@ -8,6 +8,13 @@ from state_machine.time_utils import now_iso as _now_iso
 
 REACTIVE_CONTROLLER_TYPE = "reactive_local"
 PROVIDER_RESULTS = {"resolver_miss", "no_change", "changed_same_state", "state_left", "action_error"}
+PROGRESS_ACTION_INCREMENT = 8
+PROGRESS_OBSERVATION_INCREMENT = 4
+PROGRESS_UNCERTAIN_ACTION_GRANT = 2
+PROGRESS_UNCERTAIN_OBSERVATION_GRANT = 1
+PROGRESS_MAX_EXTENSIONS = 4
+PROGRESS_HARD_MAX_ACTIONS = 64
+PROGRESS_HARD_MAX_OBSERVATIONS = 32
 
 
 def _slug(raw: Any, fallback: str) -> str:
@@ -192,7 +199,78 @@ def initial_cursor(*, visit_id: str, operation: str) -> dict[str, Any]:
         "attempted_visit": [],
         "attempted_by_epoch": {"1": []},
         "total_actions": 0,
+        "action_capacity": 0,
+        "observation_capacity": 0,
+        "capacity_extensions": 0,
+        "uncertain_probe_used": False,
+        "last_progress_audit_action": -1,
+        "last_progress_audit_observation": -1,
+        "progress_audits": [],
         "updated_at": _now_iso(),
+    }
+
+
+def ensure_progress_capacity(cursor: dict[str, Any], controller: dict[str, Any]) -> dict[str, int]:
+    base_actions = max(1, min(int(controller.get("max_actions", 12) or 12), 24))
+    base_observations = max(1, min(int(controller.get("max_observation_rounds", 6) or 6), 12))
+    if int(cursor.get("action_capacity", 0) or 0) <= 0:
+        cursor["action_capacity"] = base_actions
+    if int(cursor.get("observation_capacity", 0) or 0) <= 0:
+        cursor["observation_capacity"] = base_observations
+    cursor.setdefault("capacity_extensions", 0)
+    cursor.setdefault("uncertain_probe_used", False)
+    cursor.setdefault("last_progress_audit_action", -1)
+    cursor.setdefault("last_progress_audit_observation", -1)
+    if not isinstance(cursor.get("progress_audits"), list):
+        cursor["progress_audits"] = []
+    return {
+        "actions": int(cursor["action_capacity"]),
+        "observations": int(cursor["observation_capacity"]),
+    }
+
+
+def progress_capacity_exhausted(cursor: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    if int(cursor.get("total_actions", 0) or 0) >= int(cursor.get("action_capacity", 0) or 0):
+        reasons.append("actions")
+    if int(cursor.get("observation_epoch", 1) or 1) > int(cursor.get("observation_capacity", 0) or 0):
+        reasons.append("observations")
+    return reasons
+
+
+def apply_progress_audit(cursor: dict[str, Any], verdict: str, confidence: str) -> dict[str, Any]:
+    """Apply a model verdict using fixed runtime-owned capacity rules."""
+    verdict = str(verdict or "uncertain").strip().lower()
+    confidence = str(confidence or "low").strip().lower()
+    before_actions = int(cursor.get("action_capacity", 0) or 0)
+    before_observations = int(cursor.get("observation_capacity", 0) or 0)
+    grant_kind = "none"
+
+    reliable_progress = verdict in {"progressing", "new_instance"} and confidence in {"high", "mid"}
+    if reliable_progress and int(cursor.get("capacity_extensions", 0) or 0) < PROGRESS_MAX_EXTENSIONS:
+        cursor["action_capacity"] = min(PROGRESS_HARD_MAX_ACTIONS, before_actions + PROGRESS_ACTION_INCREMENT)
+        cursor["observation_capacity"] = min(PROGRESS_HARD_MAX_OBSERVATIONS, before_observations + PROGRESS_OBSERVATION_INCREMENT)
+        if int(cursor["action_capacity"]) > before_actions or int(cursor["observation_capacity"]) > before_observations:
+            cursor["capacity_extensions"] = int(cursor.get("capacity_extensions", 0) or 0) + 1
+            grant_kind = "progress_extension"
+    elif verdict == "uncertain" or (verdict in {"progressing", "new_instance"} and confidence == "low"):
+        if not bool(cursor.get("uncertain_probe_used", False)):
+            cursor["action_capacity"] = min(PROGRESS_HARD_MAX_ACTIONS, before_actions + PROGRESS_UNCERTAIN_ACTION_GRANT)
+            cursor["observation_capacity"] = min(PROGRESS_HARD_MAX_OBSERVATIONS, before_observations + PROGRESS_UNCERTAIN_OBSERVATION_GRANT)
+            cursor["uncertain_probe_used"] = True
+            if int(cursor["action_capacity"]) > before_actions or int(cursor["observation_capacity"]) > before_observations:
+                grant_kind = "uncertain_probe"
+
+    cursor["updated_at"] = _now_iso()
+    return {
+        "granted": grant_kind != "none",
+        "grant_kind": grant_kind,
+        "before": {"actions": before_actions, "observations": before_observations},
+        "after": {
+            "actions": int(cursor.get("action_capacity", before_actions) or before_actions),
+            "observations": int(cursor.get("observation_capacity", before_observations) or before_observations),
+        },
+        "extensions": int(cursor.get("capacity_extensions", 0) or 0),
     }
 
 
