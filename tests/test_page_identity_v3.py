@@ -46,6 +46,22 @@ def test_multiline_llm_text_is_split_into_observable_single_lines() -> None:
     assert all(item["role"] == "identity" for item in elements)
 
 
+def test_invalid_llm_bbox_is_ignored_instead_of_crashing() -> None:
+    elements = normalize_elements(
+        [{
+            "type": "pattern",
+            "bbox": [28, "2022-01-01", 28, "2022-01-01"],
+            "brief": "bad model output",
+            "role": "identity",
+            "stability": "high",
+            "discrimination": "high",
+        }],
+        FakeVision(),
+        object(),
+    )
+    assert elements == []
+
+
 def test_identity_clauses_are_or_while_supports_are_conjunctive() -> None:
     conditions = [
         {"id": "event", "role": "identity", "condition_status": "active"},

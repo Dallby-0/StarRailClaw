@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import Any
 
@@ -17,7 +18,12 @@ def _closed_object(properties: dict[str, Any], required: list[str] | None = None
 def state_bootstrap_json_schema() -> dict[str, Any]:
     """Strict schema for the single identify + intent + bootstrap Responses call."""
     level = {"type": "string", "enum": ["high", "mid", "low"]}
-    bbox = {"type": "array", "items": {"type": "integer"}, "minItems": 4, "maxItems": 4}
+    bbox = {
+        "type": "array",
+        "items": {"type": "integer", "minimum": 0, "maximum": 1000},
+        "minItems": 4,
+        "maxItems": 4,
+    }
     empty_object = _closed_object({})
     role = {"type": "string", "enum": ["identity", "identity_support", "interaction", "instance", "diagnostic"]}
 
@@ -139,16 +145,84 @@ def _load_json_lenient(text: str) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def _schema_error(value: Any, schema: dict[str, Any], path: str = "$") -> str | None:
+    """Validate the JSON Schema subset used by state_bootstrap_json_schema.
+
+    Keeping this validator local avoids making the FSM runtime depend on an
+    optional third-party package.  The schema intentionally uses only this
+    small, recursively validated subset.
+    """
+    alternatives = schema.get("anyOf")
+    if isinstance(alternatives, list):
+        if any(_schema_error(value, candidate, path) is None for candidate in alternatives):
+            return None
+        return f"{path}: value does not match any allowed schema"
+
+    expected = schema.get("type")
+    type_ok = {
+        "null": value is None,
+        "object": isinstance(value, dict),
+        "array": isinstance(value, list),
+        "string": isinstance(value, str),
+        "integer": isinstance(value, int) and not isinstance(value, bool),
+        "number": isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value),
+        "boolean": isinstance(value, bool),
+    }.get(expected, True)
+    if not type_ok:
+        return f"{path}: expected {expected}, got {type(value).__name__}"
+
+    enum = schema.get("enum")
+    if isinstance(enum, list) and value not in enum:
+        return f"{path}: value {value!r} is not in enum"
+
+    if expected == "object":
+        properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+        required = schema.get("required") if isinstance(schema.get("required"), list) else []
+        missing = [name for name in required if name not in value]
+        if missing:
+            return f"{path}: missing required properties {missing}"
+        if schema.get("additionalProperties") is False:
+            extra = [name for name in value if name not in properties]
+            if extra:
+                return f"{path}: unexpected properties {extra}"
+        for name, child in value.items():
+            child_schema = properties.get(name)
+            if isinstance(child_schema, dict):
+                error = _schema_error(child, child_schema, f"{path}.{name}")
+                if error is not None:
+                    return error
+
+    if expected == "array":
+        if isinstance(schema.get("minItems"), int) and len(value) < schema["minItems"]:
+            return f"{path}: expected at least {schema['minItems']} items"
+        if isinstance(schema.get("maxItems"), int) and len(value) > schema["maxItems"]:
+            return f"{path}: expected at most {schema['maxItems']} items"
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for index, child in enumerate(value):
+                error = _schema_error(child, item_schema, f"{path}[{index}]")
+                if error is not None:
+                    return error
+
+    if expected == "string" and isinstance(schema.get("pattern"), str):
+        if re.search(schema["pattern"], value) is None:
+            return f"{path}: value {value!r} does not match required pattern"
+
+    if expected in {"integer", "number"}:
+        if "minimum" in schema and value < schema["minimum"]:
+            return f"{path}: value {value!r} is below minimum {schema['minimum']}"
+        if "maximum" in schema and value > schema["maximum"]:
+            return f"{path}: value {value!r} is above maximum {schema['maximum']}"
+
+    return None
+
+
 def parse_state_payload(text: str) -> dict[str, Any] | None:
     payload = _load_json_lenient(text)
     if payload is None:
         return None
-    required = {"page_summary", "slug", "elements", "bootstrap_operations"}
-    if not required.issubset(payload.keys()):
+    error = _schema_error(payload, state_bootstrap_json_schema())
+    if error is not None:
+        print(f"[fsm][llm][json_schema][invalid] {error}")
         return None
-    if not isinstance(payload.get("elements"), list) or not isinstance(payload.get("bootstrap_operations"), list):
-        return None
-    payload.setdefault("possible_page_type", "none")
-    payload.setdefault("surface_relation", "uncertain")
-    payload.setdefault("common_identity", [])
     return payload

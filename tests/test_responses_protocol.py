@@ -19,6 +19,7 @@ def test_responses_request_uses_json_schema_and_multimodal_input() -> None:
     assert payload["text"]["format"] == {
         "type": "json_schema",
         "name": "fsm_state_bootstrap",
+        "strict": True,
         "schema": schema,
     }
     assert payload["input"][0]["content"][0] == {"type": "input_text", "text": "system"}
@@ -50,6 +51,8 @@ def test_state_bootstrap_schema_is_closed_and_bounded() -> None:
         assert variant["additionalProperties"] is False
         bbox = variant["properties"]["bbox"]
         assert bbox["minItems"] == bbox["maxItems"] == 4
+        assert bbox["items"]["minimum"] == 0
+        assert bbox["items"]["maximum"] == 1000
 
     operation = schema["properties"]["bootstrap_operations"]["items"]
     assert operation["additionalProperties"] is False

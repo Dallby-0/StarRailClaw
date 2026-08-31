@@ -316,7 +316,12 @@ def test_state_payload_requires_bootstrap_operations_not_legacy_actions() -> Non
         "page_summary": "popup",
         "slug": "popup",
         "possible_page_type": "popup",
+        "page_family": "popup",
+        "surface_relation": "uncertain",
+        "common_identity": [],
         "elements": [],
+        "intent_assessment": {"relation": "unknown", "reason": "no active intent"},
+        "intent_proposal": None,
         "bootstrap_operations": [],
     }
     parsed = parse_state_payload(json.dumps(payload))
@@ -332,15 +337,68 @@ def test_state_payload_locally_repairs_missing_bbox_commas_without_llm_retry() -
       "page_summary": "blessing select",
       "slug": "blessing_select",
       "possible_page_type": "none",
-      "elements": [{"type":"pattern","bbox":[26 25, 62 80]}],
+      "page_family": "blessing_select",
+      "surface_relation": "uncertain",
+      "common_identity": [],
+      "elements": [{
+        "type":"pattern",
+        "bbox":[26 25, 62 80],
+        "brief":"card icon",
+        "role":"identity",
+        "stability":"high",
+        "discrimination":"high"
+      }],
+      "intent_assessment": {"relation":"unknown","reason":"no active intent"},
+      "intent_proposal": null,
       "bootstrap_operations": [{
         "operation":"select_first",
+        "is_default":true,
+        "intent_scope":"intent_invariant",
+        "intent_effect":"advance",
+        "safety":"low_risk",
+        "expected_event":"selection_confirmed",
+        "intent_routes":[],
         "steps":[
-          {"resolver":{"type":"fixed_point","x":235,"y":480},"expected_after":{"state_relation":"must_remain","reentry_policy":"same_visit"}},
-          {"resolver":{"type":"fixed_point","x":850,"y":885},"expected_after":{"state_relation":"must_leave","reentry_policy":"new_visit"}}
+          {
+            "step_id":"select",
+            "resolver":{"type":"fixed_point","x":235,"y":480},
+            "expected_after":{"state_relation":"must_remain","reentry_policy":"same_visit"},
+            "emits_on_success":{"type":"selection_made"},
+            "brief":"select first card"
+          },
+          {
+            "step_id":"confirm",
+            "resolver":{"type":"fixed_point","x":850,"y":885},
+            "expected_after":{"state_relation":"must_leave","reentry_policy":"new_visit"},
+            "emits_on_success":{"type":"selection_confirmed"},
+            "brief":"confirm selection"
+          }
         ]
       }]
     }'''
     payload = parse_state_payload(malformed)
     assert payload is not None
     assert payload["elements"][0]["bbox"] == [26, 25, 62, 80]
+
+
+def test_state_payload_rejects_non_integer_bbox_even_when_json_is_valid() -> None:
+    payload = {
+        "page_summary": "combat",
+        "slug": "combat",
+        "possible_page_type": "none",
+        "page_family": "combat",
+        "surface_relation": "different_surface",
+        "common_identity": [],
+        "elements": [{
+            "type": "pattern",
+            "bbox": [28, "2022-01-01", 28, "2022-01-01"],
+            "brief": "run button",
+            "role": "identity",
+            "stability": "high",
+            "discrimination": "high",
+        }],
+        "intent_assessment": {"relation": "unknown", "reason": "no active intent"},
+        "intent_proposal": None,
+        "bootstrap_operations": [],
+    }
+    assert parse_state_payload(json.dumps(payload)) is None

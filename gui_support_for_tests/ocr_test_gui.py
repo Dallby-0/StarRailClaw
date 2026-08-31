@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import cv2
 import numpy as np
@@ -29,6 +30,8 @@ class OcrTestGui:
         self.current_frame: Optional[np.ndarray] = None
         self.mapper = CoordinateMapper(real_w=1280, real_h=720)
         self.vision = VisionEngine(self.mapper, log_fn=self._on_ocr_log)
+        self._rapidocr_engine: Any = None
+        self._rapidocr_backend = ""
 
         self.drag_start: Optional[tuple[int, int]] = None
         self.drag_current: Optional[tuple[int, int]] = None
@@ -66,7 +69,8 @@ class OcrTestGui:
 
         tk.Label(side, textvariable=self.status_var, anchor="w", justify=tk.LEFT, wraplength=340).pack(fill=tk.X, pady=(0, 6))
         tk.Button(side, text="刷新截图", command=self.refresh_screenshot).pack(fill=tk.X, pady=2)
-        tk.Button(side, text="执行OCR", command=self.run_ocr).pack(fill=tk.X, pady=2)
+        tk.Button(side, text="执行单行OCR (pponnxcr)", command=self.run_ocr).pack(fill=tk.X, pady=2)
+        tk.Button(side, text="执行多行OCR (RapidOCR)", command=self.run_rapidocr).pack(fill=tk.X, pady=2)
         tk.Button(side, text="保存选中区域PNG", command=self.save_selected_png).pack(fill=tk.X, pady=2)
         tk.Checkbutton(side, text="白字模式(text_match_white)", variable=self.white_text_var).pack(anchor="w", pady=(4, 2))
         tk.Entry(side, textvariable=self.save_path_var).pack(fill=tk.X, pady=(2, 6))
@@ -196,6 +200,160 @@ class OcrTestGui:
         self.status_var.set(f"OCR完成: candidates={len(words)} above_threshold={len(kept)}")
         self._refresh_canvas()
 
+    def _get_rapidocr_engine(self):
+        if self._rapidocr_engine is not None:
+            return self._rapidocr_engine
+        errors: list[str] = []
+        try:
+            from rapidocr import RapidOCR
+
+            self._rapidocr_engine = RapidOCR()
+            self._rapidocr_backend = "rapidocr"
+            return self._rapidocr_engine
+        except Exception as exc:  # noqa: BLE001 - GUI should show optional dependency errors.
+            errors.append(f"rapidocr: {type(exc).__name__}: {exc}")
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+
+            self._rapidocr_engine = RapidOCR()
+            self._rapidocr_backend = "rapidocr_onnxruntime"
+            return self._rapidocr_engine
+        except Exception as exc:  # noqa: BLE001 - GUI should show optional dependency errors.
+            errors.append(f"rapidocr_onnxruntime: {type(exc).__name__}: {exc}")
+        raise RuntimeError(
+            "RapidOCR 未安装或初始化失败。可尝试执行：\n"
+            "  pip install rapidocr onnxruntime\n"
+            "或：\n"
+            "  pip install rapidocr_onnxruntime\n\n"
+            + "\n".join(errors)
+        )
+
+    @staticmethod
+    def _rapidocr_components(raw: Any) -> tuple[list[Any], list[Any], list[Any]]:
+        """Accept both current RapidOCR output objects and legacy list tuples."""
+        def first_present(mapping: dict[str, Any], *keys: str, default: Any) -> Any:
+            for key in keys:
+                value = mapping.get(key)
+                if value is not None:
+                    return value
+            return default
+
+        payload = raw
+        if isinstance(raw, tuple) and len(raw) == 2:
+            payload = raw[0]
+
+        boxes = getattr(payload, "boxes", None)
+        texts = getattr(payload, "txts", None)
+        scores = getattr(payload, "scores", None)
+        if boxes is not None and texts is not None:
+            return list(boxes), list(texts), list(scores) if scores is not None else [0.0] * len(texts)
+
+        if isinstance(payload, dict):
+            boxes = first_present(payload, "boxes", "dt_polys", default=[])
+            texts = first_present(payload, "txts", "texts", "rec_texts", default=[])
+            scores = first_present(payload, "scores", "rec_scores", default=None)
+            if scores is None:
+                scores = [0.0] * len(texts)
+            return list(boxes), list(texts), list(scores)
+
+        out_boxes: list[Any] = []
+        out_texts: list[Any] = []
+        out_scores: list[Any] = []
+        for item in ([] if payload is None else payload):
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                continue
+            out_boxes.append(item[0])
+            out_texts.append(item[1])
+            out_scores.append(item[2] if len(item) >= 3 else 0.0)
+        return out_boxes, out_texts, out_scores
+
+    @classmethod
+    def _normalize_rapidocr_result(cls, raw: Any, *, offset_x: int, offset_y: int) -> list[dict[str, Any]]:
+        boxes, texts, scores = cls._rapidocr_components(raw)
+        words: list[dict[str, Any]] = []
+        for box, text, score in zip(boxes, texts, scores):
+            try:
+                points = [(int(round(float(p[0]))) + offset_x, int(round(float(p[1]))) + offset_y) for p in box]
+                xs = [p[0] for p in points]
+                ys = [p[1] for p in points]
+                if not xs or not ys:
+                    continue
+                x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
+                confidence = max(0.0, min(1.0, float(score)))
+            except (TypeError, ValueError, IndexError):
+                continue
+            normalized_text = str(text or "").strip()
+            if not normalized_text:
+                continue
+            words.append(
+                {
+                    "text": normalized_text,
+                    "conf": confidence,
+                    "bbox": (x1, y1, max(1, x2 - x1), max(1, y2 - y1)),
+                    "polygon": points,
+                    "center": ((x1 + x2) // 2, (y1 + y2) // 2),
+                    "backend": "rapidocr",
+                }
+            )
+        return words
+
+    def run_rapidocr(self) -> None:
+        if self.current_frame is None:
+            messagebox.showwarning("RapidOCR", "请先刷新截图")
+            return
+        if self.selection_real is None:
+            messagebox.showwarning("RapidOCR", "请先框选区域")
+            return
+        try:
+            threshold = float(self.threshold_var.get().strip())
+        except ValueError:
+            messagebox.showwarning("RapidOCR", "阈值必须是数字")
+            return
+
+        x1, y1, x2, y2 = self.selection_real
+        crop_rgb = self.current_frame[y1:y2, x1:x2]
+        if crop_rgb.size == 0:
+            messagebox.showwarning("RapidOCR", "选区为空")
+            return
+
+        self.result_text.delete("1.0", tk.END)
+        self.status_var.set("RapidOCR 初始化/识别中……首次运行可能需要较长时间")
+        self.root.update_idletasks()
+        try:
+            total_started = time.perf_counter()
+            engine = self._get_rapidocr_engine()
+            inference_started = time.perf_counter()
+            # RapidOCR/OpenCV convention is BGR for ndarray input.
+            raw = engine(cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2BGR))
+            inference_s = time.perf_counter() - inference_started
+            total_s = time.perf_counter() - total_started
+            words = self._normalize_rapidocr_result(raw, offset_x=x1, offset_y=y1)
+        except Exception as exc:  # noqa: BLE001 - surface optional backend failures in the GUI.
+            messagebox.showerror("RapidOCR 失败", str(exc))
+            self.status_var.set("RapidOCR 失败")
+            return
+
+        self.ocr_words = words
+        kept = [word for word in words if float(word.get("conf", 0.0)) >= threshold]
+        self.result_text.insert(
+            tk.END,
+            f"backend={self._rapidocr_backend}, mode=detection+recognition, "
+            f"inference={inference_s:.3f}s, total={total_s:.3f}s\n"
+            f"region_real={[x1, y1, x2, y2]}, threshold={threshold:g}, candidates={len(words)}, "
+            f"above_threshold={len(kept)}\n",
+        )
+        for index, item in enumerate(words, start=1):
+            text = str(item.get("text", "")).replace("\n", " ").strip()
+            conf = float(item.get("conf", 0.0))
+            self.result_text.insert(
+                tk.END,
+                f"{index:02d}. conf={conf:.3f} bbox={item.get('bbox')} center={item.get('center')} text={text!r}\n",
+            )
+        self.status_var.set(
+            f"RapidOCR完成: inference={inference_s:.3f}s candidates={len(words)} above_threshold={len(kept)}"
+        )
+        self._refresh_canvas()
+
     def save_selected_png(self) -> None:
         if self.current_frame is None:
             messagebox.showwarning("保存选区", "请先刷新截图")
@@ -235,7 +393,12 @@ class OcrTestGui:
 
         for w in self.ocr_words:
             x, y, bw, bh = [int(v) for v in w.get("bbox", (0, 0, 0, 0))]
-            cv2.rectangle(view, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
+            polygon = w.get("polygon")
+            if isinstance(polygon, list) and len(polygon) >= 3:
+                points = np.asarray(polygon, dtype=np.int32).reshape((-1, 1, 2))
+                cv2.polylines(view, [points], True, (0, 255, 0), 2)
+            else:
+                cv2.rectangle(view, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
             label = f"{float(w.get('conf', 0.0)):.2f} {str(w.get('text', '')).strip()[:16]}"
             cv2.putText(view, label, (x, max(18, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2, cv2.LINE_AA)
         return view

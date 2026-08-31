@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 from copy import deepcopy
+from numbers import Real
 from typing import Any
 
 from agent.behavior_tree.vision import VisionEngine
@@ -22,6 +24,21 @@ def _logical_bbox(vision: VisionEngine, real_bbox: tuple[int, int, int, int]) ->
     return [x1, y1, max(x1 + 1, x2), max(y1 + 1, y2)]
 
 
+def _valid_bbox(raw: Any) -> list[int] | None:
+    if not isinstance(raw, list) or len(raw) != 4:
+        return None
+    values: list[int] = []
+    for value in raw:
+        if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(float(value)):
+            return None
+        integer = int(value)
+        if integer != value or not 0 <= integer <= 1000:
+            return None
+        values.append(integer)
+    x1, y1, x2, y2 = values
+    return values if x1 < x2 and y1 < y2 else None
+
+
 def normalize_elements(elements: Any, vision: VisionEngine, frame_rgb) -> list[dict[str, Any]]:
     """Normalize LLM elements into runtime-observable primitives.
 
@@ -36,10 +53,11 @@ def normalize_elements(elements: Any, vision: VisionEngine, frame_rgb) -> list[d
             continue
         item = deepcopy(raw)
         item["role"] = _role(item.get("role"))
-        bbox = item.get("bbox")
-        if not (isinstance(bbox, list) and len(bbox) == 4):
+        bbox = _valid_bbox(item.get("bbox"))
+        if bbox is None:
+            print(f"[fsm][elements][warning] ignored invalid bbox: {item.get('bbox')!r}")
             continue
-        item["bbox"] = [int(v) for v in bbox]
+        item["bbox"] = bbox
         if item.get("type") != "text_line":
             normalized.append(item)
             continue

@@ -25,6 +25,7 @@ def build_json_schema_response_input(
             "format": {
                 "type": "json_schema",
                 "name": schema_name,
+                "strict": True,
                 "schema": schema,
             }
         },
