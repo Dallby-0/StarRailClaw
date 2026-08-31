@@ -353,6 +353,83 @@ HTML = r"""<!doctype html>
       margin-top: 2px;
     }
 
+    .occurrence-list {
+      display: grid;
+      gap: 8px;
+    }
+
+    .occurrence-item {
+      border: 1px solid var(--line);
+      border-left: 4px solid #58c4dd;
+      border-radius: 7px;
+      background: #0d141d;
+      overflow: hidden;
+    }
+
+    .occurrence-item.failed {
+      border-left-color: #ff4057;
+    }
+
+    .occurrence-item > summary {
+      padding: 8px;
+      cursor: pointer;
+      color: #eef4ff;
+      overflow-wrap: anywhere;
+    }
+
+    .occurrence-body {
+      display: grid;
+      gap: 8px;
+      padding: 0 8px 8px;
+    }
+
+    .occurrence-meta {
+      color: var(--muted);
+      font-size: 11px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    .occurrence-image {
+      display: block;
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #070b10;
+    }
+
+    .event-list {
+      display: grid;
+      gap: 4px;
+      max-height: 360px;
+      overflow: auto;
+    }
+
+    .event-item {
+      border: 1px solid #25364a;
+      border-radius: 5px;
+      background: #0a1119;
+    }
+
+    .event-item > summary {
+      padding: 5px 6px;
+      cursor: pointer;
+      font-size: 11px;
+      overflow-wrap: anywhere;
+    }
+
+    .event-item pre {
+      max-height: 220px;
+      margin: 0;
+      padding: 6px;
+      overflow: auto;
+      border-top: 1px solid #25364a;
+      color: #cbd7e6;
+      font: 10px/1.4 Consolas, monospace;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
     .lightbox {
       position: fixed;
       inset: 0;
@@ -525,6 +602,10 @@ HTML = r"""<!doctype html>
         <div class="section">
           <div class="label">Page Op Flow</div>
           <div id="pageOpFlow" class="value">-</div>
+        </div>
+        <div class="section">
+          <div class="label">Occurrences / Sessions</div>
+          <div id="occurrences" class="value">-</div>
         </div>
         <div class="section">
           <div class="label">Runtime</div>
@@ -713,6 +794,8 @@ HTML = r"""<!doctype html>
       selectedId: null,
       templateCache: new Map(),
       templateLoadingId: null,
+      historyCache: new Map(),
+      historyLoadingId: null,
       selectedTemplate: null,
       lightboxTemplate: null,
       lightboxScale: 1,
@@ -735,6 +818,7 @@ HTML = r"""<!doctype html>
     const selectedEl = document.getElementById('selected');
     const annotationEl = document.getElementById('annotation');
     const pageOpFlowEl = document.getElementById('pageOpFlow');
+    const occurrencesEl = document.getElementById('occurrences');
     const runtimeEl = document.getElementById('runtime');
     const outgoingEl = document.getElementById('outgoing');
     const incomingEl = document.getElementById('incoming');
@@ -1078,6 +1162,7 @@ HTML = r"""<!doctype html>
       state.graph = { nodes: [], edges: [] };
       state.selectedId = null;
       state.templateCache.clear();
+      state.historyCache.clear();
       state.didInitialLayout = false;
       state.prevCurrent = null;
       taskInput.value = payload.task_name || '';
@@ -1565,6 +1650,125 @@ HTML = r"""<!doctype html>
       }
     }
 
+    function eventSummary(event) {
+      const parts = [event.event || 'event'];
+      if (event.state_id) parts.push(`state=${event.state_id}`);
+      if (event.operation) parts.push(`op=${event.operation}`);
+      if (event.action_id) parts.push(`action=${event.action_id}`);
+      if (event.to_state) parts.push(`to=${event.to_state}`);
+      if (event.result) parts.push(`result=${event.result}`);
+      if (event.reason) parts.push(`reason=${event.reason}`);
+      return parts.join(' · ');
+    }
+
+    function renderOccurrences(payload) {
+      occurrencesEl.innerHTML = '';
+      const occurrences = payload && Array.isArray(payload.occurrences) ? payload.occurrences : [];
+      if (!occurrences.length) {
+        occurrencesEl.textContent = 'No recorded occurrences.';
+        return;
+      }
+      const count = document.createElement('div');
+      count.className = 'condition-meta';
+      count.textContent = `${occurrences.length} occurrence(s), newest first`;
+      occurrencesEl.append(count);
+      const list = document.createElement('div');
+      list.className = 'occurrence-list';
+      for (const occurrence of occurrences) {
+        const details = document.createElement('details');
+        const failed = String(occurrence.outcome_event || '').includes('fail')
+          || [
+            'controller_exhausted',
+            'page_handler_no_decision',
+            'page_handler_no_strategy',
+            'page_handler_no_progress',
+            'page_handler_max_steps',
+            'unknown_state',
+            'llm_payload_invalid'
+          ].includes(occurrence.outcome_event);
+        details.className = `occurrence-item ${failed ? 'failed' : ''}`;
+        const summary = document.createElement('summary');
+        const time = String(occurrence.ts || '').replace('T', ' ').replace('Z', '');
+        summary.textContent = `${time || '-'} · ${occurrence.outcome || occurrence.outcome_event || 'selected'}`;
+        details.append(summary);
+
+        const body = document.createElement('div');
+        body.className = 'occurrence-body';
+        if (occurrence.image_url) {
+          const link = document.createElement('a');
+          link.href = occurrence.image_url;
+          link.target = '_blank';
+          link.title = 'Open runtime screenshot';
+          const img = document.createElement('img');
+          img.className = 'occurrence-image';
+          img.loading = 'lazy';
+          img.src = occurrence.image_url;
+          img.alt = `runtime frame ${occurrence.frame_id || ''}`;
+          link.append(img);
+          body.append(link);
+        }
+        const match = occurrence.match || {};
+        const meta = document.createElement('div');
+        meta.className = 'occurrence-meta';
+        meta.textContent = [
+          `session: ${occurrence.session_id || '-'}`,
+          `run: ${occurrence.run_id || '-'}`,
+          `loop: ${occurrence.loop_id || '-'}`,
+          `observation: ${occurrence.observation_id || '-'}`,
+          `visit: ${(occurrence.visit_ids || []).join(', ') || '-'}`,
+          `match: ${match.passed_enabled ?? '-'}/${match.total_enabled ?? '-'} enabled · ${match.success ?? '-'}`,
+          occurrence.image_url ? `frame: ${occurrence.frame_id || occurrence.artifact_path || '-'}` : 'frame: unavailable (legacy run)'
+        ].join('\n');
+        body.append(meta);
+
+        const eventList = document.createElement('div');
+        eventList.className = 'event-list';
+        for (const event of occurrence.events || []) {
+          const eventDetails = document.createElement('details');
+          eventDetails.className = 'event-item';
+          const eventHead = document.createElement('summary');
+          const seq = event.seq != null ? `#${event.seq} ` : '';
+          eventHead.textContent = `${seq}${eventSummary(event)}`;
+          const pre = document.createElement('pre');
+          pre.textContent = JSON.stringify(event, null, 2);
+          eventDetails.append(eventHead, pre);
+          eventList.append(eventDetails);
+        }
+        body.append(eventList);
+        details.append(body);
+        list.append(details);
+      }
+      occurrencesEl.append(list);
+    }
+
+    async function loadHistoryForSelection(selected) {
+      if (!selected) {
+        occurrencesEl.textContent = '-';
+        return;
+      }
+      const cached = state.historyCache.get(selected);
+      if (cached && Date.now() - cached.loadedAt < 5000) {
+        renderOccurrences(cached.payload);
+        return;
+      }
+      if (state.historyLoadingId === selected) return;
+      state.historyLoadingId = selected;
+      occurrencesEl.textContent = 'loading history...';
+      try {
+        const res = await fetch(`/api/state-history?state_id=${encodeURIComponent(selected)}&limit=50`, { cache: 'no-store' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const payload = await res.json();
+        state.historyCache.set(selected, { payload, loadedAt: Date.now() });
+        if ((state.selectedId || state.runtime.last_state_id) === selected) renderOccurrences(payload);
+      } catch (err) {
+        if ((state.selectedId || state.runtime.last_state_id) === selected) {
+          occurrencesEl.textContent = `history unavailable: ${String(err)}`;
+        }
+      } finally {
+        state.historyLoadingId = null;
+      }
+    }
+
     function edgeHtml(edge, direction) {
       const el = document.createElement('div');
       el.className = 'edge-item';
@@ -1580,6 +1784,7 @@ HTML = r"""<!doctype html>
       const node = state.graph.nodes.find(n => n.state_id === selected);
       selectedEl.textContent = node ? `${node.slug}\n${node.state_id}` : '-';
       loadTemplateForSelection(selected, node);
+      loadHistoryForSelection(selected);
       if (!selected) {
         renderPageOpFlow(null);
       } else if (state.templateCache.has(selected)) {
@@ -2093,6 +2298,197 @@ def _page_handler_summary(handler: Any) -> dict[str, Any]:
     }
 
 
+_OCCURRENCE_FAILURE_EVENTS = {
+    "controller_exhausted",
+    "page_handler_no_decision",
+    "page_handler_no_progress",
+    "page_handler_max_steps",
+    "page_handler_no_strategy",
+    "llm_payload_invalid",
+    "unknown_state",
+}
+
+
+def _compact_history_event(row: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "ts",
+        "seq",
+        "event",
+        "loop_id",
+        "observation_id",
+        "visit_id",
+        "state_id",
+        "from_state",
+        "to_state",
+        "action_id",
+        "operation",
+        "reason",
+        "result",
+        "changed",
+        "diff_score",
+        "frame_id",
+        "artifact_path",
+    )
+    result = {key: row.get(key) for key in keys if row.get(key) is not None}
+    message = row.get("message")
+    if message:
+        result["message"] = str(message)[:800]
+    controller = row.get("controller")
+    if isinstance(controller, dict):
+        result["controller"] = {
+            key: controller.get(key)
+            for key in ("type", "source")
+            if controller.get(key) is not None
+        }
+    command = row.get("command")
+    if isinstance(command, dict):
+        result["command"] = {
+            key: command.get(key)
+            for key in ("operation", "source", "intent_kind", "intent_phase")
+            if command.get(key) is not None
+        }
+    match = row.get("match")
+    if isinstance(match, dict):
+        result["match"] = {
+            key: match.get(key)
+            for key in ("state_id", "passed_enabled", "total_enabled", "passed_all", "total_all", "success")
+            if match.get(key) is not None
+        }
+    candidates = row.get("candidates")
+    if isinstance(candidates, list):
+        result["candidate_count"] = len(candidates)
+        result["successful_candidates"] = [
+            str(item.get("state_id"))
+            for item in candidates
+            if isinstance(item, dict) and item.get("success") and item.get("state_id") is not None
+        ]
+    return result
+
+
+def _read_event_rows(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    value = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(value, dict):
+                    rows.append(value)
+    except OSError:
+        return []
+    return rows
+
+
+def _occurrence_window(rows: list[dict[str, Any]], index: int) -> list[dict[str, Any]]:
+    anchor = rows[index]
+    loop_id = str(anchor.get("loop_id") or "")
+    if loop_id:
+        selected = [row for row in rows if str(row.get("loop_id") or "") == loop_id]
+        return selected[-100:]
+    start = index
+    while start > 0 and rows[start].get("event") != "loop_start":
+        start -= 1
+    if rows[start].get("event") != "loop_start":
+        start = max(0, index - 10)
+    end = index + 1
+    while end < len(rows) and rows[end].get("event") != "loop_start":
+        end += 1
+    return rows[start:min(end, start + 100)]
+
+
+def _occurrence_outcome(rows: list[dict[str, Any]], selected_index: int) -> tuple[str, str]:
+    after = rows[selected_index + 1 :]
+    for row in after:
+        if row.get("event") == "transition":
+            target = str(row.get("to_state") or "unknown")
+            return "transition", f"transition -> {target}"
+    for row in reversed(after):
+        event = str(row.get("event") or "")
+        if event in _OCCURRENCE_FAILURE_EVENTS:
+            return event, str(row.get("reason") or row.get("result") or event)
+    for row in reversed(after):
+        event = str(row.get("event") or "")
+        if event not in {"console", "ocr_summary", "match_candidates"}:
+            return event, str(row.get("result") or row.get("reason") or event)
+    return "state_selected", "selected"
+
+
+def _artifact_url(session_id: str, run_id: str, artifact_path: str) -> str:
+    if not artifact_path:
+        return ""
+    return (
+        "/api/run-artifact"
+        f"?session_id={quote(session_id)}"
+        f"&run_id={quote(run_id)}"
+        f"&path={quote(artifact_path)}"
+    )
+
+
+def _state_occurrences(graph_path: Path, state_id: str, limit: int = 50) -> list[dict[str, Any]]:
+    debug_dir = graph_path.parent / "debug"
+    event_paths = list(debug_dir.glob("sessions/*/runs/run_*/events.jsonl"))
+    event_paths.sort(key=_file_mtime_ns, reverse=True)
+    occurrences: list[dict[str, Any]] = []
+    for event_path in event_paths:
+        rows = _read_event_rows(event_path)
+        if not rows:
+            continue
+        for index in range(len(rows) - 1, -1, -1):
+            row = rows[index]
+            if row.get("event") != "state_selected" or str(row.get("state_id") or "") != state_id:
+                continue
+            window = _occurrence_window(rows, index)
+            selected_index = next((i for i, item in enumerate(window) if item is row), 0)
+            session_id = str(row.get("session_id") or event_path.parents[2].name)
+            run_id = str(row.get("run_id") or event_path.parent.name.removeprefix("run_"))
+            artifact_path = str(row.get("artifact_path") or "")
+            if not artifact_path:
+                for item in reversed(window[: selected_index + 1]):
+                    if item.get("event") == "frame_captured" and item.get("artifact_path"):
+                        artifact_path = str(item.get("artifact_path"))
+                        break
+            if artifact_path:
+                artifact_file = _resolve_under(event_path.parent / Path(artifact_path), event_path.parent)
+                if artifact_file is None or not artifact_file.is_file():
+                    artifact_path = ""
+            outcome_event, outcome = _occurrence_outcome(window, selected_index)
+            match = row.get("match") if isinstance(row.get("match"), dict) else {}
+            occurrences.append(
+                {
+                    "session_id": session_id,
+                    "run_id": run_id,
+                    "ts": str(row.get("ts") or ""),
+                    "seq": row.get("seq"),
+                    "loop_id": str(row.get("loop_id") or ""),
+                    "observation_id": str(row.get("observation_id") or ""),
+                    "visit_ids": sorted(
+                        {
+                            str(item.get("visit_id"))
+                            for item in window
+                            if item.get("visit_id") is not None
+                        }
+                    ),
+                    "frame_id": str(row.get("frame_id") or ""),
+                    "artifact_path": artifact_path,
+                    "image_url": _artifact_url(session_id, run_id, artifact_path),
+                    "match": {
+                        key: match.get(key)
+                        for key in ("passed_enabled", "total_enabled", "passed_all", "total_all", "success")
+                        if match.get(key) is not None
+                    },
+                    "outcome_event": outcome_event,
+                    "outcome": outcome,
+                    "events": [_compact_history_event(item) for item in window],
+                }
+            )
+            if len(occurrences) >= limit:
+                return occurrences
+    occurrences.sort(key=lambda item: str(item.get("ts") or ""), reverse=True)
+    return occurrences[:limit]
+
+
 class FsmStateHandler(BaseHTTPRequestHandler):
     graph_path = GRAPH_PATH
     runtime_path = RUNTIME_PATH
@@ -2120,6 +2516,12 @@ class FsmStateHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/template-image":
             self._send_template_image(parse_qs(parsed.query))
+            return
+        if parsed.path == "/api/state-history":
+            self._send_state_history(parse_qs(parsed.query))
+            return
+        if parsed.path == "/api/run-artifact":
+            self._send_run_artifact(parse_qs(parsed.query))
             return
         self.send_error(HTTPStatus.NOT_FOUND, "not found")
 
@@ -2245,6 +2647,52 @@ class FsmStateHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND, "screenshot not readable")
             return
         self._send_bytes(body, "image/png")
+
+    def _send_state_history(self, query: dict[str, list[str]]) -> None:
+        state_id = query.get("state_id", [""])[0].strip()
+        if not state_id:
+            self.send_error(HTTPStatus.BAD_REQUEST, "state_id is required")
+            return
+        try:
+            limit = max(1, min(200, int(query.get("limit", ["50"])[0])))
+        except (TypeError, ValueError):
+            limit = 50
+        occurrences = _state_occurrences(self.graph_path, state_id, limit=limit)
+        body = json.dumps(
+            {
+                "state_id": state_id,
+                "count": len(occurrences),
+                "occurrences": occurrences,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        self._send_bytes(body, "application/json; charset=utf-8")
+
+    def _send_run_artifact(self, query: dict[str, list[str]]) -> None:
+        session_id = query.get("session_id", [""])[0].strip()
+        run_id = query.get("run_id", [""])[0].strip()
+        artifact_path = query.get("path", [""])[0].strip()
+        if not session_id or not run_id or not artifact_path:
+            self.send_error(HTTPStatus.BAD_REQUEST, "session_id, run_id and path are required")
+            return
+        debug_dir = self.graph_path.parent / "debug"
+        run_dir = debug_dir / "sessions" / session_id / "runs" / f"run_{run_id}"
+        safe_run_dir = _resolve_under(run_dir, debug_dir)
+        if safe_run_dir is None or not safe_run_dir.is_dir():
+            self.send_error(HTTPStatus.NOT_FOUND, "run not found")
+            return
+        candidate = _resolve_under(safe_run_dir / Path(artifact_path), safe_run_dir)
+        if candidate is None or not candidate.is_file():
+            self.send_error(HTTPStatus.NOT_FOUND, "artifact not found")
+            return
+        try:
+            body = candidate.read_bytes()
+        except OSError:
+            self.send_error(HTTPStatus.NOT_FOUND, "artifact not readable")
+            return
+        content_type = mimetypes.guess_type(candidate.name)[0] or "application/octet-stream"
+        self._send_bytes(body, content_type)
 
     def _send_bytes(self, body: bytes, content_type: str) -> None:
         self.send_response(HTTPStatus.OK)

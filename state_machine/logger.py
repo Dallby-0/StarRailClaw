@@ -36,13 +36,17 @@ class FsmRunLogger:
         self.session_dir = debug_dir / "sessions" / self.session_id
         self.run_dir = self.session_dir / "runs" / f"run_{run_id}"
         self.llm_raw_dir = self.run_dir / "llm_raw"
+        self.frames_dir = self.run_dir / "frames"
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.llm_raw_dir.mkdir(parents=True, exist_ok=True)
+        self.frames_dir.mkdir(parents=True, exist_ok=True)
         self.events_path = self.run_dir / "events.jsonl"
         self.summary_path = self.run_dir / "summary.json"
         self.report_path = self.run_dir / "session_report.txt"
         self.latest_report_path = self.session_dir / "latest_session_report.txt"
         self.path = self.events_path
+        self._event_seq = 0
+        self._context: dict[str, Any] = {}
         self._event_counts: dict[str, int] = {}
         self._summary: dict[str, Any] = {
             "session_id": self.session_id,
@@ -95,18 +99,29 @@ class FsmRunLogger:
                 "report": str(self.report_path),
                 "latest_report": str(self.latest_report_path),
                 "llm_raw": str(self.llm_raw_dir),
+                "frames": str(self.frames_dir),
             },
         }
         self._report_lines: list[str] = []
         self._write_summary_and_report()
 
+    def set_context(self, **fields: Any) -> None:
+        for key, value in fields.items():
+            if value is None:
+                self._context.pop(key, None)
+            else:
+                self._context[key] = value
+
     def event(self, event: str, **fields: Any) -> None:
         ts = _now_iso()
+        self._event_seq += 1
         row = {
             "ts": ts,
             "session_id": self.session_id,
             "run_id": self.run_id,
+            "seq": self._event_seq,
             "event": event,
+            **self._context,
             **fields,
         }
         safe_row = _json_safe(row)

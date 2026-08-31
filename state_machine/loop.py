@@ -131,7 +131,18 @@ def run_agent_loop_fsm(
 
     prev_frame = None
 
+    loop_index = 0
     while True:
+        loop_index += 1
+        loop_id = f"loop-{loop_index:06d}"
+        observation_id = f"obs-{loop_index:06d}"
+        frame_id = f"frame-{loop_index:06d}"
+        logger.set_context(
+            loop_id=loop_id,
+            observation_id=observation_id,
+            frame_id=None,
+            artifact_path=None,
+        )
         llm_session_id = _refresh_session_if_needed(runtime, session_id)
         system_prompt = _build_system_prompt_with_experience()
         logger.event(
@@ -147,7 +158,32 @@ def run_agent_loop_fsm(
         frame = emulator.screenshot(prefer_png=True)
         if frame.shape[1] != 1280 or frame.shape[0] != 720:
             frame = cv2.resize(frame, (1280, 720), interpolation=cv2.INTER_LINEAR)
-        logger.event("frame_captured", width=int(frame.shape[1]), height=int(frame.shape[0]))
+        frame_path = logger.frames_dir / f"{frame_id}.jpg"
+        frame_save_error = ""
+        try:
+            frame_saved = bool(
+                cv2.imwrite(
+                    str(frame_path),
+                    cv2.cvtColor(frame, cv2.COLOR_RGB2BGR),
+                    [int(cv2.IMWRITE_JPEG_QUALITY), 90],
+                )
+            )
+        except (cv2.error, OSError) as exc:
+            frame_saved = False
+            frame_save_error = str(exc)
+        artifact_path = frame_path.relative_to(logger.run_dir).as_posix() if frame_saved else None
+        logger.set_context(
+            frame_id=frame_id if frame_saved else None,
+            artifact_path=artifact_path,
+        )
+        logger.event(
+            "frame_captured",
+            width=int(frame.shape[1]),
+            height=int(frame.shape[0]),
+            mime_type="image/jpeg" if frame_saved else None,
+            saved=frame_saved,
+            save_error=frame_save_error or None,
+        )
 
         metas = _iter_state_meta()
 
