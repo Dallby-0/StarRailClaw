@@ -16,11 +16,11 @@ from state_machine.logger import FsmRunLogger, summarize_match
 from state_machine.matching import _find_match_by_state
 from state_machine.page_handler.actions import execute_action, resolve_strategy_step
 from state_machine.page_handler.exploration import run_exploration
-from state_machine.page_handler.llm import request_handler_repair, request_progress_audit, request_same_state_review
-from state_machine.page_handler.reactive import advance_observation, apply_progress_audit, ensure_progress_capacity, mark_provider_result, progress_capacity_exhausted, record_provider_attempt, select_provider
+from state_machine.page_handler.llm import request_handler_repair, request_next_action_recovery, request_progress_audit, request_same_state_review
+from state_machine.page_handler.reactive import advance_observation, apply_progress_audit, ensure_progress_capacity, grant_capacity_after_recovery, mark_provider_result, progress_capacity_exhausted, promote_recovery_provider, record_provider_attempt, select_provider
 from state_machine.page_handler.review_protocol import result_for_same_state_verdict
 from state_machine.page_handler.store import apply_handler_patch, append_episode, continuation_patch_from_sibling, ensure_page_handler, mark_strategy_result, materialize_strategy_templates, promote_operation_to_default, select_strategy
-from state_machine.progress_guard import blocked_strategies, clear_continuation, clear_reactive_cursor, clear_visit_progress, consume_continuation, continuation_for, grant_continuation, operation_exhausted, reactive_cursor_for, record_attempt, record_no_progress, record_repair, record_review, repair_exhausted, review_exhausted
+from state_machine.progress_guard import blocked_strategies, capacity_recovery_exhausted, clear_continuation, clear_reactive_cursor, clear_visit_progress, consume_continuation, continuation_for, grant_continuation, operation_exhausted, reactive_cursor_for, record_attempt, record_capacity_recovery, record_no_progress, record_repair, record_review, repair_exhausted, review_exhausted
 from state_machine.screen import _screen_changed, _wait_for_screen_stable
 from state_machine.transition_policy import _defer_unknown_transition, _resolve_transition_after_progress
 from state_machine.visit import ensure_page_visit, start_new_visit
@@ -81,6 +81,31 @@ def _remember_progress_observation(history: list[dict[str, Any]], frame, **field
     if len(history) > 6:
         # Preserve the episode entry frame and the five most recent outcomes.
         del history[1 : len(history) - 5]
+
+
+def _materialize_ephemeral_template(provider: dict[str, Any], state_dir: Path, frame, vision: VisionEngine, attempt: int) -> None:
+    resolver = provider.get("resolver") if isinstance(provider.get("resolver"), dict) else None
+    if not isinstance(resolver, dict) or resolver.get("type") != "region_template" or resolver.get("template_path"):
+        return
+    bbox = resolver.get("template_bbox")
+    if not (isinstance(bbox, list) and len(bbox) == 4):
+        return
+    provider_id = "".join(ch if ch.isalnum() else "_" for ch in str(provider.get("provider_id") or "recovery"))
+    path = state_dir / f"action_template_capacity_recovery_{provider_id}_{attempt}.png"
+    vision.save_template_from_rect(frame, [int(value) for value in bbox], path)
+    resolver["template_path"] = str(path)
+
+
+def _write_recovery_bundle_record(recovery: Any, name: str, payload: dict[str, Any]) -> None:
+    if not isinstance(recovery, dict) or not recovery.get("_input_bundle"):
+        return
+    try:
+        import json
+
+        Path(str(recovery["_input_bundle"]), name).write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    except Exception:
+        # Diagnostic artifacts must never become part of the control path.
+        return
 
 
 def _run_reactive_local(
@@ -217,7 +242,178 @@ def _run_reactive_local(
                 "audit": audit,
                 "decision": decision,
             })
-            return "repair", made_progress, current, failed_attempts
+            recovery_allowed = str(policy.get("safety") or "unknown") in {"low_risk", "reversible"}
+            if not recovery_allowed or capacity_recovery_exhausted(runtime, visit_id, command.operation):
+                return "capacity_exhausted", made_progress, current, failed_attempts
+
+            recovery_attempt = record_capacity_recovery(runtime, visit_id, command.operation)
+            _save_runtime(runtime)
+            recovery = request_next_action_recovery(
+                llm=llm,
+                session_id=llm_session_id,
+                state_meta=state_meta,
+                handler=handler,
+                command=command.to_dict(),
+                cursor=cursor,
+                observations=observations,
+                failed_attempts=failed_attempts,
+                logger=logger,
+            )
+            runtime["llm_turn_count"] = int(runtime.get("llm_turn_count", 0) or 0) + 1
+            _save_runtime(runtime)
+            if not isinstance(recovery, dict) or recovery.get("decision") != "act" or not isinstance(recovery.get("provider"), dict):
+                _write_recovery_bundle_record(recovery, "runtime_decision.json", {"accepted": False, "reason": "invalid_or_give_up", "attempt": recovery_attempt})
+                failed_attempts.append({
+                    "provider_id": "$capacity_recovery",
+                    "result": "invalid_or_give_up",
+                    "attempt": recovery_attempt,
+                    "recovery": recovery,
+                })
+                continue
+
+            recovery_provider = dict(recovery["provider"])
+            recovery_provider["source"] = "llm_capacity_recovery"
+            recovery_provider["learned_from_visit"] = visit_id
+            recovery_provider["learned_from_observation_epoch"] = observation_epoch
+            _materialize_ephemeral_template(recovery_provider, state_dir, current, vision, recovery_attempt)
+            recovery_id = str(recovery_provider.get("provider_id") or f"capacity_recovery_{recovery_attempt}")
+            action, action_info = _reactive_action(recovery_provider, current, vision)
+            if action is None:
+                _write_recovery_bundle_record(recovery, "runtime_decision.json", {"accepted": False, "reason": "resolver_miss", "attempt": recovery_attempt, "action_info": action_info})
+                failed_attempts.append({
+                    "provider_id": recovery_id,
+                    "result": "resolver_miss",
+                    "attempt": recovery_attempt,
+                    "reason": action_info.get("reason"),
+                })
+                append_episode(handler, {"state_id": state_id, "visit_id": visit_id, "command": command.to_dict(), "provider_id": recovery_id, "controller": "capacity_recovery", "result": "resolver_miss", "reason": action_info.get("reason")})
+                _save_json(state_path, state_meta)
+                continue
+
+            before_recovery = current
+            runtime["pending_operation"] = {
+                "attempt_id": f"{visit_id}:{command.operation}:capacity-recovery:{recovery_attempt}",
+                "intent_id": command.intent_id,
+                "state_id": state_id,
+                "state_dir": str(state_dir),
+                "visit_id": visit_id,
+                "operation": command.operation,
+                "strategy_id": recovery_id,
+                "provider_id": recovery_id,
+                "controller_type": "capacity_recovery",
+                "step_id": recovery_id,
+                "expected_after": dict(recovery_provider.get("expected_after") or {}),
+                "success_event": _event_for_success(command, action_info, final_step=True),
+                "status": "issued",
+                "created_at": _now_iso(),
+            }
+            _save_runtime(runtime)
+            executed = execute_action(
+                emulator=emulator,
+                mapper=mapper,
+                vision=vision,
+                state_id=state_id,
+                action_id=action_id,
+                action=action,
+                action_info=action_info,
+                matches_provider=matches_provider,
+                logger=logger,
+                attempt=f"capacity-recovery:{recovery_attempt}:{recovery_id}",
+            )
+            record_provider_attempt(cursor, recovery_provider, action_count=1 if executed else 0)
+            if not executed:
+                runtime["pending_operation"] = None
+                _write_recovery_bundle_record(recovery, "execution_result.json", {"result": "action_error", "attempt": recovery_attempt, "provider_id": recovery_id})
+                failed_attempts.append({"provider_id": recovery_id, "result": "action_error", "attempt": recovery_attempt})
+                append_episode(handler, {"state_id": state_id, "visit_id": visit_id, "command": command.to_dict(), "provider_id": recovery_id, "controller": "capacity_recovery", "result": "action_error"})
+                _save_json(state_path, state_meta)
+                _save_runtime(runtime)
+                continue
+
+            post = _wait_for_screen_stable(emulator, logger=logger, label="page-handler-capacity-recovery", event="page_handler_stability_check", max_checks=3)
+            matches = matches_provider(post)
+            changed, diff_score = _screen_changed(before_recovery, post)
+            current_match = _find_match_by_state(matches, state_id)
+            left_state = current_match is None or not current_match.success
+            outcome = "state_left" if left_state else "changed_same_state" if changed else "no_change"
+            runtime["pending_operation"] = None
+            event = _event_for_success(command, action_info, final_step=left_state) if outcome in {"state_left", "changed_same_state"} else None
+            reduce_intent_event(runtime, event)
+            _remember_progress_observation(
+                observations,
+                post,
+                provider_id=recovery_id,
+                provider_kind="capacity_recovery",
+                outcome=outcome,
+                changed=changed,
+                diff_score=diff_score,
+                action_count=1,
+                observation_epoch=observation_epoch,
+                note=str(recovery.get("reason") or recovery_provider.get("brief") or ""),
+            )
+            promoted = promote_recovery_provider(
+                controller,
+                recovery_provider,
+                outcome=outcome,
+                visit_id=visit_id,
+                observation_epoch=observation_epoch,
+            )
+            _write_recovery_bundle_record(recovery, "execution_result.json", {
+                "result": outcome,
+                "attempt": recovery_attempt,
+                "provider_id": recovery_id,
+                "changed": changed,
+                "diff_score": diff_score,
+                "promoted_provider_id": promoted.get("provider_id") if isinstance(promoted, dict) else None,
+            })
+            append_episode(handler, {
+                "state_id": state_id,
+                "visit_id": visit_id,
+                "command": command.to_dict(),
+                "provider_id": recovery_id,
+                "controller": "capacity_recovery",
+                "result": outcome,
+                "event": event,
+                "changed": changed,
+                "diff_score": diff_score,
+                "promoted_provider_id": promoted.get("provider_id") if isinstance(promoted, dict) else None,
+            })
+            current = post
+            state_meta["updated_at"] = _now_iso()
+            _save_json(state_path, state_meta)
+            _save_runtime(runtime)
+            if logger is not None:
+                logger.event(
+                    "page_handler_capacity_recovery_result",
+                    state_id=state_id,
+                    visit_id=visit_id,
+                    operation=command.operation,
+                    attempt=recovery_attempt,
+                    provider_id=recovery_id,
+                    result=outcome,
+                    changed=changed,
+                    diff_score=diff_score,
+                    promoted_provider_id=promoted.get("provider_id") if isinstance(promoted, dict) else None,
+                    candidates=[summarize_match(match) for match in matches],
+                )
+            if left_state:
+                nxt = _resolve_transition_after_progress(state_id=state_id, action_id=action_id, matches=matches, graph=graph, runtime=runtime, prefer_reachable_first=prefer_reachable_first, logger=logger, reason_suffix="-capacity-recovery")
+                if nxt is not None:
+                    clear_reactive_cursor(runtime, visit_id, command.operation)
+                    clear_visit_progress(runtime, visit_id)
+                    _save_runtime(runtime)
+                    return "done", True, current, failed_attempts
+                ok, deferred = _defer_unknown_transition(runtime=runtime, state_id=state_id, action_id=action_id, logger=logger, frame=current, reason="capacity-recovery-left-state")
+                return "done", ok, deferred, failed_attempts
+            if changed:
+                made_progress = True
+                advance_observation(cursor)
+                grant = grant_capacity_after_recovery(cursor)
+                _log(logger, f"[fsm][handler][capacity-recovery] progressed provider={recovery_id} grant={grant}", "page_handler_capacity_recovery_progressed", state_id=state_id, visit_id=visit_id, operation=command.operation, provider_id=recovery_id, grant=grant)
+            else:
+                failed_attempts.append({"provider_id": recovery_id, "result": "no_change", "attempt": recovery_attempt, "diff_score": diff_score})
+            _save_runtime(runtime)
+            continue
 
         action_capacity = int(cursor.get("action_capacity", LOCAL_FLOW_MAX_STEPS) or LOCAL_FLOW_MAX_STEPS)
         provider = select_provider(controller, cursor)
@@ -493,6 +689,18 @@ def run_page_handler(
             reactive_failures.extend(failures)
             if status == "done":
                 return True, current
+            if status == "capacity_exhausted":
+                _log(
+                    logger,
+                    f"[fsm][handler] reactive hard exhausted state={state_id} operation={command.operation}",
+                    "page_handler_capacity_recovery_exhausted",
+                    state_id=state_id,
+                    visit_id=visit_id,
+                    operation=command.operation,
+                    failed_attempts=reactive_failures[-12:],
+                    controller_type="reactive_local",
+                )
+                return made_progress, current
             if repair_exhausted(runtime, visit_id, command.operation):
                 _log(logger, f"[fsm][handler] reactive exhausted state={state_id} operation={command.operation}", "page_handler_no_strategy", state_id=state_id, operation=command.operation, failed_attempts=reactive_failures[-12:], controller_type="reactive_local")
                 return made_progress, current

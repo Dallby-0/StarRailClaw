@@ -4,15 +4,18 @@ from state_machine.page_handler.reactive import (
     advance_observation,
     apply_progress_audit,
     ensure_progress_capacity,
+    grant_capacity_after_recovery,
     mark_provider_result,
     merge_controller,
+    promote_recovery_provider,
+    provider_resolver_signature,
     progress_capacity_exhausted,
     record_provider_attempt,
     select_provider,
 )
 from state_machine.page_handler.store import apply_handler_patch, ensure_page_handler, handler_from_bootstrap
-from state_machine.page_handler.llm import parse_progress_audit
-from state_machine.progress_guard import clear_visit_progress, reactive_cursor_for
+from state_machine.page_handler.llm import parse_next_action_recovery, parse_progress_audit
+from state_machine.progress_guard import capacity_recovery_exhausted, clear_visit_progress, reactive_cursor_for, record_capacity_recovery
 
 
 def _operation(handler, name="advance_page"):
@@ -41,6 +44,8 @@ def test_bootstrap_builds_minimal_reactive_fast_path_without_exploration() -> No
     assert controller["providers"][0]["provider_id"] == "continue"
     assert controller["providers"][0]["resolver"] == {"type": "fixed_point", "x": 840, "y": 880}
     assert controller["providers"][0]["cost"] == 0
+    assert controller["max_actions"] == 20
+    assert controller["max_observation_rounds"] == 10
 
 
 def test_changed_observation_does_not_replay_once_per_visit_direct_action() -> None:
@@ -270,3 +275,64 @@ def test_progress_audit_parser_accepts_only_classification_fields() -> None:
         "evidence": ["confirm led to another selection screen"],
     }
     assert parse_progress_audit('{"verdict":"extend_by_999","confidence":"high"}') is None
+
+
+def test_capacity_recovery_has_independent_two_attempt_budget() -> None:
+    runtime: dict = {}
+    assert capacity_recovery_exhausted(runtime, "004:22", "select_station") is False
+    assert record_capacity_recovery(runtime, "004:22", "select_station") == 1
+    assert capacity_recovery_exhausted(runtime, "004:22", "select_station") is False
+    assert record_capacity_recovery(runtime, "004:22", "select_station") == 2
+    assert capacity_recovery_exhausted(runtime, "004:22", "select_station") is True
+    clear_visit_progress(runtime, "004:22")
+    assert capacity_recovery_exhausted(runtime, "004:22", "select_station") is False
+
+
+def test_recovery_provider_is_promoted_only_after_observed_progress_and_deduplicated() -> None:
+    controller = {"type": "reactive_local", "providers": [], "max_actions": 20, "max_observation_rounds": 10}
+    raw = {
+        "provider_id": "click_visible_confirm",
+        "kind": "action",
+        "cost": 5,
+        "repeat_policy": "once_per_observation",
+        "status": "proposed",
+        "resolver": {"type": "fixed_point", "x": 640, "y": 720},
+        "expected_after": {"state_relation": "may_leave", "reentry_policy": "same_visit"},
+        "brief": "click visible confirm",
+    }
+    assert promote_recovery_provider(controller, raw, outcome="no_change", visit_id="004:22", observation_epoch=8) is None
+    assert controller["providers"] == []
+
+    proposed = promote_recovery_provider(controller, raw, outcome="changed_same_state", visit_id="004:22", observation_epoch=8)
+    assert proposed["status"] == "proposed"
+    assert proposed["source"] == "llm_capacity_recovery"
+    assert proposed["result_counts"] == {"changed_same_state": 1}
+
+    same_behavior = {**raw, "provider_id": "different_model_name"}
+    active = promote_recovery_provider(controller, same_behavior, outcome="state_left", visit_id="004:22", observation_epoch=9)
+    assert len(controller["providers"]) == 1
+    assert active["status"] == "active"
+    assert active["success_count"] == 1
+    assert active["result_counts"] == {"changed_same_state": 1, "state_left": 1}
+    assert provider_resolver_signature(active) == provider_resolver_signature(raw)
+
+
+def test_next_action_recovery_parser_rejects_non_action_payloads() -> None:
+    parsed = parse_next_action_recovery(
+        '{"decision":"act","reason":"visible confirm","provider":{'
+        '"provider_id":"confirm","kind":"action","cost":1,"repeat_policy":"once_per_observation",'
+        '"status":"proposed","resolver":{"type":"fixed_point","x":640,"y":720},'
+        '"expected_after":{"state_relation":"may_leave","reentry_policy":"same_visit"},"brief":"confirm"}}'
+    )
+    assert parsed is not None
+    assert parsed["provider"]["provider_id"] == "confirm"
+    assert parse_next_action_recovery('{"decision":"act","reason":"x","provider":{"kind":"exploration"}}') is None
+    assert parse_next_action_recovery('{"decision":"give_up","reason":"no visible action","provider":{}}') == {
+        "decision": "give_up",
+        "reason": "no visible action",
+    }
+
+
+def test_successful_same_state_recovery_gets_small_fixed_follow_up_window() -> None:
+    cursor = {"total_actions": 21, "observation_epoch": 11, "action_capacity": 20, "observation_capacity": 10}
+    assert grant_capacity_after_recovery(cursor) == {"actions": 25, "observations": 13}

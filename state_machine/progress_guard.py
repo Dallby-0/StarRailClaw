@@ -9,6 +9,7 @@ from state_machine.page_handler.reactive import initial_cursor
 NO_PROGRESS_LIMIT = 2
 OPERATION_ATTEMPT_LIMIT = 6
 OPERATION_REPAIR_LIMIT = 1
+CAPACITY_RECOVERY_LIMIT = 2
 OPERATION_REVIEW_LIMIT = 2
 DEFAULT_CONTINUATION_ACTIONS = 6
 MAX_CONTINUATION_ACTIONS = 12
@@ -56,6 +57,22 @@ def repair_exhausted(runtime: dict[str, Any], visit_id: str, operation: str) -> 
     repairs = runtime.get("visit_operation_repairs")
     count = int(repairs.get(f"{visit_id}|{operation}", 0) or 0) if isinstance(repairs, dict) else 0
     return count >= OPERATION_REPAIR_LIMIT
+
+
+def record_capacity_recovery(runtime: dict[str, Any], visit_id: str, operation: str) -> int:
+    recoveries = runtime.get("visit_operation_capacity_recoveries")
+    if not isinstance(recoveries, dict):
+        recoveries = {}
+        runtime["visit_operation_capacity_recoveries"] = recoveries
+    key = f"{visit_id}|{operation}"
+    recoveries[key] = int(recoveries.get(key, 0) or 0) + 1
+    return int(recoveries[key])
+
+
+def capacity_recovery_exhausted(runtime: dict[str, Any], visit_id: str, operation: str) -> bool:
+    recoveries = runtime.get("visit_operation_capacity_recoveries")
+    count = int(recoveries.get(f"{visit_id}|{operation}", 0) or 0) if isinstance(recoveries, dict) else 0
+    return count >= CAPACITY_RECOVERY_LIMIT
 
 
 def record_review(runtime: dict[str, Any], visit_id: str, operation: str) -> int:
@@ -191,6 +208,10 @@ def clear_visit_progress(runtime: dict[str, Any], visit_id: str) -> None:
     if isinstance(reviews, dict):
         for key in [key for key in reviews if key.startswith(f"{visit_id}|")]:
             del reviews[key]
+    recoveries = runtime.get("visit_operation_capacity_recoveries")
+    if isinstance(recoveries, dict):
+        for key in [key for key in recoveries if key.startswith(f"{visit_id}|")]:
+            del recoveries[key]
     continuations = runtime.get("visit_operation_continuations")
     if isinstance(continuations, dict):
         for key in [key for key in continuations if key.startswith(f"{visit_id}|")]:
@@ -217,6 +238,7 @@ def reset_run_local_progress(runtime: dict[str, Any]) -> None:
         "no_progress_guard",
         "visit_operation_attempts",
         "visit_operation_repairs",
+        "visit_operation_capacity_recoveries",
         "visit_operation_reviews",
         "visit_operation_continuations",
         "visit_operation_exploration",

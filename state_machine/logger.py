@@ -289,7 +289,7 @@ def _event_delta(event: str, row: dict[str, Any]) -> dict[str, Any]:
             delta["last_state_id"] = row.get("to_state")
     elif event == "graph_edge_added":
         delta["edges_added"] = 1
-    elif event in {"controller_exhausted", "page_handler_no_decision", "page_handler_no_progress", "page_handler_max_steps"}:
+    elif event in {"controller_exhausted", "page_handler_no_decision", "page_handler_no_progress", "page_handler_max_steps", "page_handler_capacity_recovery_exhausted"}:
         delta["page_op_failures"] = 1
     elif event == "ocr_summary":
         delta["ocr_calls"] = int(row.get("calls", 0) or 0)

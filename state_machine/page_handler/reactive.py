@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 from typing import Any
 
 from state_machine.time_utils import now_iso as _now_iso
 
 
 REACTIVE_CONTROLLER_TYPE = "reactive_local"
+DEFAULT_MAX_ACTIONS = 20
+DEFAULT_MAX_OBSERVATION_ROUNDS = 10
+MAX_CONFIGURED_ACTIONS = 32
+MAX_CONFIGURED_OBSERVATIONS = 16
 PROVIDER_RESULTS = {"resolver_miss", "no_change", "changed_same_state", "state_left", "action_error"}
 PROGRESS_ACTION_INCREMENT = 8
 PROGRESS_OBSERVATION_INCREMENT = 4
@@ -53,6 +58,15 @@ def normalize_provider(raw: Any, *, index: int = 1, default_cost: int = 0) -> di
         "created_at": str(raw.get("created_at") or _now_iso()),
         "updated_at": _now_iso(),
     }
+    for key in (
+        "source",
+        "learned_from_visit",
+        "learned_from_observation_epoch",
+        "promotion_reason",
+        "created_from_frame",
+    ):
+        if raw.get(key) is not None:
+            provider[key] = deepcopy(raw[key])
     if kind == "action":
         resolver = raw.get("resolver") if isinstance(raw.get("resolver"), dict) else None
         if resolver is None:
@@ -112,8 +126,8 @@ def controller_from_steps(steps: Any, *, exploration: Any = None) -> dict[str, A
     return {
         "type": REACTIVE_CONTROLLER_TYPE,
         "providers": providers,
-        "max_actions": 12,
-        "max_observation_rounds": 6,
+        "max_actions": DEFAULT_MAX_ACTIONS,
+        "max_observation_rounds": DEFAULT_MAX_OBSERVATION_ROUNDS,
         "created_at": _now_iso(),
         "updated_at": _now_iso(),
     }
@@ -148,8 +162,8 @@ def normalize_controller(raw: Any) -> dict[str, Any] | None:
     return {
         "type": REACTIVE_CONTROLLER_TYPE,
         "providers": providers,
-        "max_actions": max(1, min(int(raw.get("max_actions", 12) or 12), 24)),
-        "max_observation_rounds": max(1, min(int(raw.get("max_observation_rounds", 6) or 6), 12)),
+        "max_actions": max(1, min(int(raw.get("max_actions", DEFAULT_MAX_ACTIONS) or DEFAULT_MAX_ACTIONS), MAX_CONFIGURED_ACTIONS)),
+        "max_observation_rounds": max(1, min(int(raw.get("max_observation_rounds", DEFAULT_MAX_OBSERVATION_ROUNDS) or DEFAULT_MAX_OBSERVATION_ROUNDS), MAX_CONFIGURED_OBSERVATIONS)),
         "created_at": str(raw.get("created_at") or _now_iso()),
         "updated_at": _now_iso(),
     }
@@ -211,8 +225,8 @@ def initial_cursor(*, visit_id: str, operation: str) -> dict[str, Any]:
 
 
 def ensure_progress_capacity(cursor: dict[str, Any], controller: dict[str, Any]) -> dict[str, int]:
-    base_actions = max(1, min(int(controller.get("max_actions", 12) or 12), 24))
-    base_observations = max(1, min(int(controller.get("max_observation_rounds", 6) or 6), 12))
+    base_actions = max(1, min(int(controller.get("max_actions", DEFAULT_MAX_ACTIONS) or DEFAULT_MAX_ACTIONS), MAX_CONFIGURED_ACTIONS))
+    base_observations = max(1, min(int(controller.get("max_observation_rounds", DEFAULT_MAX_OBSERVATION_ROUNDS) or DEFAULT_MAX_OBSERVATION_ROUNDS), MAX_CONFIGURED_OBSERVATIONS))
     if int(cursor.get("action_capacity", 0) or 0) <= 0:
         cursor["action_capacity"] = base_actions
     if int(cursor.get("observation_capacity", 0) or 0) <= 0:
@@ -356,3 +370,105 @@ def mark_provider_result(controller: dict[str, Any], provider_id: str, result: s
         # local evidence, not a reason to disable it globally.
     provider["updated_at"] = _now_iso()
     controller["updated_at"] = _now_iso()
+
+
+def provider_resolver_signature(provider: Any) -> str:
+    """Return a stable behavior signature used to deduplicate learned providers."""
+    if not isinstance(provider, dict):
+        return ""
+    kind = str(provider.get("kind") or "action")
+    if kind == "exploration":
+        payload = {
+            "kind": kind,
+            "profiles": provider.get("profiles") if isinstance(provider.get("profiles"), list) else [],
+        }
+    else:
+        resolver = provider.get("resolver") if isinstance(provider.get("resolver"), dict) else {}
+        rtype = str(resolver.get("type") or "")
+        if rtype == "fixed_point":
+            behavior = {"type": rtype, "x": resolver.get("x"), "y": resolver.get("y")}
+        elif rtype == "region_template":
+            behavior = {
+                "type": rtype,
+                "template_bbox": resolver.get("template_bbox"),
+                "search_rect": resolver.get("search_rect"),
+                "threshold": resolver.get("threshold", 0.82),
+            }
+        elif rtype == "run_preset":
+            behavior = {"type": rtype, "name": resolver.get("name")}
+        else:
+            behavior = resolver
+        payload = {"kind": kind, "resolver": behavior}
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def promote_recovery_provider(
+    controller: dict[str, Any],
+    raw_provider: dict[str, Any],
+    *,
+    outcome: str,
+    visit_id: str,
+    observation_epoch: int,
+) -> dict[str, Any] | None:
+    """Persist a verified recovery provider, merging equivalent behavior."""
+    if outcome not in {"state_left", "changed_same_state"}:
+        return None
+    candidate = normalize_provider(raw_provider, index=len(controller.get("providers", [])) + 1)
+    if candidate is None:
+        return None
+    candidate["source"] = "llm_capacity_recovery"
+    candidate["learned_from_visit"] = visit_id
+    candidate["learned_from_observation_epoch"] = int(observation_epoch)
+    candidate["promotion_reason"] = outcome
+    candidate["status"] = "active" if outcome == "state_left" else "proposed"
+
+    providers = controller.get("providers") if isinstance(controller.get("providers"), list) else []
+    controller["providers"] = providers
+    signature = provider_resolver_signature(candidate)
+    existing = next(
+        (item for item in providers if isinstance(item, dict) and provider_resolver_signature(item) == signature),
+        None,
+    )
+    if isinstance(existing, dict):
+        counts = existing.get("result_counts") if isinstance(existing.get("result_counts"), dict) else {}
+        existing["result_counts"] = counts
+        counts[outcome] = int(counts.get(outcome, 0) or 0) + 1
+        if outcome == "state_left":
+            existing["success_count"] = int(existing.get("success_count", 0) or 0) + 1
+            existing["status"] = "active"
+        existing["source"] = existing.get("source") or "llm_capacity_recovery"
+        existing["promotion_reason"] = outcome
+        existing["updated_at"] = _now_iso()
+        controller["updated_at"] = _now_iso()
+        return existing
+
+    used_ids = {str(item.get("provider_id") or "") for item in providers if isinstance(item, dict)}
+    base_id = str(candidate.get("provider_id") or "capacity_recovery")
+    unique_id = base_id
+    suffix = 2
+    while unique_id in used_ids:
+        unique_id = f"{base_id}_{suffix}"
+        suffix += 1
+    candidate["provider_id"] = unique_id
+    candidate["result_counts"] = {outcome: 1}
+    candidate["success_count"] = 1 if outcome == "state_left" else 0
+    providers.append(candidate)
+    controller["updated_at"] = _now_iso()
+    return candidate
+
+
+def grant_capacity_after_recovery(cursor: dict[str, Any]) -> dict[str, int]:
+    """Give a successful same-state recovery a small fixed local follow-up window."""
+    cursor["action_capacity"] = min(
+        PROGRESS_HARD_MAX_ACTIONS,
+        max(int(cursor.get("action_capacity", 0) or 0), int(cursor.get("total_actions", 0) or 0)) + 4,
+    )
+    cursor["observation_capacity"] = min(
+        PROGRESS_HARD_MAX_OBSERVATIONS,
+        max(int(cursor.get("observation_capacity", 0) or 0), int(cursor.get("observation_epoch", 1) or 1)) + 2,
+    )
+    cursor["updated_at"] = _now_iso()
+    return {
+        "actions": int(cursor["action_capacity"]),
+        "observations": int(cursor["observation_capacity"]),
+    }
