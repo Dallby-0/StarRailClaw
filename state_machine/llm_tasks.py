@@ -113,17 +113,17 @@ def _request_llm_payload(
         "instruction": (
             "请按 system 约定输出 JSON。先照常输出用于建立新状态的页面元素信息；"
             "possible_page_type 必须从 known_page_types.page_type 中选择，若都不像则输出 none。"
-            "同时给出最多两个 bootstrap operation；固定点是首选，步骤必须包含 expected_after。"
-            "operation 表达当前页面的一次完整推进，但优先只输出当前画面最明显的一个直接 step；"
-            "若需先选卡再确认，使用同一个 select_and_confirm operation，只有确认也已明确可见时才输出第二 step。"
-            "禁止拆成两个并列 operations；多个 operations 只表示不同 intent 下互斥的操作。"
+            "同时给出最多两个 bootstrap operation；每个 operation 直接包含 reactive providers。"
+            "operation 表达当前页面的一次完整推进；当前画面中明显的短动作链可以在一次调用中给出，"
+            "但必须拆成独立 provider，并用 successors 表达后继先验。只有前一步后才出现的特征使用 deferred_hints。"
+            "禁止把顺序必做的动作拆成并列 operations；多个 operations 只表示不同 intent 下互斥的操作。"
             "如果 active_intent 非空，判断页面与 intent 的关系，并只为该 intent 或透明阻塞层提出操作。"
             "如果 active_intent 为空，仅当页面存在同识别异操作或操作必须跨多个页面保持语义时，才输出 intent_proposal；"
             "普通唯一推进页面不得创建 intent_proposal。"
             "若 previous_surface 非空，第一张图片是前驱交互表面的样本，第二张是当前图片；"
             "优先判断当前图是否只是同一交互表面的页内下一步，并填写 surface_relation/common_identity。"
             "若是 same_surface_step，bootstrap operation 必须沿用 previous_surface 的完整页面目标语义，"
-            "不要按当前步骤按钮、具体事件或具体选项重新命名 operation。"
+            "不要按当前临时元素或具体实例重新命名 operation。core provider 必须保持领域无关。"
         ),
     }
     # State recognition and bootstrap action planning share exactly one image

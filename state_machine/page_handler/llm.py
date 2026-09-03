@@ -5,15 +5,24 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import cv2
+import numpy as np
+
 from agent.llm_client import DoubaoClient
-from agent.responses_protocol import response_output_text
 from state_machine.constants import LLM_PARSE_RETRY
-from state_machine.llm_tasks import _apply_reasoning_effort, _build_user_message_from_frame, _build_user_message_from_two_frames, _normalize_assistant_text, _save_llm_raw_debug
-from state_machine.logger import FsmRunLogger
 from state_machine.io import _save_frame
-from state_machine.page_handler.reactive import normalize_provider
+from state_machine.llm_tasks import (
+    _apply_reasoning_effort,
+    _build_user_message_from_frame,
+    _build_user_message_from_two_frames,
+    _normalize_assistant_text,
+    _save_llm_raw_debug,
+)
+from state_machine.logger import FsmRunLogger
 from state_machine.page_handler.store import handler_summary
-from state_machine.page_handler.review_protocol import parse_same_state_review
+
+
+MAX_QUERY_CELLS = 2
 
 
 def _log(logger: FsmRunLogger | None, message: str, event: str = "console", **fields: Any) -> None:
@@ -23,43 +32,7 @@ def _log(logger: FsmRunLogger | None, message: str, event: str = "console", **fi
     logger.text(message, event=event, **fields)
 
 
-def parse_handler_response(text: str) -> dict[str, Any] | None:
-    try:
-        payload = json.loads(text)
-    except Exception:
-        return None
-    if not isinstance(payload, dict) or not isinstance(payload.get("handler_patch"), dict):
-        return None
-    event = payload.get("event")
-    if event is not None and not isinstance(event, dict):
-        return None
-    payload.setdefault("event", {})
-    return payload
-
-
-def parse_progress_audit(text: str) -> dict[str, Any] | None:
-    try:
-        payload = json.loads(text)
-    except Exception:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    verdict = str(payload.get("verdict") or "").strip().lower()
-    if verdict not in {"progressing", "new_instance", "stalled", "looping", "uncertain"}:
-        return None
-    confidence = str(payload.get("confidence") or "low").strip().lower()
-    if confidence not in {"high", "mid", "low"}:
-        confidence = "low"
-    evidence = payload.get("evidence") if isinstance(payload.get("evidence"), list) else []
-    return {
-        "verdict": verdict,
-        "confidence": confidence,
-        "reason": str(payload.get("reason") or "")[:500],
-        "evidence": [str(item)[:240] for item in evidence[:8]],
-    }
-
-
-def parse_next_action_recovery(text: str) -> dict[str, Any] | None:
+def parse_repair_response(text: str) -> dict[str, Any] | None:
     try:
         payload = json.loads(text)
     except Exception:
@@ -67,459 +40,206 @@ def parse_next_action_recovery(text: str) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         return None
     decision = str(payload.get("decision") or "").strip().lower()
-    if decision not in {"act", "give_up"}:
-        return None
-    result = {"decision": decision, "reason": str(payload.get("reason") or "")[:500]}
     if decision == "give_up":
-        return result
-    provider = normalize_provider(payload.get("provider"), index=1)
-    if provider is None or provider.get("kind") != "action":
+        return {"decision": decision, "reason": str(payload.get("reason") or "")[:500]}
+    if decision == "query":
+        queries = payload.get("image_queries") if isinstance(payload.get("image_queries"), list) else []
+        cell_ids = [str(item.get("cell_id") or "") for item in queries if isinstance(item, dict) and str(item.get("cell_id") or "")]
+        if not cell_ids:
+            return None
+        return {"decision": decision, "image_queries": cell_ids[:MAX_QUERY_CELLS], "reason": str(payload.get("reason") or "")[:500]}
+    if decision != "repair" or not isinstance(payload.get("local_patch"), dict):
         return None
-    result["provider"] = provider
-    return result
+    local_patch = payload["local_patch"]
+    if not isinstance(local_patch.get("providers"), list):
+        return None
+    candidates = payload.get("generalization_candidates")
+    if candidates is not None and not isinstance(candidates, list):
+        return None
+    return {
+        "decision": decision,
+        "local_patch": {"providers": local_patch["providers"]},
+        "generalization_candidates": candidates or [],
+        "reason": str(payload.get("reason") or "")[:500],
+    }
 
 
-def _save_llm_input_bundle(
-    logger: FsmRunLogger | None,
-    *,
-    kind: str,
-    context: dict[str, Any],
-    frames: list[Any],
-) -> str | None:
-    """Persist the exact structured prompt and ordered frames for diagnosis."""
+def _make_contact_sheet(history: list[dict[str, Any]]) -> tuple[np.ndarray, list[dict[str, Any]], dict[str, Any]]:
+    available = [item for item in history if isinstance(item, dict) and item.get("frame") is not None]
+    family = next((item for item in available if item.get("kind") == "stored_family_sample"), None)
+    selected = ([family] if family is not None else []) + [item for item in available[-5:] if item is not family]
+    if not selected:
+        raise ValueError("repair history has no frames")
+    cell_w, cell_h = 320, 180
+    cells: list[np.ndarray] = []
+    manifest: list[dict[str, Any]] = []
+    frame_index: dict[str, Any] = {}
+    for index, item in enumerate(selected, 1):
+        frame = item["frame"]
+        cell_id = str(item.get("cell_id") or f"cell_{index}")
+        resized = cv2.resize(frame, (cell_w, cell_h), interpolation=cv2.INTER_AREA)
+        cv2.rectangle(resized, (0, 0), (cell_w, 24), (0, 0, 0), -1)
+        cv2.putText(resized, cell_id, (7, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
+        cells.append(resized)
+        entry = {key: value for key, value in item.items() if key != "frame"}
+        entry["cell_id"] = cell_id
+        manifest.append(entry)
+        frame_index[cell_id] = frame
+    columns = 2
+    rows = (len(cells) + columns - 1) // columns
+    sheet = np.zeros((rows * cell_h, columns * cell_w, 3), dtype=np.uint8)
+    for index, cell in enumerate(cells):
+        row, column = divmod(index, columns)
+        sheet[row * cell_h : (row + 1) * cell_h, column * cell_w : (column + 1) * cell_w] = cell
+    return sheet, manifest, frame_index
+
+
+def _save_bundle(logger: FsmRunLogger | None, context: dict[str, Any], current, sheet, history: list[dict[str, Any]]) -> str | None:
     if logger is None:
         return None
     try:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        bundle_dir = Path(logger.llm_raw_dir) / f"bundle_{kind}_{stamp}"
-        bundle_dir.mkdir(parents=True, exist_ok=True)
-        (bundle_dir / "request.json").write_text(json.dumps(context, ensure_ascii=False, indent=2), encoding="utf-8")
-        for index, frame in enumerate(frames):
-            _save_frame(bundle_dir / f"frame_{index}.png", frame)
-        return str(bundle_dir)
+        root = Path(logger.llm_raw_dir) / f"bundle_reactive_repair_{stamp}"
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "request.json").write_text(json.dumps(context, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        _save_frame(root / "current_full.png", current)
+        _save_frame(root / "contact_sheet.png", sheet)
+        available = [item for item in history if isinstance(item, dict) and item.get("frame") is not None]
+        family = next((item for item in available if item.get("kind") == "stored_family_sample"), None)
+        selected = ([family] if family is not None else []) + [item for item in available[-5:] if item is not family]
+        for item in selected:
+            if isinstance(item, dict) and item.get("frame") is not None:
+                _save_frame(root / f"{item.get('cell_id', 'frame')}.png", item["frame"])
+        return str(root)
     except Exception:
-        # Logging must not decide whether the controller is allowed to recover.
         return None
 
 
-def _save_llm_bundle_output(bundle_dir: str | None, raw: str, parsed: Any) -> None:
-    if bundle_dir is None:
-        return
-    try:
-        Path(bundle_dir, "response_raw.txt").write_text(raw, encoding="utf-8")
-        Path(bundle_dir, "parsed_response.json").write_text(json.dumps(parsed, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        return
-
-
-def request_progress_audit(
+def _repair_context(
     *,
-    llm: DoubaoClient,
-    session_id: str,
-    state_meta: dict[str, Any],
-    command: dict[str, Any],
-    cursor: dict[str, Any],
-    observations: list[dict[str, Any]],
-    logger: FsmRunLogger | None,
-) -> dict[str, Any] | None:
-    """Judge a short visual trajectory; runtime alone owns capacity values."""
-    usable = [item for item in observations if isinstance(item, dict) and item.get("frame") is not None]
-    if len(usable) < 2:
-        return None
-    selected = usable if len(usable) <= 4 else [usable[0], *usable[-3:]]
-    trajectory = []
-    for index, item in enumerate(selected):
-        trajectory.append({
-            "frame_index": index,
-            "provider_id": item.get("provider_id"),
-            "provider_kind": item.get("provider_kind"),
-            "outcome": item.get("outcome"),
-            "changed": item.get("changed"),
-            "diff_score": item.get("diff_score"),
-            "action_count": item.get("action_count", 0),
-            "observation_epoch": item.get("observation_epoch"),
-            "note": str(item.get("note") or "")[:240],
-        })
-    context = {
-        "mode": "REACTIVE_PROGRESS_AUDIT",
-        "instruction": (
-            "这些图片按时间顺序展示同一 page family 最近的一段动作轨迹。"
-            "请判断流程是否在产生实际业务推进，不要把动画、闪烁、选中高亮或无意义来回切换当成推进。"
-            "如果完成了一轮操作后出现新的同类页面实例，输出 new_instance；"
-            "如果步骤或内容持续向目标前进，输出 progressing；若没有有效推进输出 stalled；"
-            "若画面和动作序列重复形成循环输出 looping；证据不足输出 uncertain。"
-            "你只负责分类，不得建议、猜测或输出任何动作次数、上限、扩容量或新操作。只输出严格 JSON。"
-        ),
-        "state": {
-            "state_id": state_meta.get("state_id"),
-            "slug": state_meta.get("slug"),
-            "page_type": state_meta.get("page_type"),
-            "page_family": state_meta.get("page_family"),
-            "description": str(state_meta.get("description") or "")[:240],
-        },
-        "effective_command": command,
-        "runtime_summary": {
-            "total_actions": int(cursor.get("total_actions", 0) or 0),
-            "observation_epoch": int(cursor.get("observation_epoch", 1) or 1),
-            "capacity_extensions": int(cursor.get("capacity_extensions", 0) or 0),
-        },
-        "trajectory": trajectory,
-        "output_schema": {
-            "verdict": "progressing|new_instance|stalled|looping|uncertain",
-            "confidence": "high|mid|low",
-            "reason": "short reason based on temporal evidence",
-            "evidence": ["short visible or action-sequence evidence"],
-        },
-    }
-    audit_system_prompt = (
-        "你是游戏自动化运行轨迹审计器。你只根据按时间排序的截图和动作摘要判断是否实际推进、"
-        "进入同类新实例、停滞或循环。不要规划动作，不要输出任何次数或容量。必须只输出约定 JSON。"
-    )
-    try:
-        bundle_dir = _save_llm_input_bundle(logger, kind="progress_audit", context=context, frames=[item["frame"] for item in selected])
-        resp = llm.responses_json_schema(
-            system_prompt=audit_system_prompt,
-            user_text=json.dumps(context, ensure_ascii=False),
-            image_data_urls=[DoubaoClient.encode_image_to_data_url(item["frame"]) for item in selected],
-            schema_name="reactive_progress_audit",
-            schema={
-                "type": "object",
-                "properties": {
-                    "verdict": {"type": "string", "enum": ["progressing", "new_instance", "stalled", "looping", "uncertain"]},
-                    "confidence": {"type": "string", "enum": ["high", "mid", "low"]},
-                    "reason": {"type": "string"},
-                    "evidence": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
-                },
-                "required": ["verdict", "confidence", "reason", "evidence"],
-                "additionalProperties": False,
-            },
-        )
-    except Exception as exc:  # noqa: BLE001
-        _log(
-            logger,
-            f"[fsm][handler][progress-audit] request failed type={type(exc).__name__}",
-            "llm_progress_audit_error",
-            error_type=type(exc).__name__,
-            error_message=str(exc)[:300],
-        )
-        return None
-    raw = response_output_text(resp)
-    _save_llm_raw_debug(session_id, 1, raw, "progress_audit", logger.llm_raw_dir if logger is not None else None)
-    parsed = parse_progress_audit(raw)
-    _save_llm_bundle_output(bundle_dir, raw, parsed)
-    _log(logger, f"[fsm][handler][progress-audit] raw={raw[:600]}", "llm_progress_audit_raw", raw_preview=raw[:600], input_bundle=bundle_dir, parsed=parsed)
-    return parsed
-
-
-def request_next_action_recovery(
-    *,
-    llm: DoubaoClient,
-    session_id: str,
     state_meta: dict[str, Any],
     handler: dict[str, Any],
     command: dict[str, Any],
-    cursor: dict[str, Any],
-    observations: list[dict[str, Any]],
-    failed_attempts: list[dict[str, Any]],
-    logger: FsmRunLogger | None,
-) -> dict[str, Any] | None:
-    """Request one ephemeral action after local capacity is exhausted."""
-    usable = [item for item in observations if isinstance(item, dict) and item.get("frame") is not None]
-    if not usable:
-        return None
-    selected = usable if len(usable) <= 3 else [usable[0], *usable[-2:]]
-    trajectory = [{
-        "frame_index": index,
-        "provider_id": item.get("provider_id"),
-        "outcome": item.get("outcome"),
-        "changed": item.get("changed"),
-        "diff_score": item.get("diff_score"),
-        "observation_epoch": item.get("observation_epoch"),
-        "note": str(item.get("note") or "")[:200],
-    } for index, item in enumerate(selected)]
-    context = {
-        "mode": "REACTIVE_NEXT_ACTION_RECOVERY",
+    failures: list[dict[str, Any]],
+    cursor_summary: dict[str, Any],
+    manifest: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "mode": "REACTIVE_HANDLER_V2_REPAIR",
         "instruction": (
-            "本地反应式控制器已触及容量上限。请只根据按时间排序的截图、当前目标和失败摘要，"
-            "选择一个最可能让当前页面继续推进的单步动作。该动作会先临时执行，只有真实验证成功后才会写入 handler。"
-            "优先复用页面上明显可见的选项、确认、继续、提交等交互；低风险页面允许固定点。"
-            "不要设计多步宏，不要修改状态、intent、容量或 handler；不要输出探索计划。"
-            "region_template 的 template_bbox 必须来自最后一张图，search_rect 是允许搜索的区域。"
-            "如果没有合理动作则 decision=give_up。只输出严格 JSON。"
+            "Repair only the current operation. The first image is the current full-resolution stable frame; "
+            "the second is a chronological contact sheet described by frame_manifest. "
+            "Return either a bounded image query, give_up, or a repair. A repair should add the smallest local provider set "
+            "that can advance the current instance. When two or more variants reveal a real shared visual invariant, also "
+            "propose a separate family-scoped generalization candidate. Never replace a working instance provider and never "
+            "generalize by averaging coordinates. Core providers must remain domain-neutral. All persisted points and rectangles "
+            "use 1000x1000 logical coordinates. A point locator must explicitly say coordinate_space=logical. "
+            "Hints are soft ranking evidence. Effect hints are observable hypotheses, not promises. Deferred hints describe "
+            "features that can only be materialized after a predecessor provider. Do not output safety classifications."
         ),
         "state": {
             "state_id": state_meta.get("state_id"),
-            "slug": state_meta.get("slug"),
-            "page_type": state_meta.get("page_type"),
             "page_family": state_meta.get("page_family"),
-            "description": str(state_meta.get("description") or "")[:240],
+            "description": str(state_meta.get("description") or "")[:300],
         },
         "effective_command": command,
         "handler": handler_summary(handler),
-        "runtime_summary": {
-            "total_actions": int(cursor.get("total_actions", 0) or 0),
-            "observation_epoch": int(cursor.get("observation_epoch", 1) or 1),
-        },
-        "trajectory": trajectory,
-        "failed_attempts": failed_attempts[-8:],
+        "failed_attempts": failures[-12:],
+        "runtime": cursor_summary,
+        "frame_manifest": manifest,
+        "query_budget": {"max_cells": MAX_QUERY_CELLS, "one_query_round": True},
         "output_schema": {
-            "decision": "act|give_up",
-            "reason": "short visual reason",
-            "provider": {
-                "provider_id": "stable descriptive id",
-                "kind": "action",
-                "cost": "integer 0..20",
-                "repeat_policy": "once_per_visit|once_per_observation|repeatable",
-                "status": "proposed",
-                "resolver": {
-                    "type": "fixed_point|region_template|run_preset",
-                    "x": 0,
-                    "y": 0,
-                    "template_bbox": [0, 0, 0, 0],
-                    "search_rect": [0, 0, 0, 0],
-                    "threshold": 0.82,
-                    "name": "",
-                },
-                "expected_after": {"state_relation": "must_leave|must_remain|may_leave", "reentry_policy": "forbid|new_visit|same_visit"},
-                "brief": "short action description",
+            "decision": "query|repair|give_up",
+            "image_queries": [{"cell_id": "id from frame_manifest"}],
+            "local_patch": {"providers": ["provider objects"]},
+            "generalization_candidates": ["provider objects with a visual invariant, or empty"],
+            "reason": "short string",
+            "provider_object": {
+                "provider_id": "stable domain-neutral id",
+                "base_priority": 0,
+                "repeat_policy": "once_per_visit|after_confirmed_effect",
+                "locators": [
+                    {"type": "point", "x": 0, "y": 0, "coordinate_space": "logical", "source": "bootstrap|verified"},
+                    {"type": "region_template", "template_bbox": [0, 0, 0, 0], "search_rect": [0, 0, 0, 0], "threshold": 0.82, "coordinate_space": "logical"},
+                    {"type": "text_target", "rect": [0, 0, 0, 0], "texts": ["visible text"], "coordinate_space": "logical"},
+                    {"type": "run_preset", "name": "registered preset name"},
+                ],
+                "hints": [
+                    {"id": "id", "type": "template", "template_bbox": [0, 0, 0, 0], "rect": [0, 0, 0, 0], "coordinate_space": "logical"},
+                    {"id": "id", "type": "text", "rect": [0, 0, 0, 0], "texts": ["text"], "coordinate_space": "logical"},
+                    {"id": "id", "type": "line_count", "rect": [0, 0, 0, 0], "min": 1, "max": 2, "coordinate_space": "logical"},
+                ],
+                "deferred_hints": [{"id": "id", "type": "template|text|line_count", "materialize_after": "provider_id", "rect": [0, 0, 0, 0], "template_bbox": [0, 0, 0, 0], "coordinate_space": "logical"}],
+                "effect_hints": [{"id": "id", "probe": {"id": "id", "type": "template|text|line_count"}, "expected": "pass|becomes_pass|becomes_fail"}],
+                "successors": ["provider_id"],
+                "emits_on_success": {"type": "optional event"},
+                "brief": "short description",
             },
         },
     }
-    frames = [item["frame"] for item in selected]
-    bundle_dir = _save_llm_input_bundle(logger, kind="next_action_recovery", context=context, frames=frames)
-    recovery_system_prompt = (
-        "你是低风险游戏自动化的单步恢复控制器。只选择一个当前可执行动作，不规划多步流程，"
-        "不修改状态机，不建议容量。输出必须严格符合 JSON schema。"
-    )
-    try:
-        resp = llm.responses_json_schema(
-            system_prompt=recovery_system_prompt,
-            user_text=json.dumps(context, ensure_ascii=False),
-            image_data_urls=[DoubaoClient.encode_image_to_data_url(frame) for frame in frames],
-            schema_name="reactive_next_action_recovery",
-            schema={
-                "type": "object",
-                "properties": {
-                    "decision": {"type": "string", "enum": ["act", "give_up"]},
-                    "reason": {"type": "string"},
-                    "provider": {
-                        "type": "object",
-                        "properties": {
-                            "provider_id": {"type": "string"},
-                            "kind": {"type": "string", "enum": ["action"]},
-                            "cost": {"type": "integer", "minimum": 0, "maximum": 20},
-                            "repeat_policy": {"type": "string", "enum": ["once_per_visit", "once_per_observation", "repeatable"]},
-                            "status": {"type": "string", "enum": ["proposed"]},
-                            "resolver": {
-                                "type": "object",
-                                "properties": {
-                                    "type": {"type": "string", "enum": ["fixed_point", "region_template", "run_preset"]},
-                                    "x": {"type": "integer"},
-                                    "y": {"type": "integer"},
-                                    "template_bbox": {"type": "array", "items": {"type": "integer"}, "minItems": 4, "maxItems": 4},
-                                    "search_rect": {"type": "array", "items": {"type": "integer"}, "minItems": 4, "maxItems": 4},
-                                    "threshold": {"type": "number"},
-                                    "name": {"type": "string"},
-                                },
-                                "required": ["type", "x", "y", "template_bbox", "search_rect", "threshold", "name"],
-                                "additionalProperties": False,
-                            },
-                            "expected_after": {
-                                "type": "object",
-                                "properties": {
-                                    "state_relation": {"type": "string", "enum": ["must_leave", "must_remain", "may_leave"]},
-                                    "reentry_policy": {"type": "string", "enum": ["forbid", "new_visit", "same_visit"]},
-                                },
-                                "required": ["state_relation", "reentry_policy"],
-                                "additionalProperties": False,
-                            },
-                            "brief": {"type": "string"},
-                        },
-                        "required": ["provider_id", "kind", "cost", "repeat_policy", "status", "resolver", "expected_after", "brief"],
-                        "additionalProperties": False,
-                    },
-                },
-                "required": ["decision", "reason", "provider"],
-                "additionalProperties": False,
-            },
-        )
-    except Exception as exc:  # noqa: BLE001
-        _log(logger, f"[fsm][handler][capacity-recovery] request failed type={type(exc).__name__}", "llm_capacity_recovery_error", error_type=type(exc).__name__, error_message=str(exc)[:300], input_bundle=bundle_dir)
-        return None
-    raw = response_output_text(resp)
-    _save_llm_raw_debug(session_id, 1, raw, "next_action_recovery", logger.llm_raw_dir if logger is not None else None)
-    parsed = parse_next_action_recovery(raw)
-    _save_llm_bundle_output(bundle_dir, raw, parsed)
-    if bundle_dir is not None:
-        if isinstance(parsed, dict):
-            parsed["_input_bundle"] = bundle_dir
-    _log(logger, f"[fsm][handler][capacity-recovery] raw={raw[:600]}", "llm_capacity_recovery_raw", raw_preview=raw[:600], input_bundle=bundle_dir, parsed=parsed)
-    return parsed
-
-
-def request_same_state_review(
-    *,
-    llm: DoubaoClient,
-    session_id: str,
-    before_frame_rgb,
-    after_frame_rgb,
-    system_prompt: str,
-    state_meta: dict[str, Any],
-    handler: dict[str, Any],
-    command: dict[str, Any],
-    executed_action: dict[str, Any],
-    logger: FsmRunLogger | None,
-) -> dict[str, Any] | None:
-    """Resolve the semantic ambiguity when an action ends in the same state class.
-
-    This is deliberately one model call. The same response both judges the
-    previous action and supplies a corrected/continuation strategy when needed.
-    """
-    context = {
-        "mode": "SAME_STATE_ACTION_REVIEW",
-        "instruction": (
-            "第一张图是执行前，第二张图是执行后。外部 matcher 认为两张图属于同一页面状态。"
-            "请判断上一个动作对 effective_command 的完整目标是否有效，而不是仅判断是否出现像素变化。"
-            "即使 effective_command 的旧名称只写了 select，也要以完成当前页面的一次推进为目标，而不是拘泥于窄名称。"
-            "若动作已经推进页面但仍需重复同一动作，应判 partial_needs_continue，continuation.reuse_strategy=true，"
-            "无需生成同义 handler_patch；若只是选中了卡片且下一步需要点击不同的确认按钮，也判 partial_needs_continue，"
-            "但 continuation.reuse_strategy=false，并在 handler_patch 中给出后续策略。若点击完全无效则判 ineffective 并给出替代策略。"
-            "若旧页面已经完成、第二张图是连续弹出的同类新事件，判 completed_new_visit。"
-            "如果第二张图仍有已启用的确认、继续、提交按钮，禁止判 completed_same_visit；必须判 partial_needs_continue。"
-            "只有操作的完整页面推进语义已经完成且确实应停留在当前页面实例时才判 completed_same_visit。"
-            "不得创建或修改 intent，patch 中 operation 必须等于 effective_command.operation。只输出严格 JSON。"
-        ),
-        "state": {"state_id": state_meta.get("state_id"), "slug": state_meta.get("slug"), "description": str(state_meta.get("description", ""))[:240]},
-        "effective_command": command,
-        "executed_action": executed_action,
-        "handler": handler_summary(handler),
-        "output_schema": {
-            "verdict": "completed_same_visit|completed_new_visit|partial_needs_continue|ineffective|wrong_effect|uncertain",
-            "reason": "short visual/semantic reason",
-            "event": {"type": "optional observed semantic event, including page-local progress"},
-            "continuation": {
-                "reuse_strategy": "true only when repeating the executed strategy is the correct next action",
-                "max_additional_actions": "integer 1..12; omit unless partial_needs_continue"
-            },
-            "handler_patch": {
-                "operations": [{
-                    "operation": "must equal effective_command.operation",
-                    "intent_scope": "intent_specific|intent_invariant",
-                    "intent_effect": "advance|preserve|complete|none",
-                    "safety": "low_risk|reversible|commit|destructive",
-                    "expected_event": "semantic event",
-                    "strategies": [{
-                        "strategy_id": "new stable id",
-                        "level": "integer greater than failed strategy when correcting",
-                        "status": "proposed",
-                        "steps": [{
-                            "step_id": "short id",
-                            "resolver": {"type": "fixed_point|region_template|run_preset", "x": 0, "y": 0, "template_bbox": [0, 0, 0, 0], "search_rect": [0, 0, 0, 0], "threshold": 0.82, "name": ""},
-                            "expected_after": {"state_relation": "must_leave|must_remain|may_leave", "reentry_policy": "forbid|new_visit|same_visit"},
-                            "emits_on_success": {"type": "semantic event"},
-                            "brief": "short string"
-                        }]
-                    }]
-                }]
-            }
-        },
-    }
-    msg = _build_user_message_from_two_frames(before_frame_rgb, after_frame_rgb, json.dumps(context, ensure_ascii=False))
-    resp = llm.chat_with_session(session_id=session_id, system_prompt=system_prompt, user_message=msg, tools=[], tool_choice="none")
-    raw = _normalize_assistant_text(resp["choices"][0]["message"].get("content"))
-    _save_llm_raw_debug(session_id, 1, raw, "same_state_review", logger.llm_raw_dir if logger is not None else None)
-    _log(logger, f"[fsm][handler][same-state-review] raw={raw[:600]}", "llm_same_state_review_raw", raw_preview=raw[:600])
-    return parse_same_state_review(raw)
 
 
 def request_handler_repair(
     *,
     llm: DoubaoClient,
     session_id: str,
-    frame_rgb,
-    previous_frame_rgb,
+    current_frame,
+    history: list[dict[str, Any]],
     system_prompt: str,
     state_meta: dict[str, Any],
     handler: dict[str, Any],
     command: dict[str, Any],
     failed_attempts: list[dict[str, Any]],
+    cursor_summary: dict[str, Any],
     logger: FsmRunLogger | None,
     effort: str | None = "high",
 ) -> dict[str, Any] | None:
+    sheet, manifest, frame_index = _make_contact_sheet(history)
+    context = _repair_context(
+        state_meta=state_meta,
+        handler=handler,
+        command=command,
+        failures=failed_attempts,
+        cursor_summary=cursor_summary,
+        manifest=manifest,
+    )
+    bundle = _save_bundle(logger, context, current_frame, sheet, history)
     old_effort = _apply_reasoning_effort(llm, effort)
     try:
-        context = {
-            "mode": "PROGRESSIVE_HANDLER_REPAIR",
-            "instruction": (
-                "当前页面状态已确认。请只修复 effective_command 对应的页面操作策略，不要创建或修改 intent。"
-                "当前 handler 使用 reactive_local 控制器时，优先向同一 operation 的 controller.providers 追加一个最小立即动作，"
-                "并尽可能把本次布局差异提炼为 fallback_profiles（受限区域 OCR、水平/垂直探测、template_offset），"
-                "使同族页面的其他布局也能本地推进，而不是只增加当前截图专用的完整多步 strategy。"
-                "provider 按 cost 从低到高惰性执行；画面变化后 runtime 会重新观察，禁止生成无条件连点宏。"
-                "固定点使用 once_per_visit；OCR、模板或探索可以使用 once_per_observation。"
-                "精确动作 expected_after 必须使用 state_relation 和 reentry_policy。"
-                "页面内推进可用 may_leave/same_visit；普通退出使用 must_leave/forbid；同类页面连续出现用 must_leave/new_visit。"
-                "低风险提示页可以固定坐标；提交或破坏性动作必须带明确安全等级和视觉定位。只输出严格 JSON。"
-            ),
-            "state": {"state_id": state_meta.get("state_id"), "slug": state_meta.get("slug"), "page_type": state_meta.get("page_type"), "page_family": state_meta.get("page_family"), "description": str(state_meta.get("description", ""))[:240]},
-            "effective_command": command,
-            "handler": handler_summary(handler),
-            "failed_attempts": failed_attempts[-4:],
-            "output_schema": {
-                "handler_patch": {
-                    "operations": [{
-                        "operation": "must equal effective_command.operation",
-                        "intent_scope": "intent_specific|intent_invariant",
-                        "intent_effect": "advance|preserve|complete|none",
-                        "safety": "low_risk|reversible|commit|destructive",
-                        "expected_event": "optional semantic event",
-                        "controller": {
-                            "type": "reactive_local",
-                            "max_actions": 20,
-                            "max_observation_rounds": 10,
-                            "providers": [{
-                                "provider_id": "stable id",
-                                "kind": "action",
-                                "cost": "0 for direct point, 1-10 for exact visual action",
-                                "repeat_policy": "once_per_visit|once_per_observation|repeatable",
-                                "status": "proposed",
-                                "resolver": {"type": "fixed_point|region_template|run_preset", "x": 0, "y": 0, "template_bbox": [0, 0, 0, 0], "search_rect": [0, 0, 0, 0], "threshold": 0.82, "name": ""},
-                                "expected_after": {"state_relation": "must_leave|must_remain|may_leave", "reentry_policy": "forbid|new_visit|same_visit"},
-                                "emits_on_success": {"type": "semantic event"},
-                                "brief": "short string"
-                            }],
-                            "fallback_profiles": [{
-                                "id": "stable id",
-                                "kind": "horizontal_probe|confirm_search|template_offset",
-                                "region": [0, 0, 0, 0],
-                                "keywords": ["确定", "确认", "继续", "前往"],
-                                "x_start": 0,
-                                "x_end": 0,
-                                "y": 0,
-                                "samples": 5,
-                                "template_path": "",
-                                "template_bbox": [0, 0, 0, 0],
-                                "click_offset": [0, 0]
-                            }]
-                        },
-                    }],
-                },
-                "event": {"type": "optional event already evident on current page", "facts": {}},
-                "reason": "short string",
-            },
-        }
-        text = json.dumps(context, ensure_ascii=False)
+        prompt = json.dumps(context, ensure_ascii=False)
         for attempt in range(1, LLM_PARSE_RETRY + 2):
-            if attempt == 1:
-                msg = _build_user_message_from_two_frames(previous_frame_rgb, frame_rgb, text) if previous_frame_rgb is not None else _build_user_message_from_frame(frame_rgb, text)
-            else:
-                msg = {"role": "user", "content": [{"type": "text", "text": "上次 JSON 无效。只输出符合 output_schema 的完整 JSON，不要解释。"}]}
-            resp = llm.chat_with_session(session_id=session_id, system_prompt=system_prompt, user_message=msg, tools=[], tool_choice="none")
-            raw = _normalize_assistant_text(resp["choices"][0]["message"].get("content"))
-            _save_llm_raw_debug(session_id, attempt, raw, "page_handler_repair", logger.llm_raw_dir if logger is not None else None)
-            _log(logger, f"[fsm][handler][repair-llm] attempt={attempt} raw={raw[:600]}", "llm_page_handler_repair_raw", attempt=attempt, raw_preview=raw[:600])
-            parsed = parse_handler_response(raw)
-            if parsed is not None:
+            message = _build_user_message_from_two_frames(current_frame, sheet, prompt) if attempt == 1 else {
+                "role": "user",
+                "content": [{"type": "text", "text": "The previous response was invalid. Return one strict JSON object matching output_schema."}],
+            }
+            response = llm.chat_with_session(session_id=session_id, system_prompt=system_prompt, user_message=message, tools=[], tool_choice="none")
+            raw = _normalize_assistant_text(response["choices"][0]["message"].get("content"))
+            _save_llm_raw_debug(session_id, attempt, raw, "reactive_repair", logger.llm_raw_dir if logger is not None else None)
+            parsed = parse_repair_response(raw)
+            if parsed is None:
+                continue
+            if parsed["decision"] != "query":
+                if bundle:
+                    parsed["_input_bundle"] = bundle
+                return parsed
+            requested = [cell_id for cell_id in parsed["image_queries"] if cell_id in frame_index]
+            if not requested:
+                continue
+            query_text = json.dumps({
+                "instruction": "These are the requested full-resolution cells. Now return decision=repair or decision=give_up; no more queries.",
+                "cells": requested,
+            }, ensure_ascii=False)
+            query_message = (
+                _build_user_message_from_two_frames(frame_index[requested[0]], frame_index[requested[1]], query_text)
+                if len(requested) > 1
+                else _build_user_message_from_frame(frame_index[requested[0]], query_text)
+            )
+            response = llm.chat_with_session(session_id=session_id, system_prompt=system_prompt, user_message=query_message, tools=[], tool_choice="none")
+            raw = _normalize_assistant_text(response["choices"][0]["message"].get("content"))
+            parsed = parse_repair_response(raw)
+            if parsed is not None and parsed["decision"] != "query":
+                if bundle:
+                    parsed["_input_bundle"] = bundle
                 return parsed
     finally:
         llm.reasoning_effort = old_effort

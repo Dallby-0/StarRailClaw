@@ -45,10 +45,12 @@ def state_bootstrap_json_schema() -> dict[str, Any]:
         "discrimination": level,
     })
 
-    fixed_point = _closed_object({
-        "type": {"type": "string", "enum": ["fixed_point"]},
+    point = _closed_object({
+        "type": {"type": "string", "enum": ["point"]},
         "x": {"type": "integer", "minimum": 0, "maximum": 1000},
         "y": {"type": "integer", "minimum": 0, "maximum": 1000},
+        "coordinate_space": {"type": "string", "enum": ["logical"]},
+        "source": {"type": "string", "enum": ["bootstrap"]},
     })
     run_preset = _closed_object({
         "type": {"type": "string", "enum": ["run_preset"]},
@@ -59,16 +61,60 @@ def state_bootstrap_json_schema() -> dict[str, Any]:
         "template_bbox": bbox,
         "search_rect": bbox,
         "threshold": {"type": "number", "minimum": 0, "maximum": 1},
+        "coordinate_space": {"type": "string", "enum": ["logical"]},
     })
-    expected_after = _closed_object({
-        "state_relation": {"type": "string", "enum": ["must_leave", "must_remain", "may_leave"]},
-        "reentry_policy": {"type": "string", "enum": ["forbid", "new_visit", "same_visit"]},
+    text_target = _closed_object({
+        "type": {"type": "string", "enum": ["text_target"]},
+        "rect": bbox,
+        "texts": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 4},
+        "coordinate_space": {"type": "string", "enum": ["logical"]},
     })
+    template_hint = _closed_object({
+        "id": {"type": "string"},
+        "type": {"type": "string", "enum": ["template"]},
+        "template_bbox": bbox,
+        "rect": bbox,
+        "threshold": {"type": "number", "minimum": 0, "maximum": 1},
+        "coordinate_space": {"type": "string", "enum": ["logical"]},
+    })
+    text_hint = _closed_object({
+        "id": {"type": "string"},
+        "type": {"type": "string", "enum": ["text"]},
+        "rect": bbox,
+        "texts": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 4},
+        "coordinate_space": {"type": "string", "enum": ["logical"]},
+    })
+    line_hint = _closed_object({
+        "id": {"type": "string"},
+        "type": {"type": "string", "enum": ["line_count"]},
+        "rect": bbox,
+        "min": {"type": "integer", "minimum": 0, "maximum": 20},
+        "max": {"type": "integer", "minimum": 0, "maximum": 20},
+        "coordinate_space": {"type": "string", "enum": ["logical"]},
+    })
+    hint = {"anyOf": [template_hint, text_hint, line_hint]}
+
+    def deferred(variant: dict[str, Any]) -> dict[str, Any]:
+        props = dict(variant["properties"])
+        props["materialize_after"] = {"type": "string"}
+        return _closed_object(props)
+
+    deferred_hint = {"anyOf": [deferred(template_hint), deferred(text_hint), deferred(line_hint)]}
     event = _closed_object({"type": {"type": "string"}})
-    step = _closed_object({
-        "step_id": {"type": "string"},
-        "resolver": {"anyOf": [fixed_point, region_template, run_preset]},
-        "expected_after": expected_after,
+    effect_hint = _closed_object({
+        "id": {"type": "string"},
+        "probe": hint,
+        "expected": {"type": "string", "enum": ["pass", "becomes_pass", "becomes_fail"]},
+    })
+    provider = _closed_object({
+        "provider_id": {"type": "string"},
+        "base_priority": {"type": "integer", "minimum": -100, "maximum": 100},
+        "repeat_policy": {"type": "string", "enum": ["once_per_visit", "after_confirmed_effect"]},
+        "locators": {"type": "array", "items": {"anyOf": [point, region_template, text_target, run_preset]}, "minItems": 1, "maxItems": 4},
+        "hints": {"type": "array", "items": hint, "maxItems": 3},
+        "deferred_hints": {"type": "array", "items": deferred_hint, "maxItems": 2},
+        "effect_hints": {"type": "array", "items": effect_hint, "maxItems": 2},
+        "successors": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
         "emits_on_success": event,
         "brief": {"type": "string"},
     })
@@ -81,10 +127,9 @@ def state_bootstrap_json_schema() -> dict[str, Any]:
         "is_default": {"type": "boolean"},
         "intent_scope": {"type": "string", "enum": ["intent_invariant", "intent_specific"]},
         "intent_effect": {"type": "string", "enum": ["preserve", "advance", "complete", "none"]},
-        "safety": {"type": "string", "enum": ["low_risk", "reversible", "commit", "destructive"]},
         "expected_event": {"type": "string"},
         "intent_routes": {"type": "array", "items": intent_route, "maxItems": 4},
-        "steps": {"type": "array", "items": step, "minItems": 1, "maxItems": 2},
+        "providers": {"type": "array", "items": provider, "minItems": 1, "maxItems": 4},
     })
 
     transition = _closed_object({

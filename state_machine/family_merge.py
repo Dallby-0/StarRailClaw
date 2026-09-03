@@ -7,8 +7,7 @@ from agent.behavior_tree.coord_mapper import CoordinateMapper
 from agent.behavior_tree.vision import VisionEngine
 from state_machine.io import _backup_json, _load_frame, _now_iso, _save_json, _slugify
 from state_machine.logger import FsmRunLogger
-from state_machine.page_handler.reactive import merge_controller
-from state_machine.page_handler.store import ensure_page_handler, handler_from_bootstrap, materialize_strategy_templates
+from state_machine.page_handler.store import ensure_page_handler, handler_from_bootstrap, materialize_provider_templates, merge_operation
 from state_machine.page_identity import build_match_clauses, normalize_elements, record_condition_observations
 from state_machine.matching import _condition_passed
 from state_machine.state_builder import _conditions_from_elements, _extract_region_templates
@@ -38,19 +37,16 @@ def _merge_bootstrap_into_default(handler: dict[str, Any], operations: Any) -> s
         if not isinstance(target, dict):
             policies[target_name] = policy
             target = policy
-            if not default_name and str(policy.get("safety")) in {"low_risk", "reversible"}:
+            if not default_name:
                 handler["default_operation"] = {
                     "operation": target_name,
                     "intent_scope": policy.get("intent_scope", "intent_specific"),
                     "intent_effect": policy.get("intent_effect", "none"),
-                    "safety": policy.get("safety", "low_risk"),
                 }
                 default_name = target_name
         else:
-            existing_controller = target.get("controller") if isinstance(target.get("controller"), dict) else {}
-            incoming_controller = policy.get("controller") if isinstance(policy.get("controller"), dict) else {}
-            existing_ids = {str(p.get("provider_id")) for p in existing_controller.get("providers", []) if isinstance(p, dict)}
-            for provider in incoming_controller.get("providers", []):
+            existing_ids = {str(p.get("provider_id")) for p in target.get("providers", []) if isinstance(p, dict)}
+            for provider in policy.get("providers", []):
                 if not isinstance(provider, dict):
                     continue
                 base = str(provider.get("provider_id") or "provider")
@@ -61,9 +57,9 @@ def _merge_bootstrap_into_default(handler: dict[str, Any], operations: Any) -> s
                     suffix += 1
                 provider["provider_id"] = candidate
                 existing_ids.add(candidate)
-            target["controller"] = merge_controller(existing_controller, incoming_controller)
-        controller = target.get("controller") if isinstance(target.get("controller"), dict) else {}
-        touched.update(str(p.get("provider_id")) for p in controller.get("providers", []) if isinstance(p, dict))
+            target, _ = merge_operation(target, policy)
+            policies[target_name] = target
+        touched.update(str(p.get("provider_id")) for p in target.get("providers", []) if isinstance(p, dict))
     handler["updated_at"] = _now_iso()
     return touched
 
@@ -129,7 +125,7 @@ def try_merge_same_surface(
     ])
     handler = ensure_page_handler(meta)
     touched = _merge_bootstrap_into_default(handler, llm_payload.get("bootstrap_operations", []))
-    materialize_strategy_templates(handler, state_dir, frame_rgb, vision, touched)
+    materialize_provider_templates(handler, state_dir, frame_rgb, vision, touched)
     meta["page_family"] = previous_family
     meta.setdefault("model_info", {})
     if isinstance(meta["model_info"], dict):

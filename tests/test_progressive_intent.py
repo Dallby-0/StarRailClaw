@@ -1,404 +1,128 @@
 from __future__ import annotations
 
 import json
-from state_machine.command import resolve_effective_command, step_preconditions_pass
+
+from state_machine.command import resolve_effective_command
 from state_machine.intent import active_intent, adopt_intent_proposal, create_intent, push_child_intent, reduce_intent_event
-from state_machine.page_handler.store import continuation_patch_from_sibling, handler_from_bootstrap, mark_strategy_result, select_strategy
+from state_machine.page_handler.store import handler_from_bootstrap
 from state_machine.protocol import parse_state_payload
+
+
+def _provider(provider_id: str, x: int = 500, y: int = 500) -> dict:
+    return {
+        "provider_id": provider_id,
+        "base_priority": 50,
+        "repeat_policy": "once_per_visit",
+        "locators": [{"type": "point", "x": x, "y": y, "coordinate_space": "logical", "source": "bootstrap"}],
+        "hints": [],
+        "deferred_hints": [],
+        "effect_hints": [],
+        "successors": [],
+        "emits_on_success": {"type": "advanced"},
+        "brief": "advance",
+    }
+
+
+def _operation(name: str, *, default: bool = False, scope: str = "intent_specific", routes=None) -> dict:
+    return {
+        "operation": name,
+        "is_default": default,
+        "intent_scope": scope,
+        "intent_effect": "advance",
+        "expected_event": "advanced",
+        "intent_routes": routes or [],
+        "providers": [_provider(f"{name}_provider")],
+    }
 
 
 def _state(handler: dict) -> dict:
     return {"state_id": "001", "page_handler": handler}
 
 
-def test_safe_default_needs_no_persistent_intent() -> None:
-    handler = handler_from_bootstrap([
-        {
-            "operation": "dismiss_overlay",
-            "is_default": True,
-            "intent_scope": "intent_invariant",
-            "intent_effect": "preserve",
-            "safety": "low_risk",
-            "steps": [{"resolver": {"type": "fixed_point", "x": 500, "y": 850}, "expected_after": {"state_relation": "must_leave", "reentry_policy": "forbid"}}],
-        }
-    ])
+def test_default_operation_needs_no_persistent_intent() -> None:
+    handler = handler_from_bootstrap([_operation("advance", default=True)])
     command = resolve_effective_command(_state(handler), None)
     assert command is not None
-    assert command.operation == "dismiss_overlay"
-    assert command.source == "state_default"
-    assert command.intent_id is None
-
-
-def test_active_intent_route_overrides_default_operation() -> None:
-    handler = handler_from_bootstrap([
-        {
-            "operation": "dismiss_overlay",
-            "is_default": True,
-            "intent_scope": "intent_invariant",
-            "intent_effect": "preserve",
-            "safety": "low_risk",
-            "steps": [{"resolver": {"type": "fixed_point", "x": 500, "y": 850}}],
-            "intent_routes": [{"intent_kind": "inspect_reward", "phase": "inspect", "operation": "open_reward_details", "expected_event": "details_opened"}],
-        },
-        {
-            "operation": "open_reward_details",
-            "intent_scope": "intent_specific",
-            "intent_effect": "advance",
-            "safety": "reversible",
-            "steps": [{"resolver": {"type": "fixed_point", "x": 500, "y": 420}}],
-        },
-    ])
-    intent = {"intent_id": "intent_x", "kind": "inspect_reward", "phase": "inspect", "params": {"target": "foo"}, "facts": {}}
-    command = resolve_effective_command(_state(handler), intent)
-    assert command is not None
-    assert command.operation == "open_reward_details"
-    assert command.source == "active_intent"
-    assert command.intent_id == "intent_x"
-
-
-def test_compact_llm_intent_route_is_normalized_to_executable_route() -> None:
-    handler = handler_from_bootstrap([
-        {
-            "operation": "start_run",
-            "is_default": True,
-            "intent_scope": "intent_specific",
-            "intent_effect": "advance",
-            "safety": "low_risk",
-            "steps": [{"resolver": {"type": "fixed_point", "x": 845, "y": 900}}],
-            "intent_routes": [{"kind": "clear_universe", "phase": "start"}],
-        }
-    ])
-    assert handler["intent_routes"] == [{"intent_kinds": ["clear_universe"], "phases": ["start"], "operation": "start_run", "intent_effect": "advance", "expected_event": None, "params": {}}]
-    intent = {"intent_id": "intent_x", "kind": "clear_universe", "phase": "start", "params": {}, "facts": {}}
-    assert resolve_effective_command(_state(handler), intent).operation == "start_run"
-
-
-def test_active_intent_allows_safe_intent_invariant_default_fallback() -> None:
-    unsafe_handler = handler_from_bootstrap([
-        {
-            "operation": "confirm_purchase",
-            "is_default": True,
-            "intent_scope": "intent_specific",
-            "intent_effect": "advance",
-            "safety": "commit",
-            "steps": [{"resolver": {"type": "fixed_point", "x": 800, "y": 850}}],
-        }
-    ])
-    intent = {"intent_id": "intent_x", "kind": "inspect_only", "phase": "start", "params": {}, "facts": {}}
-    assert resolve_effective_command(_state(unsafe_handler), intent) is None
-
-    transparent_handler = handler_from_bootstrap([
-        {
-            "operation": "dismiss_tutorial",
-            "is_default": True,
-            "intent_scope": "intent_invariant",
-            "intent_effect": "preserve",
-            "safety": "low_risk",
-            "steps": [{"resolver": {"type": "fixed_point", "x": 500, "y": 850}}],
-        }
-    ])
-    command = resolve_effective_command(_state(transparent_handler), intent)
-    assert command is not None
-    assert command.operation == "dismiss_tutorial"
-    assert command.intent_effect == "preserve"
-
-    advancing_handler = handler_from_bootstrap([
-        {
-            "operation": "select_and_confirm",
-            "is_default": True,
-            "intent_scope": "intent_invariant",
-            "intent_effect": "advance",
-            "safety": "reversible",
-            "steps": [{"resolver": {"type": "fixed_point", "x": 500, "y": 450}}],
-        }
-    ])
-    command = resolve_effective_command(_state(advancing_handler), intent)
-    assert command is not None
-    assert command.operation == "select_and_confirm"
-    assert command.intent_effect == "advance"
-
-
-def test_explicit_safe_default_from_first_llm_call_executes_without_intent() -> None:
-    handler = handler_from_bootstrap([
-        {
-            "operation": "start_run",
-            "is_default": True,
-            "intent_scope": "intent_specific",
-            "intent_effect": "advance",
-            "safety": "low_risk",
-            "steps": [{"resolver": {"type": "fixed_point", "x": 845, "y": 900}, "expected_after": {"state_relation": "must_leave", "reentry_policy": "forbid"}}],
-        }
-    ])
-    command = resolve_effective_command(_state(handler), None)
-    assert command is not None
-    assert command.operation == "start_run"
+    assert command.operation == "advance"
     assert command.source == "state_default"
 
 
-def test_single_safe_bootstrap_operation_becomes_default_without_second_llm_call() -> None:
+def test_active_intent_route_overrides_default() -> None:
     handler = handler_from_bootstrap([
-        {
-            "operation": "select_candidate",
-            "intent_scope": "intent_specific",
-            "intent_effect": "advance",
-            "safety": "reversible",
-            "steps": [{"resolver": {"type": "fixed_point", "x": 400, "y": 500}}],
-        }
+        _operation("advance", default=True, scope="intent_invariant"),
+        _operation("inspect", routes=[{"intent_kind": "inspect", "phase": "start"}]),
     ])
-    assert handler["default_operation"]["operation"] == "select_candidate"
-    assert resolve_effective_command(_state(handler), None).operation == "select_candidate"
+    # Routes belong to the operation that declares them.
+    handler["intent_routes"] = [{"intent_kinds": ["inspect"], "phases": ["start"], "operation": "inspect", "intent_effect": "advance", "expected_event": None, "params": {}}]
+    intent = {"intent_id": "intent_x", "kind": "inspect", "phase": "start", "params": {}, "facts": {}}
+    assert resolve_effective_command(_state(handler), intent).operation == "inspect"
 
 
-def test_ambiguous_or_high_risk_bootstrap_does_not_become_implicit_default() -> None:
-    multiple = handler_from_bootstrap([
-        {"operation": "inspect", "safety": "low_risk", "steps": [{"resolver": {"type": "fixed_point", "x": 400, "y": 400}}]},
-        {"operation": "leave", "safety": "low_risk", "steps": [{"resolver": {"type": "fixed_point", "x": 50, "y": 50}}]},
-    ])
+def test_active_intent_uses_only_intent_invariant_default_as_fallback() -> None:
+    intent = {"intent_id": "intent_x", "kind": "other", "phase": "start", "params": {}, "facts": {}}
+    specific = handler_from_bootstrap([_operation("advance", default=True, scope="intent_specific")])
+    invariant = handler_from_bootstrap([_operation("advance", default=True, scope="intent_invariant")])
+    assert resolve_effective_command(_state(specific), intent) is None
+    assert resolve_effective_command(_state(invariant), intent).operation == "advance"
+
+
+def test_single_operation_becomes_default_but_multiple_are_ambiguous() -> None:
+    single = handler_from_bootstrap([_operation("advance")])
+    multiple = handler_from_bootstrap([_operation("advance"), _operation("inspect")])
+    assert single["default_operation"]["operation"] == "advance"
     assert multiple["default_operation"] is None
-    destructive = handler_from_bootstrap([
-        {"operation": "delete", "safety": "destructive", "steps": [{"resolver": {"type": "fixed_point", "x": 800, "y": 850}}]},
-    ])
-    assert destructive["default_operation"] is None
 
 
-def legacy_operation_safety_is_inherited_by_its_strategies() -> None:
-    handler = handler_from_bootstrap([
-        {
-            "operation": "confirm_purchase",
-            "intent_scope": "intent_specific",
-            "intent_effect": "advance",
-            "safety": "commit",
-            "strategies": [{"strategy_id": "confirm", "level": 0, "resolver": {"type": "fixed_point", "x": 800, "y": 850}}],
-        }
-    ])
-    strategy = handler["operation_policies"]["confirm_purchase"]["strategies"][0]
-    assert strategy["safety"] == "commit"
-
-
-def legacy_split_select_and_confirm_can_reuse_confirm_as_current_continuation() -> None:
-    handler = handler_from_bootstrap([
-        {
-            "operation": "select_card",
-            "is_default": True,
-            "intent_scope": "intent_invariant",
-            "intent_effect": "advance",
-            "safety": "reversible",
-            "steps": [{"resolver": {"type": "fixed_point", "x": 220, "y": 500}, "expected_after": {"state_relation": "must_remain", "reentry_policy": "same_visit"}}],
-        },
-        {
-            "operation": "confirm_selection",
-            "intent_scope": "intent_invariant",
-            "intent_effect": "advance",
-            "safety": "commit",
-            "steps": [{"resolver": {"type": "fixed_point", "x": 625, "y": 900}, "expected_after": {"state_relation": "must_leave", "reentry_policy": "new_visit"}}],
-        },
-    ])
-    patch = continuation_patch_from_sibling(handler, "select_card")
-    assert patch is not None
-    operation = patch["operations"][0]
-    assert operation["operation"] == "select_card"
-    assert operation["safety"] == "reversible"
-    assert operation["strategies"][0]["steps"][0]["resolver"] == {"type": "fixed_point", "x": 625, "y": 900}
-
-    default_strategy = handler["operation_policies"]["select_card"]["strategies"][0]
-    assert len(default_strategy["steps"]) == 2
-    assert default_strategy["steps"][1]["resolver"] == {"type": "fixed_point", "x": 625, "y": 900}
-    assert default_strategy["safety"] == "reversible"
-
-
-def legacy_two_step_preconditions_are_explicit_and_fail_closed() -> None:
-    handler = handler_from_bootstrap([
-        {
-            "operation": "select_and_confirm",
-            "safety": "reversible",
-            "steps": [
-                {"step_id": "select", "resolver": {"type": "fixed_point", "x": 300, "y": 400}, "emits_on_success": {"type": "candidate_selected"}},
-                {"step_id": "confirm", "resolver": {"type": "fixed_point", "x": 800, "y": 850}, "preconditions": {"previous_step_verified": True, "previous_event": "candidate_selected", "current_page_still_matches": True}},
-            ],
-        }
-    ])
-    steps = handler["operation_policies"]["select_and_confirm"]["strategies"][0]["steps"]
-    assert steps[1]["preconditions"] == {"previous_step_verified": True, "previous_event": "candidate_selected", "current_page_still_matches": True}
-    ok, reason = step_preconditions_pass(steps[1]["preconditions"], previous_step_verified=True, previous_event={"type": "candidate_selected"}, current_state_matches=True, intent=None)
-    assert ok and reason == "ok"
-    ok, reason = step_preconditions_pass({"confirm_enabled": True}, previous_step_verified=True, previous_event=None, current_state_matches=True, intent=None)
-    assert not ok and reason.startswith("unsupported_preconditions")
-
-
-def test_intent_survives_page_events_until_completion_event() -> None:
+def test_intent_survives_events_until_completion() -> None:
     runtime: dict = {}
     intent = create_intent(
         runtime,
-        kind="select_and_confirm",
-        phase="select",
+        kind="workflow",
+        phase="first",
         transitions=[
-            {"from_phase": "select", "event": "candidate_selected", "next_phase": "confirm", "fact_patch": {"slot": "$event.slot"}},
-            {"from_phase": "confirm", "event": "selection_confirmed", "next_phase": "await_reward"},
+            {"from_phase": "first", "event": "selected", "next_phase": "second", "fact_patch": {"slot": "$event.slot"}},
+            {"from_phase": "second", "event": "confirmed", "next_phase": "done"},
         ],
-        completion={"event": "reward_acquired"},
+        completion={"event": "completed"},
     )
-    intent_id = intent["intent_id"]
-    reduce_intent_event(runtime, {"type": "candidate_selected", "slot": "right"})
-    assert active_intent(runtime)["intent_id"] == intent_id
-    assert active_intent(runtime)["phase"] == "confirm"
-    assert active_intent(runtime)["facts"]["slot"] == "right"
-    reduce_intent_event(runtime, {"type": "selection_confirmed"})
-    assert active_intent(runtime)["phase"] == "await_reward"
-    reduce_intent_event(runtime, {"type": "reward_acquired"})
+    reduce_intent_event(runtime, {"type": "selected", "slot": "x"})
+    assert active_intent(runtime)["phase"] == "second"
+    assert active_intent(runtime)["facts"]["slot"] == "x"
+    reduce_intent_event(runtime, {"type": "confirmed"})
+    reduce_intent_event(runtime, {"type": "completed"})
     assert active_intent(runtime) is None
-    assert runtime["intent_runtime"]["intents"][intent_id]["status"] == "completed"
+    assert runtime["intent_runtime"]["intents"][intent["intent_id"]]["status"] == "completed"
 
 
-def test_llm_intent_proposal_is_sparse_and_never_replaces_active_intent() -> None:
+def test_sparse_intent_proposal_never_replaces_active_intent() -> None:
     runtime: dict = {}
-    assert adopt_intent_proposal(runtime, None) is None
-    proposed = adopt_intent_proposal(runtime, {"kind": "inspect_reward", "phase": "inspect", "completion": {"event": "inspection_done"}})
+    proposed = adopt_intent_proposal(runtime, {"kind": "inspect", "phase": "start", "completion": {"event": "done"}})
     assert proposed is not None
-    assert active_intent(runtime)["kind"] == "inspect_reward"
     assert adopt_intent_proposal(runtime, {"kind": "replacement"}) is None
-    assert active_intent(runtime)["kind"] == "inspect_reward"
+    assert active_intent(runtime)["kind"] == "inspect"
 
 
-def test_child_intent_interrupt_resumes_parent_after_completion() -> None:
+def test_child_intent_resumes_parent() -> None:
     runtime: dict = {}
-    parent = create_intent(runtime, kind="equip_relic", phase="select")
-    child = push_child_intent(runtime, kind="dismiss_tutorial", completion={"event": "overlay_dismissed"})
-    assert active_intent(runtime)["intent_id"] == child["intent_id"]
-    assert runtime["intent_runtime"]["intents"][parent["intent_id"]]["status"] == "suspended"
-    reduce_intent_event(runtime, {"type": "overlay_dismissed"})
+    parent = create_intent(runtime, kind="parent", phase="start")
+    push_child_intent(runtime, kind="child", completion={"event": "child_done"})
+    reduce_intent_event(runtime, {"type": "child_done"})
     assert active_intent(runtime)["intent_id"] == parent["intent_id"]
-    assert active_intent(runtime)["status"] == "running"
 
 
-def legacy_failed_cheap_strategy_escalates_to_stronger_strategy() -> None:
-    handler = handler_from_bootstrap([
-        {
-            "operation": "dismiss_overlay",
-            "is_default": True,
-            "intent_scope": "intent_invariant",
-            "intent_effect": "preserve",
-            "safety": "low_risk",
-            "strategies": [
-                {"strategy_id": "fixed", "level": 0, "status": "active", "resolver": {"type": "fixed_point", "x": 500, "y": 850}},
-                {"strategy_id": "template", "level": 2, "status": "active", "resolver": {"type": "region_template", "template_path": "button.png", "search_rect": [600, 700, 300, 200]}},
-            ],
-        }
-    ])
-    assert select_strategy(handler, "dismiss_overlay")["strategy_id"] == "fixed"
-    mark_strategy_result(handler, "dismiss_overlay", "fixed", "no_effect")
-    assert select_strategy(handler, "dismiss_overlay")["strategy_id"] == "template"
-    mark_strategy_result(handler, "dismiss_overlay", "template", "verified_success")
-    assert select_strategy(handler, "dismiss_overlay")["strategy_id"] == "template"
-
-
-def test_degraded_strategy_stays_disabled_until_explicit_repair() -> None:
-    handler = handler_from_bootstrap([
-        {
-            "operation": "select_and_confirm",
-            "safety": "reversible",
-            "strategies": [{
-                "strategy_id": "two_step",
-                "level": 0,
-                "status": "degraded",
-                "steps": [
-                    {"resolver": {"type": "fixed_point", "x": 235, "y": 480}, "expected_after": {"state_relation": "must_remain", "reentry_policy": "same_visit"}},
-                    {"resolver": {"type": "fixed_point", "x": 850, "y": 885}, "expected_after": {"state_relation": "must_leave", "reentry_policy": "new_visit"}},
-                ],
-            }],
-        }
-    ])
-    assert select_strategy(handler, "select_and_confirm") is None
-    assert select_strategy(handler, "select_and_confirm", excluded={"two_step"}) is None
-
-
-def test_state_payload_requires_bootstrap_operations_not_legacy_actions() -> None:
+def test_state_payload_requires_v2_provider_shape() -> None:
     payload = {
-        "page_summary": "popup",
-        "slug": "popup",
-        "possible_page_type": "popup",
-        "page_family": "popup",
+        "page_summary": "generic surface",
+        "slug": "generic_surface",
+        "possible_page_type": "none",
+        "page_family": "generic_surface",
         "surface_relation": "uncertain",
         "common_identity": [],
         "elements": [],
-        "intent_assessment": {"relation": "unknown", "reason": "no active intent"},
+        "intent_assessment": {"relation": "unknown", "reason": "none"},
         "intent_proposal": None,
-        "bootstrap_operations": [],
+        "bootstrap_operations": [_operation("advance", default=True)],
     }
-    parsed = parse_state_payload(json.dumps(payload))
-    assert parsed is not None
-    assert parsed["surface_relation"] == "uncertain"
-    assert parsed["common_identity"] == []
-    legacy = {"page_summary": "popup", "slug": "popup", "elements": [], "actions": []}
-    assert parse_state_payload(json.dumps(legacy)) is None
-
-
-def test_state_payload_locally_repairs_missing_bbox_commas_without_llm_retry() -> None:
-    malformed = r'''{
-      "page_summary": "blessing select",
-      "slug": "blessing_select",
-      "possible_page_type": "none",
-      "page_family": "blessing_select",
-      "surface_relation": "uncertain",
-      "common_identity": [],
-      "elements": [{
-        "type":"pattern",
-        "bbox":[26 25, 62 80],
-        "brief":"card icon",
-        "role":"identity",
-        "stability":"high",
-        "discrimination":"high"
-      }],
-      "intent_assessment": {"relation":"unknown","reason":"no active intent"},
-      "intent_proposal": null,
-      "bootstrap_operations": [{
-        "operation":"select_first",
-        "is_default":true,
-        "intent_scope":"intent_invariant",
-        "intent_effect":"advance",
-        "safety":"low_risk",
-        "expected_event":"selection_confirmed",
-        "intent_routes":[],
-        "steps":[
-          {
-            "step_id":"select",
-            "resolver":{"type":"fixed_point","x":235,"y":480},
-            "expected_after":{"state_relation":"must_remain","reentry_policy":"same_visit"},
-            "emits_on_success":{"type":"selection_made"},
-            "brief":"select first card"
-          },
-          {
-            "step_id":"confirm",
-            "resolver":{"type":"fixed_point","x":850,"y":885},
-            "expected_after":{"state_relation":"must_leave","reentry_policy":"new_visit"},
-            "emits_on_success":{"type":"selection_confirmed"},
-            "brief":"confirm selection"
-          }
-        ]
-      }]
-    }'''
-    payload = parse_state_payload(malformed)
-    assert payload is not None
-    assert payload["elements"][0]["bbox"] == [26, 25, 62, 80]
-
-
-def test_state_payload_rejects_non_integer_bbox_even_when_json_is_valid() -> None:
-    payload = {
-        "page_summary": "combat",
-        "slug": "combat",
-        "possible_page_type": "none",
-        "page_family": "combat",
-        "surface_relation": "different_surface",
-        "common_identity": [],
-        "elements": [{
-            "type": "pattern",
-            "bbox": [28, "2022-01-01", 28, "2022-01-01"],
-            "brief": "run button",
-            "role": "identity",
-            "stability": "high",
-            "discrimination": "high",
-        }],
-        "intent_assessment": {"relation": "unknown", "reason": "no active intent"},
-        "intent_proposal": None,
-        "bootstrap_operations": [],
-    }
+    assert parse_state_payload(json.dumps(payload)) is not None
+    payload["bootstrap_operations"][0]["providers"][0]["locators"][0]["coordinate_space"] = "real"
     assert parse_state_payload(json.dumps(payload)) is None

@@ -113,7 +113,6 @@ def _ensure_fsm_resources() -> None:
                 "same_external_state_count": 0,
                 "force_state_resolution": False,
                 "force_exclude_state_id": None,
-                "pending_operation": None,
                 "intent_runtime": {
                     "active_intent_id": None,
                     "intents": {},
@@ -129,7 +128,8 @@ def _ensure_fsm_resources() -> None:
             "element_types": ["text_line", "pattern"],
             "element_roles": ["identity", "identity_support", "interaction", "instance", "diagnostic"],
             "element_levels": ["high", "mid", "low"],
-            "resolver_types": ["fixed_point", "region_template", "run_preset"],
+            "locator_types": ["point", "region_template", "text_target", "run_preset"],
+            "hint_types": ["template", "text", "line_count"],
         },
     )
 

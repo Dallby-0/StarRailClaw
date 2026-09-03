@@ -12,7 +12,7 @@ from state_machine.io import _load_frame, _normalize_page_type, _now_iso, _save_
 from state_machine.logger import FsmRunLogger
 from state_machine.matching import _level
 from state_machine.page_identity import IDENTITY_ROLES, build_match_clauses, initial_observations, normalize_elements, record_condition_observations
-from state_machine.page_handler.store import handler_from_bootstrap, materialize_strategy_templates
+from state_machine.page_handler.store import handler_from_bootstrap, materialize_provider_templates
 from state_machine.state_store import _allocate_state_id, _ensure_unique_state_dir, _iter_state_meta, _latest_screenshot_path
 
 
@@ -119,21 +119,14 @@ def _create_state_from_llm(
     match_clauses = build_match_clauses(conds)
     weak_match = len(match_clauses) == 1 and len(match_clauses[0].get("all", [])) == 1
     handler = handler_from_bootstrap(llm_payload.get("bootstrap_operations", []))
-    strategy_ids = {
-        str(strategy.get("strategy_id"))
-        for policy in handler.get("operation_policies", {}).values()
-        if isinstance(policy, dict)
-        for strategy in policy.get("strategies", [])
-        if isinstance(strategy, dict)
-    }
-    strategy_ids.update(
+    provider_ids = {
         str(provider.get("provider_id"))
         for policy in handler.get("operation_policies", {}).values()
-        if isinstance(policy, dict) and isinstance(policy.get("controller"), dict)
-        for provider in policy["controller"].get("providers", [])
+        if isinstance(policy, dict)
+        for provider in policy.get("providers", [])
         if isinstance(provider, dict)
-    )
-    materialize_strategy_templates(handler, state_dir, frame_rgb, vision, strategy_ids)
+    }
+    materialize_provider_templates(handler, state_dir, frame_rgb, vision, provider_ids)
 
     state_meta = {
         "schema_version": SCHEMA_VERSION,

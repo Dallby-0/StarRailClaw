@@ -2257,27 +2257,33 @@ def _page_handler_summary(handler: Any) -> dict[str, Any]:
         policies = {}
     templates: list[dict[str, Any]] = []
     active_count = 0
+    canary_count = 0
+    proposed_count = 0
     disabled_count = 0
     for operation, policy in policies.items():
         if not isinstance(policy, dict):
             continue
-        for strategy in policy.get("strategies", []):
-            if not isinstance(strategy, dict):
+        for provider in policy.get("providers", []):
+            if not isinstance(provider, dict):
                 continue
-            status = str(strategy.get("status", "proposed"))
+            status = str(provider.get("status", "proposed"))
             if status == "active":
                 active_count += 1
+            elif status == "canary":
+                canary_count += 1
+            elif status == "proposed":
+                proposed_count += 1
             else:
                 disabled_count += 1
             templates.append(
                 {
-                    "template_id": str(strategy.get("strategy_id", "")),
+                    "template_id": str(provider.get("provider_id", "")),
                     "kind": str(operation),
-                    "label": f"level {int(strategy.get('level', 0) or 0)}",
+                    "label": f"priority {int(provider.get('base_priority', 0) or 0)}",
                     "status": status,
-                    "confidence": "verified" if int(strategy.get("success_count", 0) or 0) > 0 else "unverified",
-                    "success_count": int(strategy.get("success_count", 0) or 0),
-                    "fail_count": int(strategy.get("fail_count", 0) or 0),
+                    "confidence": "verified" if int(provider.get("success_count", 0) or 0) > 0 else "unverified",
+                    "success_count": int(provider.get("success_count", 0) or 0),
+                    "fail_count": sum(int(value or 0) for key, value in provider.get("result_counts", {}).items() if key not in {"confirmed", "transitioned"}),
                     "bbox": None,
                     "slots": [],
                 }
@@ -2288,6 +2294,8 @@ def _page_handler_summary(handler: Any) -> dict[str, Any]:
         "schema_version": str(handler.get("schema_version", "")),
         "template_count": len(templates),
         "active_count": active_count,
+        "canary_count": canary_count,
+        "proposed_count": proposed_count,
         "disabled_count": disabled_count,
         "supported_intents": sorted({str(kind) for route in handler.get("intent_routes", []) if isinstance(route, dict) for kind in (route.get("intent_kinds") if isinstance(route.get("intent_kinds"), list) else [route.get("intent_kind")]) if kind}),
         "default_operation": handler.get("default_operation"),
@@ -2300,10 +2308,8 @@ def _page_handler_summary(handler: Any) -> dict[str, Any]:
 
 _OCCURRENCE_FAILURE_EVENTS = {
     "controller_exhausted",
-    "page_handler_no_decision",
-    "page_handler_no_progress",
-    "page_handler_max_steps",
     "page_handler_no_strategy",
+    "page_handler_hard_limit",
     "llm_payload_invalid",
     "unknown_state",
 }

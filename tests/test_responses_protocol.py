@@ -56,10 +56,13 @@ def test_state_bootstrap_schema_is_closed_and_bounded() -> None:
 
     operation = schema["properties"]["bootstrap_operations"]["items"]
     assert operation["additionalProperties"] is False
-    steps = operation["properties"]["steps"]
-    assert steps["minItems"] == 1
-    assert steps["maxItems"] == 2
-    expected = steps["items"]["properties"]["expected_after"]
-    assert expected["additionalProperties"] is False
-    assert expected["properties"]["state_relation"]["enum"] == ["must_leave", "must_remain", "may_leave"]
-    assert expected["properties"]["reentry_policy"]["enum"] == ["forbid", "new_visit", "same_visit"]
+    assert "safety" not in operation["properties"]
+    providers = operation["properties"]["providers"]
+    assert providers["minItems"] == 1
+    assert providers["maxItems"] == 4
+    provider = providers["items"]
+    assert provider["additionalProperties"] is False
+    point = provider["properties"]["locators"]["items"]["anyOf"][0]
+    assert point["properties"]["coordinate_space"]["enum"] == ["logical"]
+    assert "effect_hints" in provider["properties"]
+    assert "deferred_hints" in provider["properties"]

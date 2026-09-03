@@ -44,7 +44,7 @@ LLM_FSM_PROMPT_BASE = """你是视觉驱动游戏自动化的状态标注器和�
 强约束：
 - 必须输出严格 JSON 对象，字段必须符合约定。
 - elements: 每项必须有 type。
-  - 每项还必须标注 role：identity=跨该交互表面各步骤都稳定存在、可单独确认页面身份；identity_support=稳定但过于通用、只能与其他锚点组合；interaction=按钮/箭头/可操作控件；instance=事件名、卡片名、选项、奖励、正文等当前实例内容；diagnostic=仅供解释和排错。
+  - 每项还必须标注 role：identity=跨该交互表面各步骤都稳定存在、可单独确认页面身份；identity_support=稳定但过于通用、只能与其他锚点组合；interaction=可操作控件；instance=仅当前实例存在的名称、数值或正文；diagnostic=仅供解释和排错。
   - 只有 identity/identity_support 会进入全局 state matcher。interaction 只供 page handler 定位，instance/diagnostic 不得成为 state 身份。不要把具体事件名、选项文字、当前卡面或步骤按钮标成 identity。
   - elements 应优先服务于“页面匹配”，不是描述画面。优先输出最能稳定区分当前页面类型的元素。
   - 请尽量标注当前画面中潜在可用于匹配的 OCR 区域和模板区域；即使稳定性或区分度不高，也可以输出，但必须如实把 stability/discrimination 标为 mid 或 low，不要为了让元素看起来有用而虚高评分。
@@ -80,32 +80,22 @@ LLM_FSM_PROMPT_BASE = """你是视觉驱动游戏自动化的状态标注器和�
 - page_family: 英文小写+下划线，表示可共享同类操作经验的稳定页面族；不知道时使用与 slug 相同的值。
 - surface_relation: 若提供了 previous_surface，上下两图仍是同一稳定交互表面、只是页内步骤不同，必须输出 same_surface_step；同族但应独立处理的阻塞层/结果层输出 same_family_new_surface；否则输出 different_surface；没有前图时输出 uncertain。
 - common_identity: 仅列出前后步骤共同保留的稳定身份元素，禁止填写具体事件名、选项或仅当前步骤存在的按钮。
-- bootstrap_operations: 数组。每项表示一种操作语义及其初始渐进策略，而不是无条件 state action。
-  - operation 必须是稳定的短语义名，例如 dismiss_overlay、confirm、advance、select_candidate。
-  - 同一 page_family 的不同页内步骤必须复用同一个完整目标 operation；事件页建议使用 advance_event，选站页使用 select_station_and_confirm。禁止按当前按钮或具体选项另起 operation 名。
-  - operation 必须表达“完成当前页面的一次完整推进”，但 bootstrap steps 只需描述当前截图中最明显、最低成本的下一步动作。
-    - 如果页面需要先选择卡片再点击确认，operation 应命名为 select_and_confirm；通常只输出当前可见的选择动作。只有确认按钮当前也明确可见且顺序可靠时，才可给第二个 step。
-    - 禁止把前后顺序必做的步骤拆成两个并列 bootstrap_operations；多个 operation 仅用于不同 intent/业务语义下互斥的操作选择。
-    - runtime 会在每次动作后重新观察；仍停留同页时不会把 operation 视为完成，而会尝试后续本地 provider，耗尽后才请求修复。
+- bootstrap_operations: 数组。每项表示一种稳定操作语义及其 reactive providers，而不是无条件宏。
+  - operation 使用简短、稳定、领域无关的语义名；同一 page_family 的连续页内步骤复用同一个完整目标 operation。
+  - 每个 provider 表达一个可独立观察和结算的动作。明显的短链可在一次输出中给出多个 provider，并用 successors 表达短期后继先验。
+  - runtime 在每个动作后重新截图和评估，不会把 providers 当作无条件连点序列。
+  - locators 按顺序 fallback。point 必须显式声明 coordinate_space=logical，所有点和矩形均为 1000x1000 逻辑坐标。
+  - hints 是软排序证据，通常满足 > 无法判断/无 hint > 不满足；hint 失败不能直接证明动作无效。
+  - 文本识别成本高，text hint/locator 应限制在较小区域；只需要文字行数时优先使用区域 line_count hint。
+  - effect_hints 只描述动作后的可观测假设；没有稳定可观测效果时保持空数组。
+  - 只有前驱动作后才会出现的特征放入 deferred_hints，并通过 materialize_after 引用前驱 provider_id。
+  - 禁止在 core provider 中写入特定业务对象、固定选项数量或其他只适用于单一场景的规则。
   - intent_scope 只能是 intent_invariant 或 intent_specific。只有纯提示/透明阻塞弹窗才使用 intent_invariant。
   - intent_effect 只能是 preserve、advance、complete 或 none。
-  - safety 只能是 low_risk、reversible、commit 或 destructive。commit/destructive 不可作为无条件默认操作。
-    - 普通游戏流程中的选卡并确认、领取奖励、关闭弹窗属于 low_risk/reversible；不要仅因为按钮文字是“确认”就标成 commit。
-    - 只有消费稀缺资源、购买、覆盖存档、放弃进度或其他显著不可逆业务结果才使用 commit/destructive。
-  - 优先输出一个 step，最多两个；每一步都必须提供 expected_after，runtime 会在每步后重新观察，禁止设计无条件连点宏。
-  - expected_after.state_relation 只能是 must_leave、must_remain、may_leave。
-    - 选择卡片等页面内步骤使用 must_remain。
-    - 确认、关闭、推进等必须退出当前页面实例的步骤使用 must_leave。
-  - expected_after.reentry_policy 只能是 forbid、new_visit、same_visit。
-    - 同类事件可能连续弹出（例如确认一轮卡片后又弹出下一轮卡片）时使用 new_visit。
-    - 普通关闭弹窗使用 forbid；页面内步骤使用 same_visit。
-  - 初始策略优先 resolver.type=fixed_point，坐标为 1000x1000 逻辑坐标。
-  - 只有明显需要预置动作时才使用 resolver.type=run_preset。
+  - 初见页面可优先使用 point locator；同时存在稳定视觉定位方式时，可将其放在 point 之前作为更通用的 locator。
+  - 只有明显需要已注册预置动作时才使用 run_preset locator。
   - 若 active_intent 存在，intent_routes 应说明哪些 intent kind/phase 映射到这个 operation。
-  - 预置动作：resolver={"type":"run_preset","name":"wait_till_combat_end"}
-    - 预置动作 wait_till_combat_end 若当前是战斗状态，则调用该动作，会挂起至战斗结束，此时自动战斗 
-    - 预制动作 find_and_interact_with_next_object 会在当前场景寻找并移动至下一个可交互对象并与其交互,只要是在场景中需要与物体交互，都调用这个，包括与前方怪物战斗、与NPC、机关、门互动等
-- 注意在3D场景中不要尝试点击物体触发交互，这没有任何效果，若发现需要在3D场景中需要与物体交互，请使用预置动作 find_and_interact_with_next_object。
+  - run_preset.name 只能引用 runtime 已注册的预置动作名称，不要自行创造领域规则。
 
 字段、枚举、必填项和嵌套结构由 Responses API 的 JSON Schema 提供，不要输出 schema 之外的字段。
 """

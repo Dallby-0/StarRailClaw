@@ -38,6 +38,7 @@ class OcrTestGui:
         self.selection_real: Optional[tuple[int, int, int, int]] = None
         self.selection_logical: Optional[list[int]] = None
         self.ocr_words: list[dict] = []
+        self.ocr_groups: list[dict] = []
 
         self._render_scale = 1.0
         self._render_offset_x = 0
@@ -71,6 +72,7 @@ class OcrTestGui:
         tk.Button(side, text="刷新截图", command=self.refresh_screenshot).pack(fill=tk.X, pady=2)
         tk.Button(side, text="执行单行OCR (pponnxcr)", command=self.run_ocr).pack(fill=tk.X, pady=2)
         tk.Button(side, text="执行多行OCR (RapidOCR)", command=self.run_rapidocr).pack(fill=tk.X, pady=2)
+        tk.Button(side, text="仅检测并聚集文本行 (RapidOCR)", command=self.run_rapidocr_detection).pack(fill=tk.X, pady=2)
         tk.Button(side, text="保存选中区域PNG", command=self.save_selected_png).pack(fill=tk.X, pady=2)
         tk.Checkbutton(side, text="白字模式(text_match_white)", variable=self.white_text_var).pack(anchor="w", pady=(4, 2))
         tk.Entry(side, textvariable=self.save_path_var).pack(fill=tk.X, pady=(2, 6))
@@ -166,6 +168,7 @@ class OcrTestGui:
         self.selection_real = None
         self.selection_logical = None
         self.ocr_words.clear()
+        self.ocr_groups.clear()
         self.selection_var.set("区域: -")
         self.result_text.delete("1.0", tk.END)
         self.status_var.set(f"截图成功: {w}x{h}")
@@ -186,6 +189,7 @@ class OcrTestGui:
         self.result_text.delete("1.0", tk.END)
         words = self.vision.ocr(self.current_frame, self.selection_logical, white_text=bool(self.white_text_var.get()))
         self.ocr_words = words
+        self.ocr_groups = []
         self.result_text.insert(
             tk.END,
             f"threshold={threshold:g}, white_text={self.white_text_var.get()}, candidates={len(words)}\n",
@@ -297,6 +301,195 @@ class OcrTestGui:
             )
         return words
 
+    @staticmethod
+    def _looks_like_polygon(value: Any) -> bool:
+        try:
+            points = list(value)
+            if len(points) < 4:
+                return False
+            return all(len(point) >= 2 and float(point[0]) == float(point[0]) and float(point[1]) == float(point[1]) for point in points)
+        except (TypeError, ValueError, IndexError):
+            return False
+
+    @classmethod
+    def _rapidocr_detection_polygons(cls, raw: Any) -> list[Any]:
+        """Extract detector polygons without requiring recognition fields."""
+        payload = raw[0] if isinstance(raw, tuple) and len(raw) == 2 else raw
+        for name in ("boxes", "dt_polys", "polygons"):
+            value = getattr(payload, name, None)
+            if value is not None:
+                return list(value)
+        if isinstance(payload, dict):
+            for name in ("boxes", "dt_polys", "polygons"):
+                value = payload.get(name)
+                if value is not None:
+                    return list(value)
+            return []
+        if payload is None:
+            return []
+        if isinstance(payload, np.ndarray) and payload.ndim == 3:
+            return list(payload)
+
+        polygons: list[Any] = []
+        for item in payload:
+            if cls._looks_like_polygon(item):
+                polygons.append(item)
+            elif isinstance(item, (list, tuple)) and item and cls._looks_like_polygon(item[0]):
+                # Some legacy outputs retain the ordinary [polygon, ...]
+                # item shape even when recognition is disabled.
+                polygons.append(item[0])
+        return polygons
+
+    @classmethod
+    def _normalize_detection_lines(cls, raw: Any, *, offset_x: int, offset_y: int) -> list[dict[str, Any]]:
+        lines: list[dict[str, Any]] = []
+        for polygon in cls._rapidocr_detection_polygons(raw):
+            try:
+                points = [
+                    (int(round(float(point[0]))) + offset_x, int(round(float(point[1]))) + offset_y)
+                    for point in polygon
+                ]
+            except (TypeError, ValueError, IndexError):
+                continue
+            xs = [point[0] for point in points]
+            ys = [point[1] for point in points]
+            if not xs or not ys:
+                continue
+            x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
+            lines.append(
+                {
+                    "text": "",
+                    "conf": 1.0,
+                    "bbox": (x1, y1, max(1, x2 - x1), max(1, y2 - y1)),
+                    "polygon": points,
+                    "center": ((x1 + x2) // 2, (y1 + y2) // 2),
+                    "backend": "rapidocr_detector",
+                    "kind": "detected_text_line",
+                }
+            )
+        return sorted(lines, key=lambda item: (item["center"][1], item["center"][0]))
+
+    @staticmethod
+    def _horizontal_overlap_ratio(a: dict[str, Any], b: dict[str, Any]) -> float:
+        ax, _, aw, _ = a["bbox"]
+        bx, _, bw, _ = b["bbox"]
+        overlap = max(0, min(ax + aw, bx + bw) - max(ax, bx))
+        return overlap / max(1, min(aw, bw))
+
+    @classmethod
+    def _line_boxes_belong_to_same_block(cls, a: dict[str, Any], b: dict[str, Any], typical_height: float) -> bool:
+        ax, ay, aw, ah = a["bbox"]
+        bx, by, bw, bh = b["bbox"]
+        vertical_overlap = max(0, min(ay + ah, by + bh) - max(ay, by))
+        vertical_overlap_ratio = vertical_overlap / max(1, min(ah, bh))
+        horizontal_gap = max(0, max(ax, bx) - min(ax + aw, bx + bw))
+
+        # Fragments on one visual row belong together only when reasonably
+        # close. This avoids joining independent columns across the screen.
+        if vertical_overlap_ratio >= 0.5:
+            return horizontal_gap <= max(typical_height * 2.0, min(aw, bw) * 0.35)
+
+        vertical_gap = max(0, max(ay, by) - min(ay + ah, by + bh))
+        if vertical_gap > typical_height * 1.35:
+            return False
+        overlap_ratio = cls._horizontal_overlap_ratio(a, b)
+        left_aligned = abs(ax - bx) <= typical_height * 1.5
+        centers_aligned = abs((ax + aw / 2) - (bx + bw / 2)) <= max(aw, bw) * 0.35
+        return overlap_ratio >= 0.25 or left_aligned or centers_aligned
+
+    @staticmethod
+    def _count_rows_in_group(lines: list[dict[str, Any]]) -> int:
+        if not lines:
+            return 0
+        heights = sorted(float(line["bbox"][3]) for line in lines)
+        typical_height = heights[len(heights) // 2]
+        tolerance = max(3.0, typical_height * 0.55)
+        row_centers: list[float] = []
+        row_counts: list[int] = []
+        for line in sorted(lines, key=lambda item: item["center"][1]):
+            center_y = float(line["center"][1])
+            nearest = min(range(len(row_centers)), key=lambda index: abs(row_centers[index] - center_y), default=None)
+            if nearest is None or abs(row_centers[nearest] - center_y) > tolerance:
+                row_centers.append(center_y)
+                row_counts.append(1)
+            else:
+                count = row_counts[nearest]
+                row_centers[nearest] = (row_centers[nearest] * count + center_y) / (count + 1)
+                row_counts[nearest] = count + 1
+        return len(row_centers)
+
+    @classmethod
+    def group_detected_text_lines(cls, lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Aggregate detector line boxes into nearby text blocks.
+
+        Raw polygons remain untouched for comparison with full OCR. Groups are
+        conservative connected components built from vertical proximity plus
+        horizontal alignment; ``line_count`` is calculated by clustering the
+        member boxes into visual rows.
+        """
+        if not lines:
+            return []
+        heights = sorted(float(line["bbox"][3]) for line in lines)
+        typical_height = max(1.0, heights[len(heights) // 2])
+        parent = list(range(len(lines)))
+
+        def find(index: int) -> int:
+            while parent[index] != index:
+                parent[index] = parent[parent[index]]
+                index = parent[index]
+            return index
+
+        def union(a_index: int, b_index: int) -> None:
+            a_root = find(a_index)
+            b_root = find(b_index)
+            if a_root != b_root:
+                parent[b_root] = a_root
+
+        for left in range(len(lines)):
+            for right in range(left + 1, len(lines)):
+                if cls._line_boxes_belong_to_same_block(lines[left], lines[right], typical_height):
+                    union(left, right)
+
+        components: dict[int, list[dict[str, Any]]] = {}
+        for index, line in enumerate(lines):
+            components.setdefault(find(index), []).append(line)
+
+        groups: list[dict[str, Any]] = []
+        for members in components.values():
+            x1 = min(int(line["bbox"][0]) for line in members)
+            y1 = min(int(line["bbox"][1]) for line in members)
+            x2 = max(int(line["bbox"][0] + line["bbox"][2]) for line in members)
+            y2 = max(int(line["bbox"][1] + line["bbox"][3]) for line in members)
+            groups.append(
+                {
+                    "bbox": (x1, y1, max(1, x2 - x1), max(1, y2 - y1)),
+                    "line_count": cls._count_rows_in_group(members),
+                    "detected_box_count": len(members),
+                    "lines": sorted(members, key=lambda item: (item["center"][1], item["center"][0])),
+                }
+            )
+        return sorted(groups, key=lambda item: (item["bbox"][1], item["bbox"][0]))
+
+    def detect_text_line_groups(self, crop_rgb: np.ndarray, *, offset_x: int = 0, offset_y: int = 0) -> tuple[list[dict[str, Any]], list[dict[str, Any]], float]:
+        """Run RapidOCR detection only and return raw lines plus grouped blocks."""
+        engine = self._get_rapidocr_engine()
+        started = time.perf_counter()
+        try:
+            raw = engine(
+                cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2BGR),
+                use_det=True,
+                use_cls=False,
+                use_rec=False,
+            )
+        except TypeError as exc:
+            raise RuntimeError(
+                "当前 RapidOCR 版本不支持 detection-only 调用参数 "
+                "use_det/use_cls/use_rec；没有回退到完整 OCR，以免测试结果包含识别开销。"
+            ) from exc
+        elapsed_s = time.perf_counter() - started
+        lines = self._normalize_detection_lines(raw, offset_x=offset_x, offset_y=offset_y)
+        return lines, self.group_detected_text_lines(lines), elapsed_s
+
     def run_rapidocr(self) -> None:
         if self.current_frame is None:
             messagebox.showwarning("RapidOCR", "请先刷新截图")
@@ -334,6 +527,7 @@ class OcrTestGui:
             return
 
         self.ocr_words = words
+        self.ocr_groups = []
         kept = [word for word in words if float(word.get("conf", 0.0)) >= threshold]
         self.result_text.insert(
             tk.END,
@@ -351,6 +545,57 @@ class OcrTestGui:
             )
         self.status_var.set(
             f"RapidOCR完成: inference={inference_s:.3f}s candidates={len(words)} above_threshold={len(kept)}"
+        )
+        self._refresh_canvas()
+
+    def run_rapidocr_detection(self) -> None:
+        if self.current_frame is None:
+            messagebox.showwarning("RapidOCR Detection", "请先刷新截图")
+            return
+        if self.selection_real is None:
+            messagebox.showwarning("RapidOCR Detection", "请先框选区域")
+            return
+        x1, y1, x2, y2 = self.selection_real
+        crop_rgb = self.current_frame[y1:y2, x1:x2]
+        if crop_rgb.size == 0:
+            messagebox.showwarning("RapidOCR Detection", "选区为空")
+            return
+
+        self.result_text.delete("1.0", tk.END)
+        self.status_var.set("RapidOCR 仅检测中……")
+        self.root.update_idletasks()
+        try:
+            total_started = time.perf_counter()
+            lines, groups, inference_s = self.detect_text_line_groups(crop_rgb, offset_x=x1, offset_y=y1)
+            total_s = time.perf_counter() - total_started
+        except Exception as exc:  # noqa: BLE001 - show optional backend failures in GUI.
+            messagebox.showerror("RapidOCR Detection 失败", str(exc))
+            self.status_var.set("RapidOCR Detection 失败")
+            return
+
+        self.ocr_words = lines
+        self.ocr_groups = groups
+        self.result_text.insert(
+            tk.END,
+            f"backend={self._rapidocr_backend}, mode=detection-only, "
+            f"inference={inference_s:.3f}s, total={total_s:.3f}s\n"
+            f"region_real={[x1, y1, x2, y2]}, raw_line_boxes={len(lines)}, groups={len(groups)}\n\n",
+        )
+        self.result_text.insert(tk.END, "聚集框（橙色）:\n")
+        for index, group in enumerate(groups, start=1):
+            self.result_text.insert(
+                tk.END,
+                f"G{index:02d}. bbox={group['bbox']} line_count={group['line_count']} "
+                f"detected_box_count={group['detected_box_count']}\n",
+            )
+        self.result_text.insert(tk.END, "\n原始检测行框（绿色）:\n")
+        for index, line in enumerate(lines, start=1):
+            self.result_text.insert(
+                tk.END,
+                f"L{index:02d}. bbox={line['bbox']} center={line['center']} polygon={line['polygon']}\n",
+            )
+        self.status_var.set(
+            f"仅检测完成: inference={inference_s:.3f}s lines={len(lines)} groups={len(groups)}"
         )
         self._refresh_canvas()
 
@@ -401,6 +646,11 @@ class OcrTestGui:
                 cv2.rectangle(view, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
             label = f"{float(w.get('conf', 0.0)):.2f} {str(w.get('text', '')).strip()[:16]}"
             cv2.putText(view, label, (x, max(18, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2, cv2.LINE_AA)
+        for index, group in enumerate(self.ocr_groups, start=1):
+            x, y, width, height = [int(value) for value in group.get("bbox", (0, 0, 0, 0))]
+            cv2.rectangle(view, (x, y), (x + width, y + height), (255, 150, 0), 2)
+            label = f"G{index} lines={int(group.get('line_count', 0))} boxes={int(group.get('detected_box_count', 0))}"
+            cv2.putText(view, label, (x, min(view.shape[0] - 6, y + height + 18)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 150, 0), 2, cv2.LINE_AA)
         return view
 
     def _refresh_canvas(self) -> None:

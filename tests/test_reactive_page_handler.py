@@ -1,338 +1,250 @@
 from __future__ import annotations
 
-from state_machine.page_handler.reactive import (
-    advance_observation,
-    apply_progress_audit,
-    ensure_progress_capacity,
-    grant_capacity_after_recovery,
-    mark_provider_result,
-    merge_controller,
-    promote_recovery_provider,
-    provider_resolver_signature,
-    progress_capacity_exhausted,
-    record_provider_attempt,
-    select_provider,
+from pathlib import Path
+
+import numpy as np
+
+from state_machine.page_handler.actions import (
+    evaluate_effect,
+    materialize_deferred_hints,
+    promote_materialized_hints,
+    resolve_provider,
 )
-from state_machine.page_handler.store import apply_handler_patch, ensure_page_handler, handler_from_bootstrap
-from state_machine.page_handler.llm import parse_next_action_recovery, parse_progress_audit
-from state_machine.progress_guard import capacity_recovery_exhausted, clear_visit_progress, reactive_cursor_for, record_capacity_recovery
+from state_machine.page_handler.llm import parse_repair_response
+from state_machine.page_handler.reactive import (
+    cursor_for,
+    mark_confirmed_effect,
+    normalize_locator,
+    normalize_provider,
+    provider_score,
+    rank_providers,
+    record_attempt,
+    update_successor_context,
+)
+from state_machine.page_handler.store import (
+    HANDLER_SCHEMA_VERSION,
+    apply_handler_patch,
+    ensure_page_handler,
+    handler_from_bootstrap,
+    record_provider_result,
+)
 
 
-def _operation(handler, name="advance_page"):
-    return handler["operation_policies"][name]
+def _point(x: int, y: int) -> dict:
+    return {"type": "point", "x": x, "y": y, "coordinate_space": "logical", "source": "bootstrap"}
 
 
-def test_bootstrap_builds_minimal_reactive_fast_path_without_exploration() -> None:
-    handler = handler_from_bootstrap([
-        {
-            "operation": "advance_page",
-            "is_default": True,
-            "intent_scope": "intent_invariant",
-            "intent_effect": "advance",
-            "safety": "low_risk",
-            "steps": [{
-                "step_id": "continue",
-                "resolver": {"type": "fixed_point", "x": 840, "y": 880},
-                "expected_after": {"state_relation": "must_leave", "reentry_policy": "forbid"},
-            }],
-        }
-    ])
-
-    controller = _operation(handler)["controller"]
-    assert controller["type"] == "reactive_local"
-    assert len(controller["providers"]) == 1
-    assert controller["providers"][0]["provider_id"] == "continue"
-    assert controller["providers"][0]["resolver"] == {"type": "fixed_point", "x": 840, "y": 880}
-    assert controller["providers"][0]["cost"] == 0
-    assert controller["max_actions"] == 20
-    assert controller["max_observation_rounds"] == 10
+def _provider(provider_id: str, priority: int = 0, **extra) -> dict:
+    return normalize_provider({
+        "provider_id": provider_id,
+        "base_priority": priority,
+        "locators": [_point(500, 500)],
+        **extra,
+    })
 
 
-def test_changed_observation_does_not_replay_once_per_visit_direct_action() -> None:
-    controller = {
-        "type": "reactive_local",
+class FakeVision:
+    def __init__(self) -> None:
+        self.saved: list[Path] = []
+
+    def match_template(self, frame, path, rect, threshold=0.82):
+        return (path.name == "found.png", (321, 123), 0.91)
+
+    def ocr_blocks(self, frame, rect, white_text=False):
+        return [{"text": "target text", "bbox": (100, 200, 80, 20), "center": (140, 210)}]
+
+    def detect_text_lines(self, frame, rect):
+        return {"available": True, "line_count": int(frame[0, 0, 0]), "lines": []}
+
+    def save_template_from_rect(self, frame, rect, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"template")
+        self.saved.append(path)
+
+
+def test_bootstrap_persists_v2_providers_without_controller_or_strategy() -> None:
+    handler = handler_from_bootstrap([{
+        "operation": "advance_surface",
+        "is_default": True,
+        "intent_scope": "intent_specific",
+        "intent_effect": "advance",
         "providers": [
-            {"provider_id": "select", "kind": "action", "cost": 0, "repeat_policy": "once_per_visit", "status": "active"},
-            {"provider_id": "confirm", "kind": "action", "cost": 1, "repeat_policy": "once_per_visit", "status": "active"},
+            {"provider_id": "first", "base_priority": 100, "locators": [_point(300, 400)], "successors": ["second"]},
+            {"provider_id": "second", "base_priority": 80, "locators": [_point(800, 850)]},
         ],
-    }
-    cursor = {
-        "observation_epoch": 1,
-        "attempted_visit": [],
-        "attempted_by_epoch": {"1": []},
-        "total_actions": 0,
-    }
-
-    selected = select_provider(controller, cursor)
-    assert selected["provider_id"] == "select"
-    record_provider_attempt(cursor, selected, action_count=1)
-    advance_observation(cursor)
-    assert select_provider(controller, cursor)["provider_id"] == "confirm"
+    }])
+    policy = handler["operation_policies"]["advance_surface"]
+    assert handler["schema_version"] == HANDLER_SCHEMA_VERSION
+    assert "controller" not in policy
+    assert "strategies" not in policy
+    assert [item["provider_id"] for item in policy["providers"]] == ["first", "second"]
+    assert policy["providers"][0]["successors"] == ["second"]
 
 
-def test_once_per_observation_provider_can_run_again_only_after_change() -> None:
-    controller = {
-        "type": "reactive_local",
-        "providers": [
-            {"provider_id": "find_confirm", "kind": "action", "cost": 1, "repeat_policy": "once_per_observation", "status": "active"},
+def test_old_or_unversioned_handler_is_rejected() -> None:
+    for page_handler in ({"schema_version": "reactive_handler.v1", "operation_policies": {}}, {"operation_policies": {}}):
+        try:
+            ensure_page_handler({"page_handler": page_handler})
+        except ValueError as exc:
+            assert "fresh state workspace" in str(exc)
+        else:
+            raise AssertionError("legacy page handler was accepted")
+
+
+def test_coordinate_space_is_explicit_and_real_points_are_not_persisted() -> None:
+    assert normalize_locator({"type": "point", "x": 10, "y": 20, "coordinate_space": "real"}) is None
+    locator = normalize_locator({"type": "point", "x": 10, "y": 20, "coordinate_space": "logical"})
+    assert locator["coordinate_space"] == "logical"
+
+
+def test_visual_hints_rank_pass_above_unknown_above_fail() -> None:
+    cursor = cursor_for({}, "001:1", "advance")
+    operation = {"providers": [_provider("pass", 0), _provider("unknown", 0), _provider("fail", 0)]}
+    ranked = rank_providers(operation, cursor, {"pass": ["pass"], "unknown": ["unknown"], "fail": ["fail"]})
+    assert [item["provider_id"] for item in ranked] == ["pass", "unknown", "fail"]
+
+
+def test_successor_is_a_short_bonus_and_unmentioned_provider_is_neutral() -> None:
+    cursor = cursor_for({}, "001:1", "advance")
+    cursor["successor_ids"] = ["next"]
+    next_provider = _provider("next", 0)
+    neutral = _provider("neutral", 0)
+    assert provider_score(next_provider, cursor, []) > provider_score(neutral, cursor, [])
+    cursor["successor_ids"] = []
+    assert provider_score(next_provider, cursor, []) == provider_score(neutral, cursor, [])
+
+
+def test_successor_bonus_does_not_override_a_failed_visual_hint() -> None:
+    cursor = cursor_for({}, "001:1", "advance")
+    cursor["successor_ids"] = ["next"]
+    operation = {"providers": [_provider("next", 0), _provider("neutral", 0)]}
+    ranked = rank_providers(operation, cursor, {"next": ["fail"], "neutral": []})
+    assert ranked[0]["provider_id"] == "neutral"
+
+
+def test_successor_context_is_not_set_by_failed_attempt() -> None:
+    cursor = cursor_for({}, "001:1", "advance")
+    provider = _provider("first", successors=["next"], effect_hints=[{
+        "id": "effect",
+        "probe": {"id": "lines", "type": "line_count", "rect": [0, 0, 100, 100], "min": 1, "max": 1, "coordinate_space": "logical"},
+        "expected": "pass",
+    }])
+    record_attempt(cursor, provider, executed=False)
+    assert cursor["successor_ids"] == []
+    update_successor_context(cursor, provider, "contradicted")
+    assert cursor["successor_ids"] == []
+    update_successor_context(cursor, provider, "confirmed")
+    assert cursor["successor_ids"] == ["next"]
+
+
+def test_provider_is_suppressed_for_visit_without_global_degradation() -> None:
+    cursor = cursor_for({}, "001:1", "advance")
+    provider = _provider("layout_specific")
+    operation = {"providers": [provider]}
+    record_attempt(cursor, provider, executed=False)
+    assert rank_providers(operation, cursor, {}) == []
+    record_provider_result(operation, "layout_specific", "resolver_miss", visit_id="001:1")
+    assert provider["status"] == "proposed"
+    assert provider["result_counts"] == {"resolver_miss": 1}
+
+
+def test_repeatable_provider_reopens_only_after_confirmed_effect() -> None:
+    cursor = cursor_for({}, "001:1", "advance")
+    provider = _provider("repeat", repeat_policy="after_confirmed_effect")
+    operation = {"providers": [provider]}
+    record_attempt(cursor, provider)
+    assert rank_providers(operation, cursor, {}) == []
+    mark_confirmed_effect(cursor)
+    assert rank_providers(operation, cursor, {}) == [provider]
+
+
+def test_locator_falls_back_from_missing_template_to_logical_point() -> None:
+    provider = normalize_provider({
+        "provider_id": "target",
+        "locators": [
+            {"type": "region_template", "template_path": "missing.png", "search_rect": [0, 0, 500, 500], "coordinate_space": "logical"},
+            _point(700, 800),
         ],
-    }
-    cursor = {
-        "observation_epoch": 1,
-        "attempted_visit": [],
-        "attempted_by_epoch": {"1": []},
-        "total_actions": 0,
-    }
-    provider = select_provider(controller, cursor)
-    record_provider_attempt(cursor, provider)
-    assert select_provider(controller, cursor) is None
-    advance_observation(cursor)
-    assert select_provider(controller, cursor)["provider_id"] == "find_confirm"
+    })
+    action, info = resolve_provider(provider, np.zeros((2, 2, 3), dtype=np.uint8), FakeVision())
+    assert action == {"type": "click", "x": 700, "y": 800, "coordinate_space": "logical", "brief": ""}
+    assert info["locator_index"] == 1
 
 
-def test_repair_patch_appends_generalized_fallback_without_replacing_direct_action() -> None:
-    handler = handler_from_bootstrap([
-        {
-            "operation": "select_station_and_confirm",
-            "safety": "reversible",
-            "steps": [{"step_id": "select_center", "resolver": {"type": "fixed_point", "x": 640, "y": 400}}],
-        }
-    ])
-    touched = apply_handler_patch(
-        handler,
-        {
-            "operations": [{
-                "operation": "select_station_and_confirm",
-                "safety": "reversible",
-                "controller": {
-                    "type": "reactive_local",
-                    "providers": [{
-                        "provider_id": "find_confirm_text",
-                        "kind": "action",
-                        "cost": 5,
-                        "repeat_policy": "once_per_observation",
-                        "resolver": {"type": "fixed_point", "x": 640, "y": 600},
-                    }],
-                    "fallback_profiles": [{
-                        "id": "station_choice_band",
-                        "kind": "horizontal_probe",
-                        "x_start": 480,
-                        "x_end": 800,
-                        "y": 400,
-                        "samples": 5,
-                    }],
-                },
-            }]
-        },
-    )
-
-    controller = _operation(handler, "select_station_and_confirm")["controller"]
-    ids = {item["provider_id"] for item in controller["providers"]}
-    assert ids == {"select_center", "find_confirm_text", "learned_exploration"}
-    assert touched == {"find_confirm_text", "learned_exploration"}
-
-    merged = merge_controller(
-        controller,
-        {
-            "type": "reactive_local",
-            "fallback_profiles": [{
-                "id": "confirm_band",
-                "kind": "horizontal_probe",
-                "x_start": 500,
-                "x_end": 780,
-                "y": 600,
-                "samples": 4,
-            }],
-        },
-    )
-    exploration = next(item for item in merged["providers"] if item["provider_id"] == "learned_exploration")
-    assert {item["id"] for item in exploration["profiles"]} == {"station_choice_band", "confirm_band"}
+def test_text_target_returns_real_coordinate_once() -> None:
+    provider = normalize_provider({
+        "provider_id": "target",
+        "locators": [{"type": "text_target", "rect": [0, 0, 500, 500], "texts": ["target"], "coordinate_space": "logical"}],
+    })
+    action, _ = resolve_provider(provider, np.zeros((2, 2, 3), dtype=np.uint8), FakeVision())
+    assert action["coordinate_space"] == "real"
+    assert (action["x"], action["y"]) == (140, 210)
 
 
-def test_provider_miss_is_not_globally_degraded() -> None:
-    controller = {
-        "type": "reactive_local",
-        "providers": [{
-            "provider_id": "layout_specific_point",
-            "kind": "action",
-            "cost": 0,
-            "repeat_policy": "once_per_visit",
-            "status": "active",
-            "success_count": 2,
-            "fail_count": 0,
-            "result_counts": {},
+def test_effect_hint_is_an_observable_hypothesis() -> None:
+    provider = _provider("target", effect_hints=[{
+        "id": "enabled",
+        "probe": {"id": "lines", "type": "line_count", "rect": [0, 0, 100, 100], "min": 2, "max": 2, "coordinate_space": "logical"},
+        "expected": "becomes_pass",
+    }])
+    before = np.zeros((2, 2, 3), dtype=np.uint8)
+    after = np.zeros((2, 2, 3), dtype=np.uint8)
+    after[0, 0, 0] = 2
+    result, details = evaluate_effect(provider, {"enabled": "fail"}, after, FakeVision())
+    assert result == "confirmed"
+    assert details[0]["before"] == "fail"
+    assert details[0]["after"] == "pass"
+
+
+def test_deferred_template_is_provisional_until_success(tmp_path: Path) -> None:
+    target = _provider("second", deferred_hints=[{
+        "id": "appeared",
+        "type": "template",
+        "template_bbox": [100, 100, 200, 200],
+        "rect": [50, 50, 250, 250],
+        "coordinate_space": "logical",
+        "materialize_after": "first",
+    }])
+    operation = {"providers": [_provider("first"), target]}
+    cursor = cursor_for({}, "001:1", "advance")
+    created = materialize_deferred_hints(operation, "first", np.zeros((4, 4, 3), dtype=np.uint8), tmp_path, FakeVision(), cursor)
+    assert created[0]["hint"]["status"] == "provisional"
+    assert target["hints"] == []
+    assert promote_materialized_hints(target, cursor) == ["appeared"]
+    assert target["hints"][0]["status"] == "confirmed"
+
+
+def test_repair_patch_keeps_local_and_family_candidates_separate() -> None:
+    handler = handler_from_bootstrap([{
+        "operation": "advance",
+        "providers": [{"provider_id": "old", "locators": [_point(100, 100)]}],
+    }])
+    touched = apply_handler_patch(handler, {
+        "providers": [{"provider_id": "local", "locators": [_point(200, 200)]}],
+        "generalization_candidates": [{
+            "provider_id": "shared",
+            "locators": [{"type": "text_target", "rect": [0, 0, 500, 500], "texts": ["target"], "coordinate_space": "logical"}],
         }],
-    }
-    mark_provider_result(controller, "layout_specific_point", "no_change")
-    provider = controller["providers"][0]
+    }, operation="advance")
+    assert touched == {"local", "shared"}
+    providers = {item["provider_id"]: item for item in handler["operation_policies"]["advance"]["providers"]}
+    assert providers["local"]["scope"] == "instance"
+    assert providers["shared"]["scope"] == "family"
+    assert providers["old"]["locators"][0]["x"] == 100
+
+
+def test_family_provider_requires_success_on_two_visits_to_activate() -> None:
+    provider = _provider("shared", scope="family", status="canary")
+    operation = {"providers": [provider]}
+    record_provider_result(operation, "shared", "confirmed", visit_id="001:1")
+    assert provider["status"] == "canary"
+    record_provider_result(operation, "shared", "confirmed", visit_id="001:2")
     assert provider["status"] == "active"
-    assert provider["success_count"] == 2
-    assert provider["fail_count"] == 1
 
 
-def test_legacy_strategy_schema_is_rejected_instead_of_migrated() -> None:
-    meta = {
-        "page_handler": {
-            "schema_version": "progressive_handler.v1",
-            "operation_policies": {
-                "advance_page": {
-                    "operation": "advance_page",
-                    "safety": "low_risk",
-                    "strategies": [{
-                        "strategy_id": "fixed_v1",
-                        "status": "active",
-                        "level": 0,
-                        "steps": [{"step_id": "click", "resolver": {"type": "fixed_point", "x": 500, "y": 800}}],
-                    }],
-                }
-            },
-        }
+def test_repair_parser_supports_one_bounded_query_round() -> None:
+    assert parse_repair_response('{"decision":"query","image_queries":[{"cell_id":"a"},{"cell_id":"b"},{"cell_id":"c"}],"reason":"zoom"}') == {
+        "decision": "query", "image_queries": ["a", "b"], "reason": "zoom"
     }
-    try:
-        ensure_page_handler(meta)
-    except ValueError as exc:
-        assert "fresh state workspace" in str(exc)
-    else:
-        raise AssertionError("legacy handler must not be silently migrated")
-
-
-def test_visit_cleanup_removes_reactive_cursor() -> None:
-    runtime: dict = {}
-    reactive_cursor_for(runtime, "004:1", "advance_page")
-    assert runtime["visit_operation_reactive"]
-    clear_visit_progress(runtime, "004:1")
-    assert runtime["visit_operation_reactive"] == {}
-
-
-def test_progress_capacity_expands_by_fixed_runtime_rule() -> None:
-    cursor = {
-        "total_actions": 12,
-        "observation_epoch": 7,
-        "action_capacity": 0,
-        "observation_capacity": 0,
-    }
-    ensure_progress_capacity(cursor, {"max_actions": 12, "max_observation_rounds": 6})
-    assert progress_capacity_exhausted(cursor) == ["actions", "observations"]
-
-    decision = apply_progress_audit(cursor, "progressing", "mid")
-    assert decision == {
-        "granted": True,
-        "grant_kind": "progress_extension",
-        "before": {"actions": 12, "observations": 6},
-        "after": {"actions": 20, "observations": 10},
-        "extensions": 1,
-    }
-    assert progress_capacity_exhausted(cursor) == []
-
-
-def test_progress_capacity_refuses_stall_and_limits_uncertain_probe() -> None:
-    cursor = {
-        "total_actions": 12,
-        "observation_epoch": 7,
-        "action_capacity": 12,
-        "observation_capacity": 6,
-        "capacity_extensions": 0,
-        "uncertain_probe_used": False,
-    }
-    stalled = apply_progress_audit(cursor, "stalled", "high")
-    assert stalled["granted"] is False
-    assert cursor["action_capacity"] == 12
-
-    probe = apply_progress_audit(cursor, "uncertain", "mid")
-    assert probe["grant_kind"] == "uncertain_probe"
-    assert probe["after"] == {"actions": 14, "observations": 7}
-
-    second_probe = apply_progress_audit(cursor, "uncertain", "high")
-    assert second_probe["granted"] is False
-    assert cursor["action_capacity"] == 14
-
-
-def test_progress_capacity_has_fixed_extension_count_limit() -> None:
-    cursor = {
-        "total_actions": 12,
-        "observation_epoch": 7,
-        "action_capacity": 12,
-        "observation_capacity": 6,
-        "capacity_extensions": 0,
-    }
-    for _ in range(4):
-        assert apply_progress_audit(cursor, "new_instance", "high")["granted"] is True
-    final = apply_progress_audit(cursor, "progressing", "high")
-    assert final["granted"] is False
-    assert cursor["action_capacity"] == 44
-    assert cursor["observation_capacity"] == 22
-
-
-def test_progress_audit_parser_accepts_only_classification_fields() -> None:
-    parsed = parse_progress_audit(
-        '{"verdict":"progressing","confidence":"high","reason":"new card set",'
-        '"evidence":["confirm led to another selection screen"],"grant_actions":999}'
-    )
-    assert parsed == {
-        "verdict": "progressing",
-        "confidence": "high",
-        "reason": "new card set",
-        "evidence": ["confirm led to another selection screen"],
-    }
-    assert parse_progress_audit('{"verdict":"extend_by_999","confidence":"high"}') is None
-
-
-def test_capacity_recovery_has_independent_two_attempt_budget() -> None:
-    runtime: dict = {}
-    assert capacity_recovery_exhausted(runtime, "004:22", "select_station") is False
-    assert record_capacity_recovery(runtime, "004:22", "select_station") == 1
-    assert capacity_recovery_exhausted(runtime, "004:22", "select_station") is False
-    assert record_capacity_recovery(runtime, "004:22", "select_station") == 2
-    assert capacity_recovery_exhausted(runtime, "004:22", "select_station") is True
-    clear_visit_progress(runtime, "004:22")
-    assert capacity_recovery_exhausted(runtime, "004:22", "select_station") is False
-
-
-def test_recovery_provider_is_promoted_only_after_observed_progress_and_deduplicated() -> None:
-    controller = {"type": "reactive_local", "providers": [], "max_actions": 20, "max_observation_rounds": 10}
-    raw = {
-        "provider_id": "click_visible_confirm",
-        "kind": "action",
-        "cost": 5,
-        "repeat_policy": "once_per_observation",
-        "status": "proposed",
-        "resolver": {"type": "fixed_point", "x": 640, "y": 720},
-        "expected_after": {"state_relation": "may_leave", "reentry_policy": "same_visit"},
-        "brief": "click visible confirm",
-    }
-    assert promote_recovery_provider(controller, raw, outcome="no_change", visit_id="004:22", observation_epoch=8) is None
-    assert controller["providers"] == []
-
-    proposed = promote_recovery_provider(controller, raw, outcome="changed_same_state", visit_id="004:22", observation_epoch=8)
-    assert proposed["status"] == "proposed"
-    assert proposed["source"] == "llm_capacity_recovery"
-    assert proposed["result_counts"] == {"changed_same_state": 1}
-
-    same_behavior = {**raw, "provider_id": "different_model_name"}
-    active = promote_recovery_provider(controller, same_behavior, outcome="state_left", visit_id="004:22", observation_epoch=9)
-    assert len(controller["providers"]) == 1
-    assert active["status"] == "active"
-    assert active["success_count"] == 1
-    assert active["result_counts"] == {"changed_same_state": 1, "state_left": 1}
-    assert provider_resolver_signature(active) == provider_resolver_signature(raw)
-
-
-def test_next_action_recovery_parser_rejects_non_action_payloads() -> None:
-    parsed = parse_next_action_recovery(
-        '{"decision":"act","reason":"visible confirm","provider":{'
-        '"provider_id":"confirm","kind":"action","cost":1,"repeat_policy":"once_per_observation",'
-        '"status":"proposed","resolver":{"type":"fixed_point","x":640,"y":720},'
-        '"expected_after":{"state_relation":"may_leave","reentry_policy":"same_visit"},"brief":"confirm"}}'
-    )
-    assert parsed is not None
-    assert parsed["provider"]["provider_id"] == "confirm"
-    assert parse_next_action_recovery('{"decision":"act","reason":"x","provider":{"kind":"exploration"}}') is None
-    assert parse_next_action_recovery('{"decision":"give_up","reason":"no visible action","provider":{}}') == {
-        "decision": "give_up",
-        "reason": "no visible action",
-    }
-
-
-def test_successful_same_state_recovery_gets_small_fixed_follow_up_window() -> None:
-    cursor = {"total_actions": 21, "observation_epoch": 11, "action_capacity": 20, "observation_capacity": 10}
-    assert grant_capacity_after_recovery(cursor) == {"actions": 25, "observations": 13}
+    repaired = parse_repair_response('{"decision":"repair","local_patch":{"providers":[]},"generalization_candidates":[],"reason":"done"}')
+    assert repaired["decision"] == "repair"

@@ -65,11 +65,10 @@ def resolve_effective_command(state_meta: dict[str, Any], intent: dict[str, Any]
     operation = str(default.get("operation") or "").strip()
     if not operation:
         return None
-    safety = str(default.get("safety", "unknown"))
     intent_effect = str(default.get("intent_effect", "none"))
     intent_scope = str(default.get("intent_scope", "intent_specific"))
     if isinstance(intent, dict):
-        if intent_scope != "intent_invariant" or safety not in {"low_risk", "reversible"}:
+        if intent_scope != "intent_invariant":
             return None
         return EffectiveCommand(
             operation=operation,
@@ -82,12 +81,6 @@ def resolve_effective_command(state_meta: dict[str, Any], intent: dict[str, Any]
             intent_effect=intent_effect,
             expected_event=str(default.get("expected_event") or "") or None,
         )
-    # With no active intent, an explicitly configured default operation is the
-    # state author's decision for the ordinary path.  intent_scope only controls
-    # whether that default may interrupt an *existing* intent; it must not make
-    # the same bootstrap operation unusable on the state that just learned it.
-    if safety not in {"low_risk", "reversible"}:
-        return None
     return EffectiveCommand(
         operation=operation,
         source="state_default",
@@ -96,28 +89,3 @@ def resolve_effective_command(state_meta: dict[str, Any], intent: dict[str, Any]
         intent_effect=intent_effect,
         expected_event=str(default.get("expected_event") or "") or None,
     )
-
-
-def step_preconditions_pass(
-    preconditions: dict[str, Any],
-    *,
-    previous_step_verified: bool,
-    previous_event: dict[str, Any] | None,
-    current_state_matches: bool,
-    intent: dict[str, Any] | None,
-) -> tuple[bool, str]:
-    supported = {"previous_step_verified", "previous_event", "current_page_still_matches", "intent_phase"}
-    unknown = set(preconditions) - supported
-    if unknown:
-        return False, f"unsupported_preconditions:{','.join(sorted(unknown))}"
-    if bool(preconditions.get("previous_step_verified", False)) and not previous_step_verified:
-        return False, "previous_step_not_verified"
-    expected_event = str(preconditions.get("previous_event") or "")
-    if expected_event and str((previous_event or {}).get("type") or "") != expected_event:
-        return False, "previous_event_mismatch"
-    if bool(preconditions.get("current_page_still_matches", False)) and not current_state_matches:
-        return False, "current_page_no_longer_matches"
-    expected_phase = str(preconditions.get("intent_phase") or "")
-    if expected_phase and str((intent or {}).get("phase") or "") != expected_phase:
-        return False, "intent_phase_mismatch"
-    return True, "ok"

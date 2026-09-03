@@ -29,6 +29,7 @@ def _text_condition(condition_id: str, text: str, *, enabled: bool) -> dict:
         "kind": "text_line_contains",
         "enabled": enabled,
         "condition_status": "active",
+        "role": "identity_support",
         "params": {"text": text, "rect": [0, 0, 1, 1]},
         "stability": "high",
         "discrimination": "high",
@@ -49,6 +50,7 @@ def test_loser_strengthening_is_verified_with_real_matcher(tmp_path: Path) -> No
     loser_meta = {
         "state_id": "loser",
         "samples": [{"path": str(sample_path)}],
+        "match_clauses": [{"all": ["broad"]}],
         "match_conditions": [
             _text_condition("broad", "common", enabled=True),
             _text_condition("loser-exclusive", "loser-only", enabled=False),

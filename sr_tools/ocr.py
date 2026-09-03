@@ -144,3 +144,94 @@ def ocr_entries(image: np.ndarray, area: Area, lang: str = "zhs", white: bool = 
     if white:
         roi = _extract_white_letters(roi, threshold=255)
     return _detect_text_entries(roi, lang=lang)
+
+
+@lru_cache(maxsize=1)
+def _get_detection_engine():
+    errors: list[str] = []
+    for module_name in ("rapidocr", "rapidocr_onnxruntime"):
+        try:
+            module = __import__(module_name, fromlist=["RapidOCR"])
+            return module.RapidOCR()
+        except Exception as exc:  # pragma: no cover - depends on optional backend
+            errors.append(f"{module_name}: {type(exc).__name__}: {exc}")
+    raise RuntimeError("RapidOCR detection backend is unavailable: " + "; ".join(errors))
+
+
+def _detection_polygons(raw: Any) -> list[Any]:
+    payload = raw[0] if isinstance(raw, tuple) and len(raw) == 2 else raw
+    for name in ("boxes", "dt_polys", "polygons"):
+        value = getattr(payload, name, None)
+        if value is not None:
+            return list(value)
+    if isinstance(payload, dict):
+        for name in ("boxes", "dt_polys", "polygons"):
+            if payload.get(name) is not None:
+                return list(payload[name])
+        return []
+    if isinstance(payload, np.ndarray) and payload.ndim == 3:
+        return list(payload)
+    polygons: list[Any] = []
+    for item in ([] if payload is None else payload):
+        candidate = item[0] if isinstance(item, (list, tuple)) and item else item
+        try:
+            points = list(candidate)
+            if len(points) >= 4 and all(len(point) >= 2 for point in points):
+                polygons.append(candidate)
+        except (TypeError, IndexError):
+            continue
+    return polygons
+
+
+def detect_text_lines(image: np.ndarray, area: Area) -> list[dict[str, Any]]:
+    """Run detection only; no text recognition is performed."""
+    x1, y1, x2, y2 = _clip_area(area, image.shape[1], image.shape[0])
+    roi = image[y1:y2, x1:x2]
+    if roi.size == 0:
+        return []
+    try:
+        raw = _get_detection_engine()(
+            cv2.cvtColor(roi, cv2.COLOR_RGB2BGR),
+            use_det=True,
+            use_cls=False,
+            use_rec=False,
+        )
+    except TypeError as exc:
+        raise RuntimeError("RapidOCR backend does not support detection-only mode") from exc
+    lines: list[dict[str, Any]] = []
+    for polygon in _detection_polygons(raw):
+        try:
+            points = [(int(round(float(point[0]))) + x1, int(round(float(point[1]))) + y1) for point in polygon]
+        except (TypeError, ValueError, IndexError):
+            continue
+        xs = [point[0] for point in points]
+        ys = [point[1] for point in points]
+        if not xs or not ys:
+            continue
+        left, top, right, bottom = min(xs), min(ys), max(xs), max(ys)
+        lines.append({
+            "bbox": (left, top, max(1, right - left), max(1, bottom - top)),
+            "center": ((left + right) // 2, (top + bottom) // 2),
+            "polygon": points,
+        })
+    return sorted(lines, key=lambda item: (item["center"][1], item["center"][0]))
+
+
+def count_text_rows(lines: list[dict[str, Any]]) -> int:
+    if not lines:
+        return 0
+    heights = sorted(max(1, int(line["bbox"][3])) for line in lines)
+    tolerance = max(3.0, heights[len(heights) // 2] * 0.55)
+    centers: list[float] = []
+    counts: list[int] = []
+    for line in lines:
+        center_y = float(line["center"][1])
+        nearest = min(range(len(centers)), key=lambda index: abs(centers[index] - center_y), default=None)
+        if nearest is None or abs(centers[nearest] - center_y) > tolerance:
+            centers.append(center_y)
+            counts.append(1)
+        else:
+            count = counts[nearest]
+            centers[nearest] = (centers[nearest] * count + center_y) / (count + 1)
+            counts[nearest] = count + 1
+    return len(centers)

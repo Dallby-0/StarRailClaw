@@ -1,400 +1,239 @@
 from __future__ import annotations
 
-from pathlib import Path
 from copy import deepcopy
+from pathlib import Path
 from typing import Any
 
-from state_machine.page_handler.reactive import controller_from_steps, merge_controller, normalize_controller
+from state_machine.page_handler.reactive import normalize_operation, normalize_provider
 from state_machine.time_utils import now_iso as _now_iso
 
-HANDLER_SCHEMA_VERSION = "reactive_handler.v1"
+
+HANDLER_SCHEMA_VERSION = "reactive_handler.v2"
 TRACE_LIMIT = 40
-STRATEGY_RESULTS = {"verified_success", "verified_reentry", "partial_progress", "progress_unknown", "no_effect", "wrong_transition", "unsafe_effect", "state_mismatch", "transient_unknown"}
-
-
-def _slug(raw: Any, fallback: str) -> str:
-    text = str(raw or "").strip().lower()
-    safe = "".join(ch if ch.isalnum() else "_" for ch in text)
-    while "__" in safe:
-        safe = safe.replace("__", "_")
-    return safe.strip("_") or fallback
-
-
-def ensure_page_handler(meta: dict[str, Any]) -> dict[str, Any]:
-    handler = meta.get("page_handler")
-    if not isinstance(handler, dict):
-        handler = {}
-        meta["page_handler"] = handler
-    persisted_version = str(handler.get("schema_version") or "")
-    if persisted_version and persisted_version != HANDLER_SCHEMA_VERSION:
-        raise ValueError(
-            f"unsupported legacy page handler schema {persisted_version!r}; "
-            "create a fresh state workspace for reactive_handler.v1"
-        )
-    handler.setdefault("schema_version", HANDLER_SCHEMA_VERSION)
-    handler.setdefault("default_operation", None)
-    if not isinstance(handler.get("intent_routes"), list):
-        handler["intent_routes"] = []
-    if not isinstance(handler.get("operation_policies"), dict):
-        handler["operation_policies"] = {}
-    for policy in handler["operation_policies"].values():
-        if not isinstance(policy, dict):
-            continue
-        normalized = normalize_controller(policy.get("controller"))
-        if normalized is not None:
-            policy["controller"] = normalized
-    handler["schema_version"] = HANDLER_SCHEMA_VERSION
-    if not isinstance(handler.get("episode_trace"), list):
-        handler["episode_trace"] = []
-    handler["updated_at"] = _now_iso()
-    return handler
-
-
-def _normalize_resolver(raw: Any) -> dict[str, Any] | None:
-    if not isinstance(raw, dict):
-        return None
-    rtype = str(raw.get("type") or "fixed_point").strip()
-    if rtype == "click":
-        rtype = "fixed_point"
-    if rtype == "fixed_point":
-        try:
-            return {"type": rtype, "x": int(raw.get("x")), "y": int(raw.get("y"))}
-        except Exception:
-            return None
-    if rtype == "run_preset":
-        name = str(raw.get("name") or "").strip()
-        return {"type": rtype, "name": name} if name else None
-    if rtype == "region_template":
-        return {
-            "type": rtype,
-            "template_path": str(raw.get("template_path") or ""),
-            "search_rect": raw.get("search_rect"),
-            "template_bbox": raw.get("template_bbox") or raw.get("bbox"),
-            "threshold": float(raw.get("threshold", 0.82)),
-        }
-    return None
-
-
-def normalize_strategy(raw: Any, *, operation: str, index: int = 1) -> dict[str, Any] | None:
-    if not isinstance(raw, dict):
-        return None
-    strategy_id = _slug(raw.get("strategy_id") or raw.get("id"), f"{operation}_strategy_{index}")
-    raw_steps = raw.get("steps") if isinstance(raw.get("steps"), list) else [raw]
-    steps: list[dict[str, Any]] = []
-    for step_idx, step in enumerate(raw_steps[:2], start=1):
-        if not isinstance(step, dict):
-            continue
-        resolver = _normalize_resolver(step.get("resolver") or step.get("action") or step)
-        if resolver is None:
-            continue
-        steps.append({
-            "step_id": _slug(step.get("step_id"), f"step_{step_idx}"),
-            "resolver": resolver,
-            "preconditions": dict(step.get("preconditions") or {}),
-            "expected_after": dict(step.get("expected_after") or {"state_relation": "may_leave", "reentry_policy": "forbid"}),
-            "emits_on_success": dict(step.get("emits_on_success") or {}),
-            "brief": str(step.get("brief") or step.get("label") or ""),
-        })
-    if not steps:
-        return None
-    status = str(raw.get("status", "proposed"))
-    if status not in {"proposed", "active", "degraded", "quarantined"}:
-        status = "proposed"
-    return {
-        "strategy_id": strategy_id,
-        "operation": operation,
-        "level": max(0, int(raw.get("level", 0) or 0)),
-        "status": status,
-        "safety": str(raw.get("safety", "low_risk")),
-        "steps": steps,
-        "success_count": int(raw.get("success_count", 0) or 0),
-        "fail_count": int(raw.get("fail_count", 0) or 0),
-        "result_counts": dict(raw.get("result_counts") or {}),
-        "created_at": str(raw.get("created_at") or _now_iso()),
-        "updated_at": _now_iso(),
-    }
-
-
-def normalize_operation(raw: Any, *, index: int = 1) -> dict[str, Any] | None:
-    if not isinstance(raw, dict):
-        return None
-    operation = _slug(raw.get("operation"), f"operation_{index}")
-    exploration = [dict(item) for item in raw.get("exploration", []) if isinstance(item, dict)]
-    controller = normalize_controller(raw.get("controller"))
-    if controller is None and isinstance(raw.get("steps"), list):
-        controller = controller_from_steps(raw["steps"], exploration=exploration)
-    if controller is None:
-        return None
-    operation_policy = {
-        "operation": operation,
-        "intent_scope": str(raw.get("intent_scope", "intent_specific")),
-        "intent_effect": str(raw.get("intent_effect", "none")),
-        "safety": str(raw.get("safety", "low_risk")),
-        "expected_event": str(raw.get("expected_event") or "") or None,
-        # Optional local recovery profiles.  They are intentionally kept
-        # outside learned strategies so exploratory probing cannot poison the
-        # strategy ranking or success counts.
-        "exploration": exploration,
-        "allow_exploration": bool(raw.get("allow_exploration", False)),
-        "strategies": [],
-    }
-    if controller is not None:
-        operation_policy["controller"] = controller
-    return operation_policy
 
 
 def _normalize_intent_route(raw: Any, operation: str) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
-    kinds = raw.get("intent_kinds")
-    if not isinstance(kinds, list):
-        kind = raw.get("intent_kind") or raw.get("kind")
-        kinds = [kind] if kind else []
-    phases = raw.get("phases")
-    if not isinstance(phases, list):
-        phase = raw.get("phase")
-        phases = [phase] if phase else ["*"]
+    kinds = raw.get("intent_kinds") if isinstance(raw.get("intent_kinds"), list) else [raw.get("intent_kind") or raw.get("kind")]
+    phases = raw.get("phases") if isinstance(raw.get("phases"), list) else [raw.get("phase") or "*"]
+    kinds = [str(value) for value in kinds if str(value or "")]
     if not kinds:
         return None
     return {
-        "intent_kinds": [str(value) for value in kinds if str(value)],
-        "phases": [str(value) for value in phases if str(value)] or ["*"],
+        "intent_kinds": kinds,
+        "phases": [str(value) for value in phases if str(value or "")] or ["*"],
         "operation": str(raw.get("operation") or operation),
-        "intent_effect": str(raw.get("intent_effect", "advance")),
+        "intent_effect": str(raw.get("intent_effect") or "advance"),
         "expected_event": str(raw.get("expected_event") or "") or None,
         "params": dict(raw.get("params") or {}),
     }
 
 
+def _empty_handler() -> dict[str, Any]:
+    now = _now_iso()
+    return {
+        "schema_version": HANDLER_SCHEMA_VERSION,
+        "default_operation": None,
+        "intent_routes": [],
+        "operation_policies": {},
+        "episode_trace": [],
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+def ensure_page_handler(meta: dict[str, Any]) -> dict[str, Any]:
+    raw = meta.get("page_handler")
+    if raw is None:
+        raw = _empty_handler()
+        meta["page_handler"] = raw
+    if not isinstance(raw, dict):
+        raise ValueError("page_handler must be an object")
+    version = str(raw.get("schema_version") or "")
+    if version != HANDLER_SCHEMA_VERSION:
+        raise ValueError(
+            f"unsupported page handler schema {version or '<missing>'!r}; "
+            "create a fresh state workspace for reactive_handler.v2"
+        )
+    policies = raw.get("operation_policies")
+    if not isinstance(policies, dict):
+        raise ValueError("reactive_handler.v2 operation_policies must be an object")
+    normalized: dict[str, dict[str, Any]] = {}
+    for index, (name, policy) in enumerate(policies.items(), 1):
+        operation = normalize_operation(policy, index=index)
+        if operation is None or operation["operation"] != str(name):
+            raise ValueError(f"invalid reactive operation policy: {name!r}")
+        normalized[str(name)] = operation
+    raw["operation_policies"] = normalized
+    if not isinstance(raw.get("intent_routes"), list):
+        raw["intent_routes"] = []
+    if not isinstance(raw.get("episode_trace"), list):
+        raw["episode_trace"] = []
+    raw["updated_at"] = _now_iso()
+    return raw
+
+
 def handler_from_bootstrap(bootstrap_operations: Any) -> dict[str, Any]:
-    handler = {"schema_version": HANDLER_SCHEMA_VERSION, "default_operation": None, "intent_routes": [], "operation_policies": {}, "episode_trace": [], "created_at": _now_iso(), "updated_at": _now_iso()}
+    handler = _empty_handler()
     if not isinstance(bootstrap_operations, list):
         return handler
-    for idx, raw in enumerate(bootstrap_operations[:4], start=1):
-        operation = normalize_operation(raw, index=idx)
+    defaults: list[str] = []
+    for index, raw in enumerate(bootstrap_operations[:4], 1):
+        operation = normalize_operation(raw, index=index)
         if operation is None:
             continue
         name = operation["operation"]
         handler["operation_policies"][name] = operation
-        if bool(raw.get("is_default", False)):
-            handler["default_operation"] = {"operation": name, "intent_scope": operation["intent_scope"], "intent_effect": operation["intent_effect"], "safety": operation["safety"], "expected_event": operation["expected_event"]}
+        if bool(raw.get("is_default")):
+            defaults.append(name)
         routes = raw.get("intent_routes") if isinstance(raw.get("intent_routes"), list) else []
         handler["intent_routes"].extend(route for item in routes if (route := _normalize_intent_route(item, name)) is not None)
-    # A single low-risk bootstrap operation is an unambiguous answer to the
-    # combined "identify + advance" request.  Treat it as the default even if
-    # the model omitted is_default or emitted a contradictory intent_scope.
-    # Multiple choices and commit/destructive operations still require an
-    # explicit command/intent and therefore remain unresolved.
-    if handler["default_operation"] is None and len(handler["operation_policies"]) == 1:
-        only = next(iter(handler["operation_policies"].values()))
-        if isinstance(only, dict) and str(only.get("safety")) in {"low_risk", "reversible"}:
-            handler["default_operation"] = {
-                "operation": str(only["operation"]),
-                "intent_scope": str(only.get("intent_scope", "intent_specific")),
-                "intent_effect": str(only.get("intent_effect", "none")),
-                "safety": str(only.get("safety")),
-                "expected_event": only.get("expected_event"),
-            }
+    if len(defaults) == 1:
+        name = defaults[0]
+        operation = handler["operation_policies"][name]
+        handler["default_operation"] = {
+            "operation": name,
+            "intent_scope": operation["intent_scope"],
+            "intent_effect": operation["intent_effect"],
+            "expected_event": operation["expected_event"],
+        }
+    elif len(handler["operation_policies"]) == 1:
+        name, operation = next(iter(handler["operation_policies"].items()))
+        handler["default_operation"] = {
+            "operation": name,
+            "intent_scope": operation["intent_scope"],
+            "intent_effect": operation["intent_effect"],
+            "expected_event": operation["expected_event"],
+        }
     return handler
 
 
-def handler_summary(handler: dict[str, Any], *, limit_trace: int = 8) -> dict[str, Any]:
-    policies = handler.get("operation_policies") if isinstance(handler.get("operation_policies"), dict) else {}
-    compact: dict[str, Any] = {}
-    for operation, policy in policies.items():
-        if not isinstance(policy, dict):
-            continue
-        compact[str(operation)] = {
-            "intent_scope": policy.get("intent_scope"), "intent_effect": policy.get("intent_effect"), "safety": policy.get("safety"),
-            "controller": {
-                "type": policy.get("controller", {}).get("type"),
-                "providers": [
-                    {
-                        "provider_id": item.get("provider_id"),
-                        "kind": item.get("kind"),
-                        "cost": item.get("cost"),
-                        "repeat_policy": item.get("repeat_policy"),
-                        "status": item.get("status"),
-                        "success_count": item.get("success_count", 0),
-                        "fail_count": item.get("fail_count", 0),
-                    }
-                    for item in policy.get("controller", {}).get("providers", [])
-                    if isinstance(item, dict)
-                ],
-            } if isinstance(policy.get("controller"), dict) else None,
-            "exploration": [
-                {"id": item.get("id"), "kind": item.get("kind")}
-                for item in policy.get("exploration", [])
-                if isinstance(item, dict)
-            ],
-            "strategies": [{"strategy_id": item.get("strategy_id"), "level": item.get("level"), "status": item.get("status"), "success_count": item.get("success_count", 0), "fail_count": item.get("fail_count", 0)} for item in policy.get("strategies", []) if isinstance(item, dict)],
-        }
-    trace = handler.get("episode_trace") if isinstance(handler.get("episode_trace"), list) else []
-    return {"schema_version": handler.get("schema_version"), "default_operation": handler.get("default_operation"), "intent_routes": handler.get("intent_routes", []), "operation_policies": compact, "recent_trace": trace[-limit_trace:]}
+def _provider_signature(provider: dict[str, Any]) -> tuple[Any, ...]:
+    return (str(provider.get("provider_id") or ""),)
 
 
-def continuation_patch_from_sibling(handler: dict[str, Any], operation: str) -> dict[str, Any] | None:
-    """Reuse an already learned sibling operation that exits the current page.
-
-    This repairs a common bootstrap modeling error where the model emits
-    `select` and `confirm` as parallel operations even though they are ordered
-    steps of one default page advance operation.
-    """
-    policies = handler.get("operation_policies") if isinstance(handler.get("operation_policies"), dict) else {}
-    current = policies.get(operation) if isinstance(policies.get(operation), dict) else {}
-    for sibling_name, policy in policies.items():
-        if sibling_name == operation or not isinstance(policy, dict):
-            continue
-        for strategy in policy.get("strategies", []):
-            if not isinstance(strategy, dict):
-                continue
-            steps = strategy.get("steps") if isinstance(strategy.get("steps"), list) else []
-            if not steps or not any(
-                isinstance(step, dict)
-                and isinstance(step.get("expected_after"), dict)
-                and str(step["expected_after"].get("state_relation")) == "must_leave"
-                for step in steps
-            ):
-                continue
-            copied = deepcopy(strategy)
-            copied["strategy_id"] = _slug(f"{operation}_continue_{strategy.get('strategy_id')}", f"{operation}_continuation")
-            copied["operation"] = operation
-            copied["level"] = max(1, int(copied.get("level", 0) or 0) + 1)
-            copied["status"] = "proposed"
-            # The sibling is being folded into an already authorized default
-            # page advance operation. Keep the default operation's safety
-            # boundary instead of importing a model's overly broad "commit"
-            # label for an ordinary card-confirm button.
-            copied["safety"] = str(current.get("safety", "reversible"))
-            copied.pop("success_count", None)
-            copied.pop("fail_count", None)
-            copied.pop("result_counts", None)
-            return {
-                "operations": [{
-                    "operation": operation,
-                    "intent_scope": str(current.get("intent_scope", "intent_specific")),
-                    "intent_effect": str(current.get("intent_effect", "advance")),
-                    "safety": str(current.get("safety", "reversible")),
-                    "expected_event": policy.get("expected_event") or current.get("expected_event") or "",
-                    "strategies": [copied],
-                }]
-            }
-    return None
-
-
-def select_strategy(handler: dict[str, Any], operation: str, *, excluded: set[str] | None = None, preferred_id: str | None = None) -> dict[str, Any] | None:
-    policies = handler.get("operation_policies") if isinstance(handler.get("operation_policies"), dict) else {}
-    policy = policies.get(operation)
-    if not isinstance(policy, dict):
-        return None
-    excluded = excluded or set()
-    candidates = [item for item in policy.get("strategies", []) if isinstance(item, dict) and str(item.get("strategy_id")) not in excluded and str(item.get("status", "proposed")) in {"proposed", "active"}]
-    if not candidates:
-        return None
-    if preferred_id:
-        preferred = next((item for item in candidates if str(item.get("strategy_id") or "") == preferred_id), None)
-        if preferred is not None:
-            return preferred
-    candidates.sort(key=lambda item: (int(item.get("level", 0) or 0), 0 if item.get("status") == "active" else 1, -int(item.get("success_count", 0) or 0)))
-    return candidates[0]
-
-
-def apply_handler_patch(handler: dict[str, Any], patch: Any) -> set[str]:
+def merge_operation(existing: dict[str, Any] | None, incoming: dict[str, Any]) -> tuple[dict[str, Any], set[str]]:
+    if not isinstance(existing, dict):
+        return deepcopy(incoming), {str(item.get("provider_id")) for item in incoming.get("providers", []) if isinstance(item, dict)}
+    merged = deepcopy(existing)
+    providers = merged.get("providers") if isinstance(merged.get("providers"), list) else []
+    merged["providers"] = providers
+    by_signature = {_provider_signature(item): item for item in providers if isinstance(item, dict)}
     touched: set[str] = set()
-    if not isinstance(patch, dict):
+    for provider in incoming.get("providers", []):
+        if not isinstance(provider, dict):
+            continue
+        signature = _provider_signature(provider)
+        previous = by_signature.get(signature)
+        if previous is not None:
+            provider = deepcopy(provider)
+            provider["success_count"] = int(previous.get("success_count", 0) or 0)
+            provider["result_counts"] = dict(previous.get("result_counts") or {})
+            provider["successful_visits"] = list(previous.get("successful_visits") or [])
+            provider["created_at"] = previous.get("created_at", provider.get("created_at"))
+            providers.remove(previous)
+        providers.append(deepcopy(provider))
+        by_signature[signature] = providers[-1]
+        touched.add(str(provider.get("provider_id") or ""))
+    for key in ("intent_scope", "intent_effect", "expected_event", "budgets"):
+        if incoming.get(key) is not None:
+            merged[key] = deepcopy(incoming[key])
+    return merged, touched
+
+
+def merge_bootstrap_operations(handler: dict[str, Any], operations: Any) -> set[str]:
+    touched: set[str] = set()
+    if not isinstance(operations, list):
         return touched
-    policies = handler.get("operation_policies") if isinstance(handler.get("operation_policies"), dict) else {}
-    handler["operation_policies"] = policies
-    for op_idx, raw in enumerate(patch.get("operations") if isinstance(patch.get("operations"), list) else [], start=1):
-        operation = normalize_operation(raw, index=op_idx)
+    policies = handler["operation_policies"]
+    for index, raw in enumerate(operations[:4], 1):
+        operation = normalize_operation(raw, index=index)
         if operation is None:
             continue
         name = operation["operation"]
-        existing = policies.get(name)
-        if not isinstance(existing, dict):
-            policies[name] = operation
-            touched.update(str(item["strategy_id"]) for item in operation["strategies"])
-            if isinstance(operation.get("controller"), dict):
-                touched.update(str(item["provider_id"]) for item in operation["controller"].get("providers", []))
-            continue
-        by_id = {str(item.get("strategy_id")): item for item in existing.get("strategies", []) if isinstance(item, dict)}
-        for strategy in operation["strategies"]:
-            old = by_id.get(str(strategy["strategy_id"]))
-            if isinstance(old, dict):
-                strategy.update({"success_count": int(old.get("success_count", 0) or 0), "fail_count": int(old.get("fail_count", 0) or 0), "result_counts": dict(old.get("result_counts") or {}), "created_at": old.get("created_at", strategy["created_at"])})
-                existing["strategies"].remove(old)
-            existing.setdefault("strategies", []).append(strategy)
-            touched.add(str(strategy["strategy_id"]))
-        if isinstance(operation.get("controller"), dict):
-            incoming_provider_ids = {
-                str(item.get("provider_id"))
-                for item in operation["controller"].get("providers", [])
-                if isinstance(item, dict)
-            }
-            existing["controller"] = merge_controller(existing.get("controller"), operation["controller"])
-            touched.update(incoming_provider_ids)
-        if operation.get("exploration"):
-            existing["exploration"] = operation["exploration"]
-        if operation.get("allow_exploration"):
-            existing["allow_exploration"] = True
-    if isinstance(patch.get("default_operation"), dict):
-        handler["default_operation"] = dict(patch["default_operation"])
-    if isinstance(patch.get("intent_routes"), list):
-        normalized_routes = []
-        for item in patch["intent_routes"]:
-            operation = str(item.get("operation") or "") if isinstance(item, dict) else ""
-            route = _normalize_intent_route(item, operation)
-            if route is not None:
-                normalized_routes.append(route)
-        handler["intent_routes"] = normalized_routes
+        policies[name], changed = merge_operation(policies.get(name), operation)
+        touched.update(changed)
     handler["updated_at"] = _now_iso()
     return touched
 
 
-def materialize_strategy_templates(handler: dict[str, Any], state_dir: Path, frame_rgb, vision, strategy_ids: set[str]) -> None:
+def apply_handler_patch(handler: dict[str, Any], patch: Any, *, operation: str) -> set[str]:
+    if not isinstance(patch, dict):
+        return set()
     policies = handler.get("operation_policies") if isinstance(handler.get("operation_policies"), dict) else {}
-    for policy in policies.values():
+    handler["operation_policies"] = policies
+    policy = policies.get(operation)
+    touched: set[str] = set()
+    raw_providers = patch.get("providers") if isinstance(patch.get("providers"), list) else []
+    candidates = patch.get("generalization_candidates") if isinstance(patch.get("generalization_candidates"), list) else []
+    incoming: list[dict[str, Any]] = []
+    existing_ids = {
+        str(item.get("provider_id") or "")
+        for item in (policy.get("providers", []) if isinstance(policy, dict) else [])
+        if isinstance(item, dict)
+    }
+    tagged = [(raw, False) for raw in raw_providers] + [(raw, True) for raw in candidates]
+    for index, (raw, family_candidate) in enumerate(tagged, 1):
+        candidate = dict(raw) if isinstance(raw, dict) else raw
+        if isinstance(candidate, dict) and family_candidate:
+            candidate["scope"] = "family"
+            candidate["status"] = "proposed"
+            base_id = str(candidate.get("provider_id") or "family_candidate")
+            unique_id = base_id
+            suffix = 2
+            while unique_id in existing_ids:
+                unique_id = f"{base_id}_family_{suffix}"
+                suffix += 1
+            candidate["provider_id"] = unique_id
+        provider = normalize_provider(candidate, index=index)
+        if provider is not None:
+            incoming.append(provider)
+            existing_ids.add(str(provider.get("provider_id") or ""))
+    if not incoming:
+        return set()
+    if not isinstance(policy, dict):
+        policy = {
+            "operation": operation,
+            "intent_scope": "intent_specific",
+            "intent_effect": "advance",
+            "expected_event": None,
+            "providers": [],
+            "budgets": {},
+        }
+        policies[operation] = policy
+    merged, touched = merge_operation(policy, {**policy, "providers": incoming})
+    policies[operation] = merged
+    handler["updated_at"] = _now_iso()
+    return touched
+
+
+def materialize_provider_templates(handler: dict[str, Any], state_dir: Path, frame_rgb, vision, provider_ids: set[str]) -> None:
+    for policy in handler.get("operation_policies", {}).values():
         if not isinstance(policy, dict):
             continue
-        for strategy in policy.get("strategies", []):
-            if not isinstance(strategy, dict) or str(strategy.get("strategy_id")) not in strategy_ids:
+        for provider in policy.get("providers", []):
+            if not isinstance(provider, dict) or str(provider.get("provider_id")) not in provider_ids:
                 continue
-            for step_idx, step in enumerate(strategy.get("steps", []), start=1):
-                resolver = step.get("resolver") if isinstance(step, dict) and isinstance(step.get("resolver"), dict) else None
-                if not isinstance(resolver, dict) or resolver.get("type") != "region_template" or resolver.get("template_path"):
+            for index, locator in enumerate(provider.get("locators", []), 1):
+                if not isinstance(locator, dict) or locator.get("type") != "region_template" or locator.get("template_path"):
                     continue
-                bbox = resolver.get("template_bbox")
-                if not (isinstance(bbox, list) and len(bbox) == 4):
+                bbox = locator.get("template_bbox")
+                if not isinstance(bbox, list):
                     continue
-                path = state_dir / f"action_template_{strategy['strategy_id']}_{step_idx}.png"
-                vision.save_template_from_rect(frame_rgb, [int(v) for v in bbox], path)
-                resolver["template_path"] = str(path)
-        controller = policy.get("controller") if isinstance(policy.get("controller"), dict) else {}
-        for provider in controller.get("providers", []):
-            if not isinstance(provider, dict) or str(provider.get("provider_id")) not in strategy_ids:
-                continue
-            resolver = provider.get("resolver") if isinstance(provider.get("resolver"), dict) else None
-            if not isinstance(resolver, dict) or resolver.get("type") != "region_template" or resolver.get("template_path"):
-                continue
-            bbox = resolver.get("template_bbox")
-            if not (isinstance(bbox, list) and len(bbox) == 4):
-                continue
-            path = state_dir / f"action_template_provider_{provider['provider_id']}.png"
-            vision.save_template_from_rect(frame_rgb, [int(v) for v in bbox], path)
-            resolver["template_path"] = str(path)
-            continue
-        for provider in controller.get("providers", []):
-            if not isinstance(provider, dict) or str(provider.get("provider_id")) not in strategy_ids:
-                continue
-            for profile_idx, profile in enumerate(provider.get("profiles", []), start=1):
-                if not isinstance(profile, dict) or profile.get("kind") != "template_offset" or profile.get("template_path"):
-                    continue
-                bbox = profile.get("template_bbox")
-                if not (isinstance(bbox, list) and len(bbox) == 4):
-                    continue
-                path = state_dir / f"action_template_provider_{provider['provider_id']}_profile_{profile_idx}.png"
-                vision.save_template_from_rect(frame_rgb, [int(v) for v in bbox], path)
-                profile["template_path"] = str(path)
+                path = state_dir / f"reactive_locator_{provider['provider_id']}_{index}.png"
+                vision.save_template_from_rect(frame_rgb, bbox, path)
+                locator["template_path"] = str(path)
+            for collection in ("hints", "deferred_hints"):
+                for index, hint in enumerate(provider.get(collection, []), 1):
+                    if not isinstance(hint, dict) or hint.get("type") != "template" or hint.get("template_path"):
+                        continue
+                    bbox = hint.get("template_bbox")
+                    if not isinstance(bbox, list) or collection == "deferred_hints":
+                        continue
+                    path = state_dir / f"reactive_hint_{provider['provider_id']}_{index}.png"
+                    vision.save_template_from_rect(frame_rgb, bbox, path)
+                    hint["template_path"] = str(path)
 
 
 def append_episode(handler: dict[str, Any], episode: dict[str, Any]) -> None:
@@ -408,51 +247,57 @@ def append_episode(handler: dict[str, Any], episode: dict[str, Any]) -> None:
     handler["updated_at"] = _now_iso()
 
 
-def mark_strategy_result(handler: dict[str, Any], operation: str, strategy_id: str, result: str) -> None:
-    if result not in STRATEGY_RESULTS:
-        raise ValueError(f"unsupported strategy result: {result}")
-    policies = handler.get("operation_policies") if isinstance(handler.get("operation_policies"), dict) else {}
-    policy = policies.get(operation)
-    if not isinstance(policy, dict):
+def record_provider_result(operation: dict[str, Any], provider_id: str, result: str, *, visit_id: str) -> None:
+    provider = next((item for item in operation.get("providers", []) if isinstance(item, dict) and str(item.get("provider_id")) == provider_id), None)
+    if not isinstance(provider, dict):
         return
-    strategy = next((item for item in policy.get("strategies", []) if isinstance(item, dict) and str(item.get("strategy_id")) == strategy_id), None)
-    if not isinstance(strategy, dict):
-        return
-    counts = strategy.get("result_counts") if isinstance(strategy.get("result_counts"), dict) else {}
-    strategy["result_counts"] = counts
+    counts = provider.get("result_counts") if isinstance(provider.get("result_counts"), dict) else {}
+    provider["result_counts"] = counts
     counts[result] = int(counts.get(result, 0) or 0) + 1
-    if result in {"verified_success", "verified_reentry"}:
-        strategy["success_count"] = int(strategy.get("success_count", 0) or 0) + 1
-        strategy["status"] = "active"
-    elif result == "partial_progress":
-        # An intermediate step is not evidence that the complete strategy
-        # works.  In particular, do not promote a multi-step strategy whose
-        # confirm/exit step has never succeeded.
-        pass
-    elif result == "progress_unknown":
-        # A bounded continuation lease permits this action even when the local
-        # observer cannot prove page-local progress. It is neither success
-        # evidence nor a reason to degrade the strategy.
-        pass
-    elif result in {"no_effect", "wrong_transition", "unsafe_effect"}:
-        strategy["fail_count"] = int(strategy.get("fail_count", 0) or 0) + 1
-        strategy["status"] = "quarantined" if result == "unsafe_effect" else "degraded"
-    strategy["updated_at"] = _now_iso()
+    if result in {"confirmed", "transitioned"}:
+        visits = provider.get("successful_visits") if isinstance(provider.get("successful_visits"), list) else []
+        provider["successful_visits"] = visits
+        if visit_id not in visits:
+            visits.append(visit_id)
+            del visits[:-8]
+        provider["success_count"] = int(provider.get("success_count", 0) or 0) + 1
+        if str(provider.get("scope")) == "family":
+            provider["status"] = "active" if len(visits) >= 2 else "canary"
+        else:
+            provider["status"] = "active"
+    provider["updated_at"] = _now_iso()
 
 
-def promote_operation_to_default(handler: dict[str, Any], operation: str) -> bool:
-    policies = handler.get("operation_policies") if isinstance(handler.get("operation_policies"), dict) else {}
-    policy = policies.get(operation)
-    if not isinstance(policy, dict):
-        return False
-    if str(policy.get("intent_scope")) != "intent_invariant" or str(policy.get("safety")) not in {"low_risk", "reversible"}:
-        return False
-    handler["default_operation"] = {
-        "operation": operation,
-        "intent_scope": "intent_invariant",
-        "intent_effect": str(policy.get("intent_effect", "none")),
-        "safety": str(policy.get("safety")),
-        "expected_event": policy.get("expected_event"),
+def handler_summary(handler: dict[str, Any], *, limit_trace: int = 8) -> dict[str, Any]:
+    policies: dict[str, Any] = {}
+    for name, policy in handler.get("operation_policies", {}).items():
+        if not isinstance(policy, dict):
+            continue
+        policies[str(name)] = {
+            "intent_scope": policy.get("intent_scope"),
+            "intent_effect": policy.get("intent_effect"),
+            "budgets": policy.get("budgets"),
+            "providers": [
+                {
+                    "provider_id": item.get("provider_id"),
+                    "scope": item.get("scope"),
+                    "status": item.get("status"),
+                    "base_priority": item.get("base_priority"),
+                    "locators": item.get("locators", []),
+                    "hints": item.get("hints", []),
+                    "deferred_hints": item.get("deferred_hints", []),
+                    "effect_hints": item.get("effect_hints", []),
+                    "successors": item.get("successors", []),
+                    "result_counts": item.get("result_counts", {}),
+                }
+                for item in policy.get("providers", []) if isinstance(item, dict)
+            ],
+        }
+    trace = handler.get("episode_trace") if isinstance(handler.get("episode_trace"), list) else []
+    return {
+        "schema_version": handler.get("schema_version"),
+        "default_operation": handler.get("default_operation"),
+        "intent_routes": handler.get("intent_routes", []),
+        "operation_policies": policies,
+        "recent_trace": trace[-limit_trace:],
     }
-    handler["updated_at"] = _now_iso()
-    return True

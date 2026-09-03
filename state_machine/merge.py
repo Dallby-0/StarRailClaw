@@ -16,8 +16,7 @@ from state_machine.llm_tasks import _request_llm_condition_revision
 from state_machine.logger import FsmRunLogger
 from state_machine.matching import _condition_passed, _level, _select_enabled_conditions
 from state_machine.page_identity import IDENTITY_ROLES, build_match_clauses
-from state_machine.page_handler.reactive import merge_controller
-from state_machine.page_handler.store import apply_handler_patch, ensure_page_handler, handler_from_bootstrap, materialize_strategy_templates
+from state_machine.page_handler.store import ensure_page_handler, handler_from_bootstrap, materialize_provider_templates, merge_bootstrap_operations, merge_operation
 from state_machine.state_store import (
     _latest_screenshot_path,
     _latest_state_for_page_type,
@@ -138,7 +137,8 @@ def _try_merge_ambiguous_states(
         if isinstance(target_policy, dict):
             for loser_policy in loser_policies.values():
                 if isinstance(loser_policy, dict):
-                    target_policy["controller"] = merge_controller(target_policy.get("controller"), loser_policy.get("controller"))
+                    target_policy, _ = merge_operation(target_policy, loser_policy)
+                    winner_policies[target_name] = target_policy
         winner_samples = winner_meta.setdefault("samples", [])
         known_paths = {str(item.get("path")) for item in winner_samples if isinstance(item, dict)} if isinstance(winner_samples, list) else set()
         if isinstance(winner_samples, list):
@@ -362,7 +362,7 @@ def _try_merge_page_type(
     latest_meta["match_conditions"] = revised
     handler = ensure_page_handler(latest_meta)
     bootstrap_raw = llm_payload.get("bootstrap_operations", [])
-    touched = apply_handler_patch(handler, {"operations": bootstrap_raw})
+    touched = merge_bootstrap_operations(handler, bootstrap_raw)
     bootstrap = handler_from_bootstrap(bootstrap_raw)
     if handler.get("default_operation") is None and bootstrap.get("default_operation") is not None:
         handler["default_operation"] = bootstrap["default_operation"]
@@ -370,7 +370,7 @@ def _try_merge_page_type(
     for route in bootstrap.get("intent_routes", []):
         if isinstance(route, dict) and str(route) not in known_routes:
             handler["intent_routes"].append(route)
-    materialize_strategy_templates(handler, latest_dir, frame_rgb, vision, touched)
+    materialize_provider_templates(handler, latest_dir, frame_rgb, vision, touched)
     latest_meta["updated_at"] = _now_iso()
     latest_meta["page_type"] = page_type
     latest_meta.setdefault("model_info", {})

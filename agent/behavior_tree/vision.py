@@ -159,6 +159,22 @@ class VisionEngine:
             self.ocr_success_count += 1
         return out
 
+    def detect_text_lines(self, frame_rgb: np.ndarray, rect: list[int] | None) -> dict[str, Any]:
+        """Detect visual text rows in a bounded region without recognition."""
+        real_rect = self._real_area(frame_rgb, rect)
+        started = time.perf_counter()
+        try:
+            lines = sr_ocr.detect_text_lines(frame_rgb, real_rect)
+        except Exception as exc:  # noqa: BLE001 - an optional detector is a soft visual signal
+            self.log_fn(f"[vision][text-detection] error type={type(exc).__name__} message={exc} logical_rect={rect}")
+            return {"available": False, "line_count": 0, "lines": [], "elapsed_s": time.perf_counter() - started}
+        return {
+            "available": True,
+            "line_count": sr_ocr.count_text_rows(lines),
+            "lines": lines,
+            "elapsed_s": time.perf_counter() - started,
+        }
+
     def reset_ocr_stats(self) -> None:
         self.ocr_call_count = 0
         self.ocr_success_count = 0

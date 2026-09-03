@@ -108,17 +108,16 @@ def test_new_bootstrap_persists_only_reactive_controller() -> None:
         "is_default": True,
         "intent_scope": "intent_specific",
         "intent_effect": "advance",
-        "safety": "low_risk",
         "expected_event": "event_advanced",
         "intent_routes": [],
-        "steps": [{
-            "step_id": "advance",
-            "resolver": {"type": "fixed_point", "x": 500, "y": 800},
-            "expected_after": {"state_relation": "may_leave", "reentry_policy": "same_visit"},
+        "providers": [{
+            "provider_id": "advance",
+            "locators": [{"type": "point", "x": 500, "y": 800, "coordinate_space": "logical", "source": "bootstrap"}],
             "emits_on_success": {"type": "event_advanced"},
             "brief": "推进事件",
         }],
     }])
     policy = handler["operation_policies"]["advance_event"]
-    assert policy["controller"]["type"] == "reactive_local"
-    assert policy["strategies"] == []
+    assert policy["providers"][0]["provider_id"] == "advance"
+    assert "controller" not in policy
+    assert "strategies" not in policy

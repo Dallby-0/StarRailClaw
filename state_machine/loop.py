@@ -30,9 +30,8 @@ from state_machine.logger import FsmRunLogger, summarize_match
 from state_machine.matching import _eval_state_match, _select_best_for_unknown
 from state_machine.family_merge import try_merge_same_surface
 from state_machine.page_identity import temporal_continuation_evidence
-from state_machine.progress_guard import reset_run_local_progress
+from state_machine.page_handler.reactive import reset_run_local_progress
 from state_machine.screen import _wait_for_unknown_screen_stable
-from state_machine.settlement import settle_pending_operation
 from state_machine.session_runtime import _maybe_rotate_session, _refresh_session_if_needed
 from state_machine.state_builder import _create_state_from_llm
 from state_machine.state_store import (
@@ -196,8 +195,7 @@ def run_agent_loop_fsm(
             live_metas = _iter_state_meta()
             matches = [_eval_state_match(meta, sdir, vision, img) for sdir, meta in live_metas]
             if not any(match.success for match in matches):
-                pending = runtime.get("pending_operation") if isinstance(runtime.get("pending_operation"), dict) else {}
-                temporal_state_id = str(pending.get("state_id") or runtime.get("pending_from_state_id") or "")
+                temporal_state_id = str(runtime.get("pending_from_state_id") or "")
                 temporal_item = _meta_for_state(live_metas, temporal_state_id) if temporal_state_id else None
                 temporal_match = next((match for match in matches if match.state_id == temporal_state_id), None)
                 if temporal_item is not None and temporal_match is not None:
@@ -359,13 +357,12 @@ def run_agent_loop_fsm(
             pending_from = runtime.get("pending_from_state_id")
             pending_action = runtime.get("pending_action_id")
             if isinstance(pending_from, str) and pending_from and isinstance(pending_action, str) and pending_action:
-                settlement = settle_pending_operation(runtime, new_state_id)
-                allow_edge = pending_from != new_state_id or bool(settlement and settlement.get("allow_self_edge"))
+                allow_edge = pending_from != new_state_id
                 if allow_edge:
                     transition_kind = "reentry" if pending_from == new_state_id else "normal"
                     _append_graph_edge(pending_from, pending_action, new_state_id, logger=logger, reason="pending-unknown-resolution", confidence="llm_verified", transition_kind=transition_kind)
                 else:
-                    logger.text(f"[fsm][edge][skipped-self] state={new_state_id} settlement={settlement}", "edge_self_skipped", state_id=new_state_id, settlement=settlement)
+                    logger.text(f"[fsm][edge][skipped-self] state={new_state_id}", "edge_self_skipped", state_id=new_state_id)
                 runtime["pending_from_state_id"] = None
                 runtime["pending_action_id"] = None
             runtime["force_state_resolution"] = False
@@ -401,8 +398,7 @@ def run_agent_loop_fsm(
         pending_from2 = runtime.get("pending_from_state_id")
         pending_action2 = runtime.get("pending_action_id")
         if isinstance(pending_from2, str) and pending_from2 and isinstance(pending_action2, str) and pending_action2:
-            settlement = settle_pending_operation(runtime, best.state_id)
-            allow_edge = pending_from2 != best.state_id or bool(settlement and settlement.get("allow_self_edge"))
+            allow_edge = pending_from2 != best.state_id
             if allow_edge:
                 transition_kind = "reentry" if pending_from2 == best.state_id else "normal"
                 _append_graph_edge(pending_from2, pending_action2, best.state_id, logger=logger, reason="pending-unknown-resolved-to-existing", confidence=pending_resolution_confidence, transition_kind=transition_kind)
@@ -410,7 +406,7 @@ def run_agent_loop_fsm(
                 if best_meta_item is not None:
                     _add_state_sample(best_meta_item[0], best_meta_item[1], frame, role="positive", source="pending_existing", confidence=0.8, logger=logger)
             else:
-                logger.text(f"[fsm][edge][skipped-self] state={best.state_id} settlement={settlement}", "edge_self_skipped", state_id=best.state_id, settlement=settlement)
+                logger.text(f"[fsm][edge][skipped-self] state={best.state_id}", "edge_self_skipped", state_id=best.state_id)
             runtime["pending_from_state_id"] = None
             runtime["pending_action_id"] = None
         if force_state_resolution:
