@@ -77,6 +77,7 @@ LLM_FSM_PROMPT_BASE = """你是视觉驱动游戏自动化的状态标注器和�
     - 页面标题、固定图标、固定按钮、固定交互控件通常更稳定。
 - slug: 英文小写+下划线，简短可读。
 - possible_page_type: 如果当前页面可能属于已知页面类型，输出该类型英文名；否则输出 "none"。不要把具体实例名称当作页面类型。
+- scene_mode: 必须判断为 ui_2d、scene_3d 或 unknown。scene_3d 表示当前主要是可自由移动/寻找交互物体的 3D 场景；仅有 3D 背景但当前有明确稳定 UI 控件时仍可使用 ui_2d。
 - page_family: 英文小写+下划线，表示可共享同类操作经验的稳定页面族；不知道时使用与 slug 相同的值。
 - surface_relation: 若提供了 previous_surface，上下两图仍是同一稳定交互表面、只是页内步骤不同，必须输出 same_surface_step；同族但应独立处理的阻塞层/结果层输出 same_family_new_surface；否则输出 different_surface；没有前图时输出 uncertain。
 - common_identity: 仅列出前后步骤共同保留的稳定身份元素，禁止填写具体事件名、选项或仅当前步骤存在的按钮。
@@ -96,6 +97,7 @@ LLM_FSM_PROMPT_BASE = """你是视觉驱动游戏自动化的状态标注器和�
   - 只有明显需要已注册预置动作时才使用 run_preset locator。
   - 若 active_intent 存在，intent_routes 应说明哪些 intent kind/phase 映射到这个 operation。
   - run_preset.name 只能引用 runtime 已注册的预置动作名称，不要自行创造领域规则。
+  - scene_mode=scene_3d 时，bootstrap operation 必须提供 run_preset locator，name 必须为 find_and_interact_with_next_object；不要输出固定坐标、模板或 OCR 点击来操作场景物体。scene_mode=ui_2d 使用 reactive providers；unknown 时保持谨慎，不要假设 3D 物体可点击。
 
 字段、枚举、必填项和嵌套结构由 Responses API 的 JSON Schema 提供，不要输出 schema 之外的字段。
 """

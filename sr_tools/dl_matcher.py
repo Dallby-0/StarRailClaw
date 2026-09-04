@@ -181,7 +181,7 @@ def _main() -> int:
     args = parser.parse_args()
 
     image_path = Path(args.image)
-    if not image_path.exists():
+    if not image_path.is_file():
         raise FileNotFoundError(f"Image not found: {image_path}")
     image_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if image_bgr is None:
@@ -191,7 +191,7 @@ def _main() -> int:
     matcher = YoloEMatcher(model_path=args.model, conf=args.conf, iou=args.iou, device=args.device)
     if args.refer_image and args.refer_bbox:
         refer_path = Path(args.refer_image)
-        if not refer_path.exists():
+        if not refer_path.is_file():
             raise FileNotFoundError(f"Reference image not found: {refer_path}")
         refer_bgr = cv2.imread(str(refer_path), cv2.IMREAD_COLOR)
         if refer_bgr is None:

@@ -133,6 +133,7 @@ def _create_state_from_llm(
         "state_id": state_id,
         "slug": _slugify(str(llm_payload.get("slug", "state"))),
         "page_type": _normalize_page_type(llm_payload.get("possible_page_type") or llm_payload.get("page_type")),
+        "scene_mode": str(llm_payload.get("scene_mode") or "unknown"),
         "page_family": _slugify(str(llm_payload.get("page_family") or _normalize_page_type(llm_payload.get("possible_page_type")) or llm_payload.get("slug") or "generic_page")),
         "display_name": str(llm_payload.get("slug", "state")),
         "description": str(llm_payload.get("page_summary", "")),

@@ -43,6 +43,7 @@ def _page_type_summaries(metas: list[tuple[Path, dict[str, Any]]], limit: int = 
             {
                 "page_type": ptype,
                 "page_family": str(meta.get("page_family") or ptype),
+                "scene_mode": str(meta.get("scene_mode") or "unknown"),
                 "example_slug": str(meta.get("slug", "")),
                 "description": str(meta.get("description", ""))[:160],
                 "sample_count": 0,

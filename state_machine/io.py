@@ -124,7 +124,7 @@ def _ensure_fsm_resources() -> None:
         FSM_SCHEMA_PATH,
         {
             "schema_version": SCHEMA_VERSION,
-            "required_fields": ["page_summary", "slug", "possible_page_type", "page_family", "surface_relation", "common_identity", "elements", "bootstrap_operations"],
+            "required_fields": ["page_summary", "slug", "possible_page_type", "scene_mode", "page_family", "surface_relation", "common_identity", "elements", "bootstrap_operations"],
             "element_types": ["text_line", "pattern"],
             "element_roles": ["identity", "identity_support", "interaction", "instance", "diagnostic"],
             "element_levels": ["high", "mid", "low"],
@@ -163,6 +163,8 @@ def _save_frame(path: Path, frame_rgb) -> None:
 
 
 def _load_frame(path: Path):
+    if not path.is_file():
+        return None
     img = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if img is None:
         return None

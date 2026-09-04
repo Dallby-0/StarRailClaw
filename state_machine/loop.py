@@ -300,6 +300,7 @@ def run_agent_loop_fsm(
                     "slug": predecessor_item[1].get("slug"),
                     "page_type": predecessor_item[1].get("page_type"),
                     "page_family": predecessor_item[1].get("page_family"),
+                    "scene_mode": predecessor_item[1].get("scene_mode", "unknown"),
                     "description": predecessor_item[1].get("description"),
                     "operations": list(
                         (predecessor_item[1].get("page_handler") or {}).get("operation_policies", {}).keys()

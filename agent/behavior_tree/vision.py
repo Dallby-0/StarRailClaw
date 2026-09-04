@@ -48,7 +48,11 @@ class VisionEngine:
         rect: list[int] | None,
         threshold: float = 0.8,
     ) -> tuple[bool, tuple[int, int] | None, float]:
-        if not template_path.exists():
+        # ``Path("")`` resolves to the current directory.  Passing that
+        # directory to OpenCV produces a noisy ``imread('.')`` warning and
+        # can hide the actual locator failure, so only regular files are
+        # valid templates.
+        if not template_path.is_file():
             return False, None, 0.0
         crop = self.crop_rect(frame_rgb, rect)
         tpl_bgr = cv2.imread(str(template_path), cv2.IMREAD_COLOR)

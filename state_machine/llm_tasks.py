@@ -112,6 +112,7 @@ def _request_llm_payload(
         "previous_surface": previous_surface or {},
         "instruction": (
             "请按 system 约定输出 JSON。先照常输出用于建立新状态的页面元素信息；"
+            "必须先判断 scene_mode：ui_2d、scene_3d 或 unknown。scene_3d 时仅规划 find_and_interact_with_next_object 预置；"
             "possible_page_type 必须从 known_page_types.page_type 中选择，若都不像则输出 none。"
             "同时给出最多两个 bootstrap operation；每个 operation 直接包含 reactive providers。"
             "operation 表达当前页面的一次完整推进；当前画面中明显的短动作链可以在一次调用中给出，"

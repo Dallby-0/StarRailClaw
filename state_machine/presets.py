@@ -36,9 +36,9 @@ def _still_in_state(*, emulator, state_id: str, matches_provider, find_match_by_
 
 def _run_wait_till_combat_end(emulator, vision) -> bool:
     template_path = WAIT_TILL_COMBAT_END_TEMPLATE_PATH
-    if not template_path.exists() and WAIT_TILL_COMBAT_END_LEGACY_TEMPLATE_PATH.exists():
+    if not template_path.is_file() and WAIT_TILL_COMBAT_END_LEGACY_TEMPLATE_PATH.is_file():
         template_path = WAIT_TILL_COMBAT_END_LEGACY_TEMPLATE_PATH
-    if not template_path.exists():
+    if not template_path.is_file():
         print(f"[preset] missing template: {template_path}")
         return False
 

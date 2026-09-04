@@ -155,6 +155,7 @@ def state_bootstrap_json_schema() -> dict[str, Any]:
         "page_summary": {"type": "string"},
         "slug": {"type": "string", "pattern": "^[a-z0-9]+(?:_[a-z0-9]+)*$"},
         "possible_page_type": {"type": "string"},
+        "scene_mode": {"type": "string", "enum": ["ui_2d", "scene_3d", "unknown"]},
         "page_family": {"type": "string", "pattern": "^[a-z0-9]+(?:_[a-z0-9]+)*$"},
         "surface_relation": {"type": "string", "enum": ["same_surface_step", "same_family_new_surface", "different_surface", "uncertain"]},
         "common_identity": {"type": "array", "items": {"type": "string"}, "maxItems": 6},
@@ -266,6 +267,9 @@ def parse_state_payload(text: str) -> dict[str, Any] | None:
     payload = _load_json_lenient(text)
     if payload is None:
         return None
+    # Keep persisted/fixture payloads from before scene routing readable while
+    # requiring new model responses to state the scene mode explicitly.
+    payload.setdefault("scene_mode", "unknown")
     error = _schema_error(payload, state_bootstrap_json_schema())
     if error is not None:
         print(f"[fsm][llm][json_schema][invalid] {error}")

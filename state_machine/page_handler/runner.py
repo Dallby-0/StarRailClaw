@@ -43,7 +43,8 @@ from state_machine.page_handler.store import (
 )
 from state_machine.screen import _screen_changed, _wait_for_screen_stable
 from state_machine.transition_policy import _defer_unknown_transition, _resolve_transition_after_progress
-from state_machine.visit import ensure_page_visit
+from state_machine.visit import ensure_page_visit, start_new_visit
+from state_machine.page_handler.reactive import clear_visit
 
 
 def _log(logger: FsmRunLogger | None, message: str, event: str = "console", **fields: Any) -> None:
@@ -102,13 +103,97 @@ def _provider_hint_results(
     return results, details
 
 
+def _scene_operation(operation: dict[str, Any] | None, scene_mode: str) -> dict[str, Any] | None:
+    """Apply the runtime's hard routing rule for free-camera 3D scenes."""
+    if not isinstance(operation, dict):
+        return None
+    if scene_mode != "scene_3d":
+        return operation
+    providers: list[dict[str, Any]] = []
+    for provider in operation.get("providers", []):
+        if not isinstance(provider, dict):
+            continue
+        preset_locators = [
+            locator for locator in provider.get("locators", [])
+            if isinstance(locator, dict)
+            and locator.get("type") == "run_preset"
+            and locator.get("name") == "find_and_interact_with_next_object"
+        ]
+        if preset_locators:
+            providers.append({**provider, "locators": preset_locators})
+    if not providers:
+        return None
+    return {**operation, "providers": providers}
+
+
+def _text_fingerprint(match: Any) -> tuple[str, ...]:
+    """Return only recognized text from state match conditions.
+
+    Empty/unknown OCR is deliberately represented by an empty tuple; it must
+    never be mistaken for evidence that a self-loop advanced.
+    """
+    details = getattr(match, "condition_results", None)
+    if not isinstance(details, list):
+        return ()
+    values: list[str] = []
+    for detail in details:
+        if not isinstance(detail, dict) or detail.get("kind") != "text_line_contains":
+            continue
+        lines = detail.get("ocr_lines")
+        if isinstance(lines, list):
+            values.extend(str(line).strip() for line in lines if str(line).strip())
+    return tuple(values)
+
+
+def _effect_has_observable_change(effect_details: list[dict[str, Any]]) -> bool:
+    for detail in effect_details:
+        if not isinstance(detail, dict) or detail.get("matched") is not True:
+            continue
+        # ``expected=pass`` is a level assertion, not evidence of progress;
+        # transitions such as becomes_pass/becomes_fail are.
+        if str(detail.get("expected") or "pass") != "pass":
+            return True
+        if detail.get("before") != detail.get("after"):
+            return True
+    return False
+
+
+def _element_text_fingerprint(state_meta: dict[str, Any], frame: Any, vision: VisionEngine) -> tuple[str, ...]:
+    """Read a few model-labeled text regions for same-state instance changes.
+
+    This is intentionally a fallback: normal matching already provides OCR
+    for identity conditions.  It runs only when a terminal provider has no
+    other progress evidence, and remains bounded to small regions rather than
+    triggering a full-screen OCR pass.
+    """
+    ocr = getattr(vision, "ocr", None)
+    if not callable(ocr):
+        return ()
+    values: list[str] = []
+    elements = state_meta.get("elements") if isinstance(state_meta.get("elements"), list) else []
+    for element in elements:
+        if not isinstance(element, dict) or element.get("type") != "text_line":
+            continue
+        rect = element.get("bbox")
+        if not (isinstance(rect, list) and len(rect) == 4):
+            continue
+        try:
+            entries = ocr(frame, rect, white_text=False)
+        except Exception:
+            continue
+        values.extend(str(item.get("text") or "").strip() for item in entries if isinstance(item, dict) and str(item.get("text") or "").strip())
+        if len(values) >= 4:
+            break
+    return tuple(values)
+
+
 def _sample_frames(state_meta: dict[str, Any], current) -> list[Any]:
     frames = [current]
     for sample in state_meta.get("samples", []):
         if not isinstance(sample, dict):
             continue
         path = Path(str(sample.get("path") or ""))
-        frame = _load_frame(path) if path.exists() else None
+        frame = _load_frame(path) if path.is_file() else None
         if frame is not None:
             frames.append(frame)
             break
@@ -235,13 +320,23 @@ def run_page_handler(
     state_path = state_dir / "state.json"
     state_meta = _load_json(state_path)
     handler = ensure_page_handler(state_meta)
+    scene_mode = str(state_meta.get("scene_mode") or "unknown")
     intent = active_intent(runtime)
     command = resolve_effective_command(state_meta, intent) or _fallback_command(intent)
     visit_id = str(ensure_page_visit(runtime, state_id)["visit_id"])
     cursor = cursor_for(runtime, visit_id, command.operation, now_monotonic=time.monotonic())
     if float(cursor.get("started_monotonic", 0.0) or 0.0) <= 0:
         cursor["started_monotonic"] = time.monotonic()
-    operation = handler.get("operation_policies", {}).get(command.operation)
+    operation = _scene_operation(handler.get("operation_policies", {}).get(command.operation), scene_mode)
+    if scene_mode == "scene_3d" and operation is None:
+        _log(
+            logger,
+            "[fsm][handler] scene_3d requires find_and_interact_with_next_object preset",
+            "page_handler_scene_route_missing",
+            state_id=state_id,
+            operation=command.operation,
+        )
+        return False, current
     budgets = normalize_budgets(operation.get("budgets") if isinstance(operation, dict) else None)
     failures: list[dict[str, Any]] = []
     history: list[dict[str, Any]] = []
@@ -275,6 +370,9 @@ def run_page_handler(
             ranked = rank_providers(operation, cursor, hint_results)
         needs_repair = not ranked or int(cursor.get("actions_since_repair", 0) or 0) >= budgets["soft_actions"]
         if needs_repair:
+            if scene_mode == "scene_3d" and operation is None:
+                _log(logger, "[fsm][handler] no valid 3D preset after repair", "page_handler_scene_route_missing", state_id=state_id, operation=command.operation)
+                return False, current
             if int(cursor.get("repair_count", 0) or 0) >= budgets["max_repairs"]:
                 _log(logger, "[fsm][handler] repair budget exhausted", "page_handler_no_strategy", state_id=state_id, visit_id=visit_id, operation=command.operation, failed_attempts=failures[-12:])
                 return False, current
@@ -304,11 +402,15 @@ def run_page_handler(
                 failures.append({"result": "repair_failed", "reason": repair_result})
                 if repair_result in {"give_up", "duplicate_patch", "no_valid_provider"}:
                     return False, current
+            operation = _scene_operation(operation, scene_mode)
             budgets = normalize_budgets(operation.get("budgets") if isinstance(operation, dict) else None)
             continue
 
         provider = ranked[0]
         provider_id = str(provider.get("provider_id") or "")
+        before_matches = matches_provider(current)
+        before_match = next((item for item in before_matches if item.state_id == state_id), None)
+        before_text_fp = _text_fingerprint(before_match)
         baseline = capture_effect_baseline(provider, current, vision)
         action, action_info = resolve_provider(provider, current, vision)
         if action is None:
@@ -347,13 +449,37 @@ def run_page_handler(
         matches = matches_provider(post)
         current_match = next((item for item in matches if item.state_id == state_id), None)
         still_current = bool(current_match and current_match.success)
+        after_text_fp = _text_fingerprint(current_match)
+        text_progress = bool(before_text_fp and after_text_fp and before_text_fp != after_text_fp)
+        # Identity conditions intentionally omit volatile instance labels. If
+        # the action otherwise looks unverified and leaves us on the same
+        # state, use bounded local OCR as a final self-reentry signal.
+        if (
+            still_current
+            and not provider.get("successors")
+            and not text_progress
+            and (effect_result == "unverified" or not _effect_has_observable_change(effect_details))
+        ):
+            before_instance_fp = _element_text_fingerprint(state_meta, current, vision)
+            after_instance_fp = _element_text_fingerprint(state_meta, post, vision)
+            if before_instance_fp and after_instance_fp and before_instance_fp != after_instance_fp:
+                before_text_fp = before_instance_fp
+                after_text_fp = after_instance_fp
+                text_progress = True
         known_other = next((item for item in matches if item.success and item.state_id != state_id), None)
         result = "transitioned" if known_other is not None else effect_result
+        if result == "unverified" and still_current and text_progress:
+            # OCR provides the local evidence needed to distinguish a fresh
+            # same-state instance from an ineffective click.
+            result = "confirmed"
         update_successor_context(cursor, provider, result)
         record_provider_result(operation, provider_id, result, visit_id=visit_id)
         promoted_hints: list[str] = []
         if result in {"confirmed", "transitioned"}:
+            had_repair = int(cursor.get("repair_count", 0) or 0) > 0
             mark_confirmed_effect(cursor)
+            if had_repair:
+                runtime["reactive_total_repairs"] = max(0, int(runtime.get("reactive_total_repairs", 0) or 0) - 1)
             promoted_hints = promote_materialized_hints(provider, cursor)
             event = provider.get("emits_on_success") if isinstance(provider.get("emits_on_success"), dict) else None
             if not event and not provider.get("successors") and command.expected_event:
@@ -371,6 +497,9 @@ def run_page_handler(
             "still_current": still_current,
             "materialized_hints": materialized,
             "promoted_hints": promoted_hints,
+            "text_fingerprint_before": before_text_fp,
+            "text_fingerprint_after": after_text_fp,
+            "text_progress": text_progress,
         }
         append_episode(handler, episode)
         history.append(_history_item(post, f"after_{len(history)}", kind="post_action", provider_id=provider_id, result=result, changed=changed, diff_score=diff_score))
@@ -393,6 +522,17 @@ def run_page_handler(
             runtime["pending_action_id"] = action_id
             return _defer_unknown_transition(runtime=runtime, state_id=state_id, action_id=action_id, logger=logger, frame=post, reason="reactive-v2-unmatched-stable-frame")
         if result == "confirmed" and not provider.get("successors"):
+            # A confirmed observable effect with the same matcher is a fresh
+            # instance (e.g. repeated cards/dialogs), not a reason to reuse
+            # exhausted once-per-visit providers.
+            effect_progress = _effect_has_observable_change(effect_details)
+            if text_progress or effect_progress:
+                clear_visit(runtime, visit_id)
+                new_visit = start_new_visit(runtime, state_id, reason="confirmed_self_reentry")
+                runtime["last_state_id"] = state_id
+                runtime["last_transition_ok"] = True
+                _save_runtime(runtime)
+                _log(logger, f"[fsm][handler] confirmed self-reentry old_visit={visit_id} new_visit={new_visit['visit_id']}", "page_handler_self_reentry", state_id=state_id, old_visit_id=visit_id, new_visit_id=new_visit["visit_id"], text_progress=text_progress, effect_progress=effect_progress)
             return True, post
         if result == "contradicted":
             failures.append({"provider_id": provider_id, "result": result, "effect_details": effect_details})

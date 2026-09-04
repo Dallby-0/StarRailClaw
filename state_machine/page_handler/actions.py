@@ -42,7 +42,7 @@ def evaluate_hint(
     try:
         if kind == "template":
             path = Path(str(hint.get("template_path") or ""))
-            if not path.exists():
+            if not path.is_file():
                 result = {"result": "unknown", "reason": "template_not_materialized"}
             else:
                 ok, point, similarity = vision.match_template(
@@ -119,6 +119,9 @@ def resolve_provider(provider: dict[str, Any], frame_rgb, vision: VisionEngine) 
             }, {"locator_index": index, "locator_type": kind}
         if kind == "region_template":
             path = Path(str(locator.get("template_path") or ""))
+            if not path.is_file():
+                failures.append({"locator_index": index, "locator_type": kind, "reason": "template_not_materialized"})
+                continue
             ok, point, similarity = vision.match_template(
                 frame_rgb,
                 path,

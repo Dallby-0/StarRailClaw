@@ -45,6 +45,7 @@ def test_state_bootstrap_schema_is_closed_and_bounded() -> None:
     assert schema["additionalProperties"] is False
     assert set(schema["required"]) == set(schema["properties"])
     assert schema["properties"]["bootstrap_operations"]["maxItems"] == 2
+    assert schema["properties"]["scene_mode"]["enum"] == ["ui_2d", "scene_3d", "unknown"]
 
     element_variants = schema["properties"]["elements"]["items"]["anyOf"]
     for variant in element_variants:

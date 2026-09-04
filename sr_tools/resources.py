@@ -113,6 +113,8 @@ class ResourceCatalog:
         if template_id in self._cache:
             return self._cache[template_id]
         path = self.templates_dir / spec.file
+        if not path.is_file():
+            raise FileNotFoundError(f"Template file not found: {path}")
         image = cv2.imread(str(path), cv2.IMREAD_COLOR)
         if image is None:
             raise FileNotFoundError(f"Template file not found: {path}")

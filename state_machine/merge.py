@@ -373,6 +373,7 @@ def _try_merge_page_type(
     materialize_provider_templates(handler, latest_dir, frame_rgb, vision, touched)
     latest_meta["updated_at"] = _now_iso()
     latest_meta["page_type"] = page_type
+    latest_meta["scene_mode"] = str(llm_payload.get("scene_mode") or latest_meta.get("scene_mode") or "unknown")
     latest_meta.setdefault("model_info", {})
     if isinstance(latest_meta["model_info"], dict):
         latest_meta["model_info"]["weak_match"] = weak_match

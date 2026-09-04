@@ -337,6 +337,9 @@ def record_attempt(cursor: dict[str, Any], provider: dict[str, Any], *, executed
 def mark_confirmed_effect(cursor: dict[str, Any]) -> None:
     cursor["confirmed_effect_epoch"] = int(cursor.get("confirmed_effect_epoch", 0) or 0) + 1
     cursor["actions_since_repair"] = 0
+    # A productive action makes the visit-local repair attempts stale.  The
+    # global hard limit remains the final runaway guard.
+    cursor["repair_count"] = 0
     cursor["updated_at"] = _now_iso()
 
 
