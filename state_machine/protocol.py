@@ -24,7 +24,6 @@ def state_bootstrap_json_schema() -> dict[str, Any]:
         "minItems": 4,
         "maxItems": 4,
     }
-    empty_object = _closed_object({})
     role = {"type": "string", "enum": ["identity", "identity_support", "interaction", "instance", "diagnostic"]}
 
     text_element = _closed_object({
@@ -137,16 +136,10 @@ def state_bootstrap_json_schema() -> dict[str, Any]:
         "event": {"type": "string"},
         "next_phase": {"type": "string"},
         "status": {"type": "string", "enum": ["running", "completed"]},
-        # Strict structured output cannot safely express arbitrary JSON maps.
-        # The initial visual proposal therefore carries no dynamic fact patch;
-        # deterministic runtime events may enrich facts later.
-        "fact_patch": empty_object,
     })
     intent_proposal = _closed_object({
         "kind": {"type": "string"},
         "phase": {"type": "string"},
-        "params": empty_object,
-        "facts": empty_object,
         "transitions": {"type": "array", "items": transition, "maxItems": 8},
         "completion": _closed_object({"event": {"type": "string"}}),
     })

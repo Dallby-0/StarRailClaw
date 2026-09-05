@@ -102,6 +102,44 @@ def test_sparse_intent_proposal_never_replaces_active_intent() -> None:
     assert active_intent(runtime)["kind"] == "inspect"
 
 
+def test_llm_intent_proposal_omits_runtime_owned_state() -> None:
+    payload = {
+        "page_summary": "generic surface",
+        "slug": "generic_surface",
+        "possible_page_type": "none",
+        "scene_mode": "unknown",
+        "page_family": "generic_surface",
+        "surface_relation": "uncertain",
+        "common_identity": [],
+        "elements": [],
+        "intent_assessment": {"relation": "unknown", "reason": "none"},
+        "intent_proposal": {
+            "kind": "inspect",
+            "phase": "start",
+            "transitions": [{
+                "from_phase": "start",
+                "event": "advanced",
+                "next_phase": "done",
+                "status": "completed",
+            }],
+            "completion": {"event": "completed"},
+        },
+        "bootstrap_operations": [_operation("advance", default=True)],
+    }
+
+    parsed = parse_state_payload(json.dumps(payload))
+    assert parsed is not None
+    runtime: dict = {}
+    intent = adopt_intent_proposal(runtime, parsed["intent_proposal"])
+    assert intent is not None
+    assert intent["params"] == {}
+    assert intent["facts"] == {}
+    assert "fact_patch" not in intent["transitions"][0]
+
+    payload["intent_proposal"]["facts"] = {"guessed": True}
+    assert parse_state_payload(json.dumps(payload)) is None
+
+
 def test_child_intent_resumes_parent() -> None:
     runtime: dict = {}
     parent = create_intent(runtime, kind="parent", phase="start")

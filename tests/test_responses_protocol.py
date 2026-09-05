@@ -67,3 +67,8 @@ def test_state_bootstrap_schema_is_closed_and_bounded() -> None:
     assert point["properties"]["coordinate_space"]["enum"] == ["logical"]
     assert "effect_hints" in provider["properties"]
     assert "deferred_hints" in provider["properties"]
+
+    intent = schema["properties"]["intent_proposal"]["anyOf"][1]
+    assert set(intent["properties"]) == {"kind", "phase", "transitions", "completion"}
+    transition = intent["properties"]["transitions"]["items"]
+    assert set(transition["properties"]) == {"from_phase", "event", "next_phase", "status"}
