@@ -107,7 +107,7 @@ def test_llm_intent_proposal_omits_runtime_owned_state() -> None:
         "page_summary": "generic surface",
         "slug": "generic_surface",
         "possible_page_type": "none",
-        "scene_mode": "unknown",
+        "scene_mode": "ui_2d",
         "page_family": "generic_surface",
         "surface_relation": "uncertain",
         "common_identity": [],
@@ -124,7 +124,7 @@ def test_llm_intent_proposal_omits_runtime_owned_state() -> None:
             }],
             "completion": {"event": "completed"},
         },
-        "bootstrap_operations": [_operation("advance", default=True)],
+        "execution": {"kind": "reactive_2d", "bootstrap_operations": [_operation("advance", default=True)]},
     }
 
     parsed = parse_state_payload(json.dumps(payload))
@@ -153,14 +153,15 @@ def test_state_payload_requires_v2_provider_shape() -> None:
         "page_summary": "generic surface",
         "slug": "generic_surface",
         "possible_page_type": "none",
+        "scene_mode": "ui_2d",
         "page_family": "generic_surface",
         "surface_relation": "uncertain",
         "common_identity": [],
         "elements": [],
         "intent_assessment": {"relation": "unknown", "reason": "none"},
         "intent_proposal": None,
-        "bootstrap_operations": [_operation("advance", default=True)],
+        "execution": {"kind": "reactive_2d", "bootstrap_operations": [_operation("advance", default=True)]},
     }
     assert parse_state_payload(json.dumps(payload)) is not None
-    payload["bootstrap_operations"][0]["providers"][0]["locators"][0]["coordinate_space"] = "real"
+    payload["execution"]["bootstrap_operations"][0]["providers"][0]["locators"][0]["coordinate_space"] = "real"
     assert parse_state_payload(json.dumps(payload)) is None

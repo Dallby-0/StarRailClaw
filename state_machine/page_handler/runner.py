@@ -103,29 +103,6 @@ def _provider_hint_results(
     return results, details
 
 
-def _scene_operation(operation: dict[str, Any] | None, scene_mode: str) -> dict[str, Any] | None:
-    """Apply the runtime's hard routing rule for free-camera 3D scenes."""
-    if not isinstance(operation, dict):
-        return None
-    if scene_mode != "scene_3d":
-        return operation
-    providers: list[dict[str, Any]] = []
-    for provider in operation.get("providers", []):
-        if not isinstance(provider, dict):
-            continue
-        preset_locators = [
-            locator for locator in provider.get("locators", [])
-            if isinstance(locator, dict)
-            and locator.get("type") == "run_preset"
-            and locator.get("name") == "find_and_interact_with_next_object"
-        ]
-        if preset_locators:
-            providers.append({**provider, "locators": preset_locators})
-    if not providers:
-        return None
-    return {**operation, "providers": providers}
-
-
 def _text_fingerprint(match: Any) -> tuple[str, ...]:
     """Return only recognized text from state match conditions.
 
@@ -219,7 +196,7 @@ def _validate_family_candidates(
             continue
         dynamic_locators = [
             locator for locator in provider.get("locators", [])
-            if isinstance(locator, dict) and locator.get("type") not in {"point", "run_preset"}
+            if isinstance(locator, dict) and locator.get("type") != "point"
         ]
         if not dynamic_locators:
             providers.remove(provider)
@@ -319,24 +296,18 @@ def run_page_handler(
     current = start_frame
     state_path = state_dir / "state.json"
     state_meta = _load_json(state_path)
+    execution = state_meta.get("execution") if isinstance(state_meta.get("execution"), dict) else {}
+    if str(state_meta.get("scene_mode") or "") != "ui_2d" or execution.get("kind") != "reactive_2d":
+        _log(logger, "[fsm][handler] rejected non-reactive state", "page_handler_invalid_route", state_id=state_id, scene_mode=state_meta.get("scene_mode"), execution=execution)
+        return False, current
     handler = ensure_page_handler(state_meta)
-    scene_mode = str(state_meta.get("scene_mode") or "unknown")
     intent = active_intent(runtime)
     command = resolve_effective_command(state_meta, intent) or _fallback_command(intent)
     visit_id = str(ensure_page_visit(runtime, state_id)["visit_id"])
     cursor = cursor_for(runtime, visit_id, command.operation, now_monotonic=time.monotonic())
     if float(cursor.get("started_monotonic", 0.0) or 0.0) <= 0:
         cursor["started_monotonic"] = time.monotonic()
-    operation = _scene_operation(handler.get("operation_policies", {}).get(command.operation), scene_mode)
-    if scene_mode == "scene_3d" and operation is None:
-        _log(
-            logger,
-            "[fsm][handler] scene_3d requires find_and_interact_with_next_object preset",
-            "page_handler_scene_route_missing",
-            state_id=state_id,
-            operation=command.operation,
-        )
-        return False, current
+    operation = handler.get("operation_policies", {}).get(command.operation)
     budgets = normalize_budgets(operation.get("budgets") if isinstance(operation, dict) else None)
     failures: list[dict[str, Any]] = []
     history: list[dict[str, Any]] = []
@@ -370,9 +341,6 @@ def run_page_handler(
             ranked = rank_providers(operation, cursor, hint_results)
         needs_repair = not ranked or int(cursor.get("actions_since_repair", 0) or 0) >= budgets["soft_actions"]
         if needs_repair:
-            if scene_mode == "scene_3d" and operation is None:
-                _log(logger, "[fsm][handler] no valid 3D preset after repair", "page_handler_scene_route_missing", state_id=state_id, operation=command.operation)
-                return False, current
             if int(cursor.get("repair_count", 0) or 0) >= budgets["max_repairs"]:
                 _log(logger, "[fsm][handler] repair budget exhausted", "page_handler_no_strategy", state_id=state_id, visit_id=visit_id, operation=command.operation, failed_attempts=failures[-12:])
                 return False, current
@@ -402,7 +370,6 @@ def run_page_handler(
                 failures.append({"result": "repair_failed", "reason": repair_result})
                 if repair_result in {"give_up", "duplicate_patch", "no_valid_provider"}:
                     return False, current
-            operation = _scene_operation(operation, scene_mode)
             budgets = normalize_budgets(operation.get("budgets") if isinstance(operation, dict) else None)
             continue
 

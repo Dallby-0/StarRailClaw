@@ -15,8 +15,17 @@ def _closed_object(properties: dict[str, Any], required: list[str] | None = None
     }
 
 
-def state_bootstrap_json_schema() -> dict[str, Any]:
+def state_bootstrap_json_schema(available_tools: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Strict schema for the single identify + intent + bootstrap Responses call."""
+    if available_tools is None:
+        from state_machine.presets import tool_catalog
+
+        available_tools = tool_catalog()
+    tool_names = sorted({
+        str(item.get("name") or "").strip()
+        for item in available_tools
+        if str(item.get("name") or "").strip()
+    })
     level = {"type": "string", "enum": ["high", "mid", "low"]}
     bbox = {
         "type": "array",
@@ -50,10 +59,6 @@ def state_bootstrap_json_schema() -> dict[str, Any]:
         "y": {"type": "integer", "minimum": 0, "maximum": 1000},
         "coordinate_space": {"type": "string", "enum": ["logical"]},
         "source": {"type": "string", "enum": ["bootstrap"]},
-    })
-    run_preset = _closed_object({
-        "type": {"type": "string", "enum": ["run_preset"]},
-        "name": {"type": "string", "enum": ["wait_till_combat_end", "find_and_interact_with_next_object"]},
     })
     region_template = _closed_object({
         "type": {"type": "string", "enum": ["region_template"]},
@@ -109,7 +114,7 @@ def state_bootstrap_json_schema() -> dict[str, Any]:
         "provider_id": {"type": "string"},
         "base_priority": {"type": "integer", "minimum": -100, "maximum": 100},
         "repeat_policy": {"type": "string", "enum": ["once_per_visit", "after_confirmed_effect"]},
-        "locators": {"type": "array", "items": {"anyOf": [point, region_template, text_target, run_preset]}, "minItems": 1, "maxItems": 4},
+        "locators": {"type": "array", "items": {"anyOf": [point, region_template, text_target]}, "minItems": 1, "maxItems": 4},
         "hints": {"type": "array", "items": hint, "maxItems": 3},
         "deferred_hints": {"type": "array", "items": deferred_hint, "maxItems": 2},
         "effect_hints": {"type": "array", "items": effect_hint, "maxItems": 2},
@@ -130,6 +135,21 @@ def state_bootstrap_json_schema() -> dict[str, Any]:
         "intent_routes": {"type": "array", "items": intent_route, "maxItems": 4},
         "providers": {"type": "array", "items": provider, "minItems": 1, "maxItems": 4},
     })
+    execution_variants: list[dict[str, Any]] = [
+        _closed_object({
+            "kind": {"type": "string", "enum": ["reactive_2d"]},
+            "bootstrap_operations": {"type": "array", "items": operation, "minItems": 1, "maxItems": 2},
+        })
+    ]
+    if tool_names:
+        execution_variants.append(_closed_object({
+            "kind": {"type": "string", "enum": ["invoke_tool"]},
+            "tool_name": {"type": "string", "enum": tool_names},
+        }))
+    execution_variants.append(_closed_object({
+        "kind": {"type": "string", "enum": ["cannot_handle"]},
+        "reason": {"type": "string"},
+    }))
 
     transition = _closed_object({
         "from_phase": {"type": "string"},
@@ -158,7 +178,7 @@ def state_bootstrap_json_schema() -> dict[str, Any]:
             "reason": {"type": "string"},
         }),
         "intent_proposal": {"anyOf": [{"type": "null"}, intent_proposal]},
-        "bootstrap_operations": {"type": "array", "items": operation, "maxItems": 2},
+        "execution": {"anyOf": execution_variants},
     })
 
 
@@ -260,11 +280,22 @@ def parse_state_payload(text: str) -> dict[str, Any] | None:
     payload = _load_json_lenient(text)
     if payload is None:
         return None
-    # Keep persisted/fixture payloads from before scene routing readable while
-    # requiring new model responses to state the scene mode explicitly.
-    payload.setdefault("scene_mode", "unknown")
-    error = _schema_error(payload, state_bootstrap_json_schema())
+    from state_machine.presets import get_tool, tool_catalog
+
+    catalog = tool_catalog()
+    error = _schema_error(payload, state_bootstrap_json_schema(catalog))
     if error is not None:
         print(f"[fsm][llm][json_schema][invalid] {error}")
         return None
+    scene_mode = str(payload.get("scene_mode") or "")
+    execution = payload.get("execution") if isinstance(payload.get("execution"), dict) else {}
+    kind = str(execution.get("kind") or "")
+    if kind == "reactive_2d" and scene_mode != "ui_2d":
+        print(f"[fsm][llm][json_schema][invalid] reactive_2d cannot handle scene_mode={scene_mode!r}")
+        return None
+    if kind == "invoke_tool":
+        tool = get_tool(str(execution.get("tool_name") or ""))
+        if tool is None or scene_mode not in tool.supported_scene_modes:
+            print(f"[fsm][llm][json_schema][invalid] tool does not support scene_mode={scene_mode!r}")
+            return None
     return payload

@@ -105,16 +105,22 @@ def _request_llm_payload(
     previous_frame_rgb=None,
     raw_debug_dir: Path | None = None,
 ) -> dict[str, Any] | None:
+    from state_machine.presets import tool_catalog
+
+    available_tools = tool_catalog()
     context = {
         "mode": "NORMAL",
         "known_page_types": page_summaries or [],
         "active_intent": active_intent or {},
         "previous_surface": previous_surface or {},
+        "available_tools": available_tools,
         "instruction": (
             "请按 system 约定输出 JSON。先照常输出用于建立新状态的页面元素信息；"
-            "必须先判断 scene_mode：ui_2d、scene_3d 或 unknown。scene_3d 时仅规划 find_and_interact_with_next_object 预置；"
+            "必须先判断 scene_mode：ui_2d、scene_3d 或 unknown，再选择且只选择一种 execution。"
+            "reactive_2d 只能处理 ui_2d；invoke_tool 必须从 available_tools 中选择且支持当前 scene_mode；"
+            "没有适用执行器时选择 cannot_handle，不得创造工具名。选择 invoke_tool 时不要生成 reactive providers；"
             "possible_page_type 必须从 known_page_types.page_type 中选择，若都不像则输出 none。"
-            "同时给出最多两个 bootstrap operation；每个 operation 直接包含 reactive providers。"
+            "只有选择 reactive_2d 时才给出最多两个 bootstrap operation；每个 operation 直接包含 reactive providers。"
             "operation 表达当前页面的一次完整推进；当前画面中明显的短动作链可以在一次调用中给出，"
             "但必须拆成独立 provider，并用 successors 表达后继先验。只有前一步后才出现的特征使用 deferred_hints。"
             "禁止把顺序必做的动作拆成并列 operations；多个 operations 只表示不同 intent 下互斥的操作。"
@@ -138,7 +144,7 @@ def _request_llm_payload(
         user_text=json.dumps(context, ensure_ascii=False),
         image_data_urls=images,
         schema_name="fsm_state_bootstrap",
-        schema=state_bootstrap_json_schema(),
+        schema=state_bootstrap_json_schema(available_tools),
     )
     text = response_output_text(resp)
     _save_llm_raw_debug(session_id, 1, text, "normal", raw_debug_dir)

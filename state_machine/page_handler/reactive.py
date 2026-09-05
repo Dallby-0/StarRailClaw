@@ -101,9 +101,6 @@ def normalize_locator(raw: Any) -> dict[str, Any] | None:
         if rect is None or not texts:
             return None
         return {"type": kind, "rect": rect, "texts": texts[:6], "match": "contains", "coordinate_space": "logical"}
-    if kind == "run_preset":
-        name = str(raw.get("name") or "").strip()
-        return {"type": kind, "name": name} if name else None
     return None
 
 

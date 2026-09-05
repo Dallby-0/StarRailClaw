@@ -162,7 +162,6 @@ def _repair_context(
                     {"type": "point", "x": 0, "y": 0, "coordinate_space": "logical", "source": "bootstrap|verified"},
                     {"type": "region_template", "template_bbox": [0, 0, 0, 0], "search_rect": [0, 0, 0, 0], "threshold": 0.82, "coordinate_space": "logical"},
                     {"type": "text_target", "rect": [0, 0, 0, 0], "texts": ["visible text"], "coordinate_space": "logical"},
-                    {"type": "run_preset", "name": "registered preset name"},
                 ],
                 "hints": [
                     {"id": "id", "type": "template", "template_bbox": [0, 0, 0, 0], "rect": [0, 0, 0, 0], "coordinate_space": "logical"},

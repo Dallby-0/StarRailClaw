@@ -8,6 +8,7 @@ import cv2
 from agent.behavior_tree.coord_mapper import CoordinateMapper
 from agent.behavior_tree.vision import VisionEngine
 from state_machine.constants import SCHEMA_VERSION
+from state_machine.execution import execution_from_payload, reactive_bootstrap_operations
 from state_machine.io import _load_frame, _normalize_page_type, _now_iso, _save_frame, _save_json, _slugify
 from state_machine.logger import FsmRunLogger
 from state_machine.matching import _level
@@ -118,15 +119,18 @@ def _create_state_from_llm(
     conds = _extract_region_templates(frame_rgb, mapper, state_dir, conds)
     match_clauses = build_match_clauses(conds)
     weak_match = len(match_clauses) == 1 and len(match_clauses[0].get("all", [])) == 1
-    handler = handler_from_bootstrap(llm_payload.get("bootstrap_operations", []))
-    provider_ids = {
-        str(provider.get("provider_id"))
-        for policy in handler.get("operation_policies", {}).values()
-        if isinstance(policy, dict)
-        for provider in policy.get("providers", [])
-        if isinstance(provider, dict)
-    }
-    materialize_provider_templates(handler, state_dir, frame_rgb, vision, provider_ids)
+    execution = execution_from_payload(llm_payload)
+    bootstrap_operations = reactive_bootstrap_operations(llm_payload)
+    handler = handler_from_bootstrap(bootstrap_operations) if execution["kind"] == "reactive_2d" else None
+    if handler is not None:
+        provider_ids = {
+            str(provider.get("provider_id"))
+            for policy in handler.get("operation_policies", {}).values()
+            if isinstance(policy, dict)
+            for provider in policy.get("providers", [])
+            if isinstance(provider, dict)
+        }
+        materialize_provider_templates(handler, state_dir, frame_rgb, vision, provider_ids)
 
     state_meta = {
         "schema_version": SCHEMA_VERSION,
@@ -134,6 +138,7 @@ def _create_state_from_llm(
         "slug": _slugify(str(llm_payload.get("slug", "state"))),
         "page_type": _normalize_page_type(llm_payload.get("possible_page_type") or llm_payload.get("page_type")),
         "scene_mode": str(llm_payload.get("scene_mode") or "unknown"),
+        "execution": execution,
         "page_family": _slugify(str(llm_payload.get("page_family") or _normalize_page_type(llm_payload.get("possible_page_type")) or llm_payload.get("slug") or "generic_page")),
         "display_name": str(llm_payload.get("slug", "state")),
         "description": str(llm_payload.get("page_summary", "")),
@@ -152,8 +157,9 @@ def _create_state_from_llm(
         ],
         "match_conditions": conds,
         "match_clauses": match_clauses,
-        "page_handler": handler,
     }
+    if handler is not None:
+        state_meta["page_handler"] = handler
     record_condition_observations(state_meta, vision, frame_rgb, cohort="family_positive")
     for other_dir, other_meta in _iter_state_meta():
         other_family = _slugify(str(other_meta.get("page_family") or other_meta.get("page_type") or other_meta.get("slug") or ""))
@@ -175,7 +181,8 @@ def _create_state_from_llm(
             page_type=state_meta["page_type"],
             weak_match=weak_match,
             elements_count=len(elements),
-            bootstrap_operations_count=len(llm_payload.get("bootstrap_operations", [])),
+            execution=execution,
+            bootstrap_operations_count=len(bootstrap_operations),
             conditions=conds,
             screenshot_path=state_dir / "screenshot_1.png",
         )

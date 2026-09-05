@@ -301,6 +301,7 @@ def run_agent_loop_fsm(
                     "page_type": predecessor_item[1].get("page_type"),
                     "page_family": predecessor_item[1].get("page_family"),
                     "scene_mode": predecessor_item[1].get("scene_mode", "unknown"),
+                    "execution": predecessor_item[1].get("execution", {}),
                     "description": predecessor_item[1].get("description"),
                     "operations": list(
                         (predecessor_item[1].get("page_handler") or {}).get("operation_policies", {}).keys()
@@ -333,7 +334,8 @@ def run_agent_loop_fsm(
                 slug=payload.get("slug"),
                 possible_page_type=payload.get("possible_page_type"),
                 elements_count=len(payload.get("elements", [])),
-                bootstrap_operations_count=len(payload.get("bootstrap_operations", [])),
+                execution=payload.get("execution"),
+                bootstrap_operations_count=len((payload.get("execution") or {}).get("bootstrap_operations", [])),
             )
             proposed_intent = adopt_intent_proposal(runtime, payload.get("intent_proposal"))
             if proposed_intent is not None:

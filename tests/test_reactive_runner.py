@@ -73,7 +73,7 @@ def test_two_provider_chain_runs_locally_and_promotes_deferred_hint(tmp_path: Pa
             },
         ],
     }])
-    state_meta = {"state_id": "001", "samples": [], "page_handler": handler}
+    state_meta = {"state_id": "001", "scene_mode": "ui_2d", "execution": {"kind": "reactive_2d"}, "samples": [], "page_handler": handler}
     (tmp_path / "state.json").write_text(json.dumps(state_meta), encoding="utf-8")
     start = np.zeros((4, 4, 3), dtype=np.uint8)
     after_first = start.copy()
@@ -128,7 +128,7 @@ def test_confirmed_same_state_reentry_starts_fresh_visit(tmp_path: Path, monkeyp
             "effect_hints": [{"id": "changed", "probe": _line_probe(), "expected": "becomes_pass"}],
         }],
     }])
-    state_meta = {"state_id": "001", "samples": [], "page_handler": handler}
+    state_meta = {"state_id": "001", "scene_mode": "ui_2d", "execution": {"kind": "reactive_2d"}, "samples": [], "page_handler": handler}
     (tmp_path / "state.json").write_text(json.dumps(state_meta), encoding="utf-8")
     before = np.ones((4, 4, 3), dtype=np.uint8)
     after = before.copy()
@@ -169,7 +169,7 @@ def test_confirmed_same_state_reentry_starts_fresh_visit(tmp_path: Path, monkeyp
     assert runtime["reactive_visits"] == {}
 
 
-def test_scene_3d_rejects_non_preset_provider(tmp_path: Path, monkeypatch) -> None:
+def test_page_handler_rejects_non_reactive_route(tmp_path: Path, monkeypatch) -> None:
     handler = handler_from_bootstrap([{
         "operation": "advance",
         "is_default": True,
@@ -178,7 +178,7 @@ def test_scene_3d_rejects_non_preset_provider(tmp_path: Path, monkeypatch) -> No
         "expected_event": "advanced",
         "providers": [{"provider_id": "point", "locators": [_point(250, 500)]}],
     }])
-    state_meta = {"state_id": "001", "scene_mode": "scene_3d", "samples": [], "page_handler": handler}
+    state_meta = {"state_id": "001", "scene_mode": "scene_3d", "execution": {"kind": "invoke_tool", "tool_name": "find_and_interact_with_next_object"}, "samples": [], "page_handler": handler}
     (tmp_path / "state.json").write_text(json.dumps(state_meta), encoding="utf-8")
     emulator = FakeEmulator()
     ok, _ = run_page_handler(

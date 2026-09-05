@@ -12,7 +12,7 @@ EXPERIENCE_PATH = FSM_DIR / "experience.md"
 TASK_SUMMARY_PATH = FSM_DIR / "task_summary.md"
 EXPERIENCE_WRITE_ENABLED = False
 
-SCHEMA_VERSION = "3.0.0"
+SCHEMA_VERSION = "4.0.0"
 ACTION_CLICK_WAIT_S = 1.0
 UNKNOWN_STABILITY_DIFF_THRESHOLD = 0.1
 UNKNOWN_STABILITY_SAMPLE_INTERVAL_S = 0.5
@@ -81,7 +81,12 @@ LLM_FSM_PROMPT_BASE = """你是视觉驱动游戏自动化的状态标注器和�
 - page_family: 英文小写+下划线，表示可共享同类操作经验的稳定页面族；不知道时使用与 slug 相同的值。
 - surface_relation: 若提供了 previous_surface，上下两图仍是同一稳定交互表面、只是页内步骤不同，必须输出 same_surface_step；同族但应独立处理的阻塞层/结果层输出 same_family_new_surface；否则输出 different_surface；没有前图时输出 uncertain。
 - common_identity: 仅列出前后步骤共同保留的稳定身份元素，禁止填写具体事件名、选项或仅当前步骤存在的按钮。
-- bootstrap_operations: 数组。每项表示一种稳定操作语义及其 reactive providers，而不是无条件宏。
+- execution: 必须只选择一种执行路线。
+  - reactive_2d 仅适用于 scene_mode=ui_2d，并携带 bootstrap_operations。
+  - invoke_tool 可用于 2D 或 3D，但 tool_name 必须来自本次请求的 available_tools，且 supported_scene_modes 必须包含当前 scene_mode。
+  - 没有适用执行器时使用 cannot_handle；禁止臆造工具名称。
+  - 工具与 reactive 是并列执行器。选择 invoke_tool 时不得再输出 reactive providers。
+- bootstrap_operations: 仅存在于 execution.kind=reactive_2d。每项表示一种稳定操作语义及其 reactive providers，而不是无条件宏。
   - operation 使用简短、稳定、领域无关的语义名；同一 page_family 的连续页内步骤复用同一个完整目标 operation。
   - 每个 provider 表达一个可独立观察和结算的动作。明显的短链可在一次输出中给出多个 provider，并用 successors 表达短期后继先验。
   - runtime 在每个动作后重新截图和评估，不会把 providers 当作无条件连点序列。
@@ -94,10 +99,8 @@ LLM_FSM_PROMPT_BASE = """你是视觉驱动游戏自动化的状态标注器和�
   - intent_scope 只能是 intent_invariant 或 intent_specific。只有纯提示/透明阻塞弹窗才使用 intent_invariant。
   - intent_effect 只能是 preserve、advance、complete 或 none。
   - 初见页面可优先使用 point locator；同时存在稳定视觉定位方式时，可将其放在 point 之前作为更通用的 locator。
-  - 只有明显需要已注册预置动作时才使用 run_preset locator。
   - 若 active_intent 存在，intent_routes 应说明哪些 intent kind/phase 映射到这个 operation。
-  - run_preset.name 只能引用 runtime 已注册的预置动作名称，不要自行创造领域规则。
-  - scene_mode=scene_3d 时，bootstrap operation 必须提供 run_preset locator，name 必须为 find_and_interact_with_next_object；不要输出固定坐标、模板或 OCR 点击来操作场景物体。scene_mode=ui_2d 使用 reactive providers；unknown 时保持谨慎，不要假设 3D 物体可点击。
+  - locator 只能负责定位 2D 原子点击目标，不得调用工具或承载内部循环。
 
 字段、枚举、必填项和嵌套结构由 Responses API 的 JSON Schema 提供，不要输出 schema 之外的字段。
 """

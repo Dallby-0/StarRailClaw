@@ -44,6 +44,7 @@ def _page_type_summaries(metas: list[tuple[Path, dict[str, Any]]], limit: int = 
                 "page_type": ptype,
                 "page_family": str(meta.get("page_family") or ptype),
                 "scene_mode": str(meta.get("scene_mode") or "unknown"),
+                "execution": dict(meta.get("execution") or {}),
                 "example_slug": str(meta.get("slug", "")),
                 "description": str(meta.get("description", ""))[:160],
                 "sample_count": 0,
@@ -55,6 +56,8 @@ def _page_type_summaries(metas: list[tuple[Path, dict[str, Any]]], limit: int = 
             if state_dir.stat().st_mtime >= Path(str(entry["latest_dir"])).stat().st_mtime:
                 entry["example_slug"] = str(meta.get("slug", ""))
                 entry["description"] = str(meta.get("description", ""))[:160]
+                entry["scene_mode"] = str(meta.get("scene_mode") or "unknown")
+                entry["execution"] = dict(meta.get("execution") or {})
                 entry["latest_dir"] = str(state_dir)
         except Exception:
             pass

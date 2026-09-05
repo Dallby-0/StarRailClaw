@@ -11,6 +11,7 @@ from agent.behavior_tree.coord_mapper import CoordinateMapper
 from agent.behavior_tree.vision import VisionEngine
 from agent.llm_client import DoubaoClient
 from state_machine import constants
+from state_machine.execution import execution_from_payload, execution_key, reactive_bootstrap_operations
 from state_machine.io import _backup_json, _load_frame, _load_json, _normalize_page_type, _now_iso, _save_frame, _save_json, _state_page_type
 from state_machine.llm_tasks import _request_llm_condition_revision
 from state_machine.logger import FsmRunLogger
@@ -93,6 +94,8 @@ def _try_merge_ambiguous_states(
         reason = ""
         if not winner_type or winner_type != loser_type:
             reason = "different_or_missing_page_family"
+        if not reason and execution_key(winner_meta) != execution_key(loser_meta):
+            reason = "different_execution_route"
 
         frames: list[Any] = [frame_rgb]
         if not reason:
@@ -127,18 +130,19 @@ def _try_merge_ambiguous_states(
         _backup_json(loser_dir / "state.json")
         winner_meta["match_conditions"] = common
         winner_meta["match_clauses"] = build_match_clauses(common)
-        winner_handler = ensure_page_handler(winner_meta)
-        loser_handler = ensure_page_handler(loser_meta)
-        winner_policies = winner_handler.get("operation_policies") if isinstance(winner_handler.get("operation_policies"), dict) else {}
-        loser_policies = loser_handler.get("operation_policies") if isinstance(loser_handler.get("operation_policies"), dict) else {}
-        winner_default = winner_handler.get("default_operation") if isinstance(winner_handler.get("default_operation"), dict) else {}
-        target_name = str(winner_default.get("operation") or "")
-        target_policy = winner_policies.get(target_name) if target_name else None
-        if isinstance(target_policy, dict):
-            for loser_policy in loser_policies.values():
-                if isinstance(loser_policy, dict):
-                    target_policy, _ = merge_operation(target_policy, loser_policy)
-                    winner_policies[target_name] = target_policy
+        if execution_key(winner_meta)[0] == "reactive_2d":
+            winner_handler = ensure_page_handler(winner_meta)
+            loser_handler = ensure_page_handler(loser_meta)
+            winner_policies = winner_handler.get("operation_policies") if isinstance(winner_handler.get("operation_policies"), dict) else {}
+            loser_policies = loser_handler.get("operation_policies") if isinstance(loser_handler.get("operation_policies"), dict) else {}
+            winner_default = winner_handler.get("default_operation") if isinstance(winner_handler.get("default_operation"), dict) else {}
+            target_name = str(winner_default.get("operation") or "")
+            target_policy = winner_policies.get(target_name) if target_name else None
+            if isinstance(target_policy, dict):
+                for loser_policy in loser_policies.values():
+                    if isinstance(loser_policy, dict):
+                        target_policy, _ = merge_operation(target_policy, loser_policy)
+                        winner_policies[target_name] = target_policy
         winner_samples = winner_meta.setdefault("samples", [])
         known_paths = {str(item.get("path")) for item in winner_samples if isinstance(item, dict)} if isinstance(winner_samples, list) else set()
         if isinstance(winner_samples, list):
@@ -360,20 +364,36 @@ def _try_merge_page_type(
             }
         )
     latest_meta["match_conditions"] = revised
-    handler = ensure_page_handler(latest_meta)
-    bootstrap_raw = llm_payload.get("bootstrap_operations", [])
-    touched = merge_bootstrap_operations(handler, bootstrap_raw)
-    bootstrap = handler_from_bootstrap(bootstrap_raw)
-    if handler.get("default_operation") is None and bootstrap.get("default_operation") is not None:
-        handler["default_operation"] = bootstrap["default_operation"]
-    known_routes = {str(item) for item in handler.get("intent_routes", []) if isinstance(item, dict)}
-    for route in bootstrap.get("intent_routes", []):
-        if isinstance(route, dict) and str(route) not in known_routes:
-            handler["intent_routes"].append(route)
-    materialize_provider_templates(handler, latest_dir, frame_rgb, vision, touched)
+    incoming_execution = execution_from_payload(llm_payload)
+    bootstrap_raw = reactive_bootstrap_operations(llm_payload)
+    if incoming_execution["kind"] == "reactive_2d":
+        if execution_key(latest_meta)[0] == "reactive_2d" and isinstance(latest_meta.get("page_handler"), dict):
+            handler = ensure_page_handler(latest_meta)
+            touched = merge_bootstrap_operations(handler, bootstrap_raw)
+            bootstrap = handler_from_bootstrap(bootstrap_raw)
+            if handler.get("default_operation") is None and bootstrap.get("default_operation") is not None:
+                handler["default_operation"] = bootstrap["default_operation"]
+            known_routes = {str(item) for item in handler.get("intent_routes", []) if isinstance(item, dict)}
+            for route in bootstrap.get("intent_routes", []):
+                if isinstance(route, dict) and str(route) not in known_routes:
+                    handler["intent_routes"].append(route)
+        else:
+            handler = handler_from_bootstrap(bootstrap_raw)
+            latest_meta["page_handler"] = handler
+            touched = {
+                str(provider.get("provider_id"))
+                for policy in handler.get("operation_policies", {}).values()
+                if isinstance(policy, dict)
+                for provider in policy.get("providers", [])
+                if isinstance(provider, dict)
+            }
+        materialize_provider_templates(handler, latest_dir, frame_rgb, vision, touched)
+    else:
+        latest_meta.pop("page_handler", None)
     latest_meta["updated_at"] = _now_iso()
     latest_meta["page_type"] = page_type
     latest_meta["scene_mode"] = str(llm_payload.get("scene_mode") or latest_meta.get("scene_mode") or "unknown")
+    latest_meta["execution"] = incoming_execution
     latest_meta.setdefault("model_info", {})
     if isinstance(latest_meta["model_info"], dict):
         latest_meta["model_info"]["weak_match"] = weak_match

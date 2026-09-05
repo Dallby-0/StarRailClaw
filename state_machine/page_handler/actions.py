@@ -9,8 +9,6 @@ from agent.behavior_tree.coord_mapper import CoordinateMapper
 from agent.behavior_tree.vision import VisionEngine
 from sr_tools.emulator import EmulatorClient
 from state_machine.logger import FsmRunLogger
-from state_machine.matching import _find_match_by_state
-from state_machine.presets import run_preset
 
 
 def _log(logger: FsmRunLogger | None, message: str, event: str = "console", **fields: Any) -> None:
@@ -111,12 +109,6 @@ def resolve_provider(provider: dict[str, Any], frame_rgb, vision: VisionEngine) 
                 "brief": str(provider.get("brief") or ""),
             }
             return action, {"locator_index": index, "locator_type": kind, "locator_source": locator.get("source")}
-        if kind == "run_preset":
-            return {
-                "type": "run_preset",
-                "name": str(locator.get("name") or ""),
-                "brief": str(provider.get("brief") or ""),
-            }, {"locator_index": index, "locator_type": kind}
         if kind == "region_template":
             path = Path(str(locator.get("template_path") or ""))
             if not path.is_file():
@@ -280,14 +272,6 @@ def execute_action(
     attempt: str,
 ) -> bool:
     atype = str(action.get("type", "click"))
-    if atype == "run_preset":
-        name = str(action.get("name", "")).strip()
-        _log(logger, f"[fsm][handler][preset] name={name}", "page_handler_preset", state_id=state_id, action_id=action_id, attempt=attempt, name=name, action_info=action_info)
-        try:
-            return run_preset(name, emulator=emulator, mapper=mapper, vision=vision, state_id=state_id, matches_provider=matches_provider, find_match_by_state=_find_match_by_state)
-        except Exception as exc:  # noqa: BLE001
-            _log(logger, f"[fsm][handler][preset] failed name={name} error={exc}", "page_handler_preset_exception", state_id=state_id, action_id=action_id, attempt=attempt, name=name, error=str(exc))
-            return False
     x = int(action.get("x", 500))
     y = int(action.get("y", 500))
     coordinate_space = str(action.get("coordinate_space") or "")

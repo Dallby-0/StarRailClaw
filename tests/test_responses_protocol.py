@@ -44,8 +44,13 @@ def test_state_bootstrap_schema_is_closed_and_bounded() -> None:
     schema = state_bootstrap_json_schema()
     assert schema["additionalProperties"] is False
     assert set(schema["required"]) == set(schema["properties"])
-    assert schema["properties"]["bootstrap_operations"]["maxItems"] == 2
     assert schema["properties"]["scene_mode"]["enum"] == ["ui_2d", "scene_3d", "unknown"]
+
+    execution_variants = schema["properties"]["execution"]["anyOf"]
+    reactive = next(item for item in execution_variants if item["properties"]["kind"]["enum"] == ["reactive_2d"])
+    invoke_tool = next(item for item in execution_variants if item["properties"]["kind"]["enum"] == ["invoke_tool"])
+    assert reactive["properties"]["bootstrap_operations"]["maxItems"] == 2
+    assert "find_and_interact_with_next_object" in invoke_tool["properties"]["tool_name"]["enum"]
 
     element_variants = schema["properties"]["elements"]["items"]["anyOf"]
     for variant in element_variants:
@@ -55,7 +60,7 @@ def test_state_bootstrap_schema_is_closed_and_bounded() -> None:
         assert bbox["items"]["minimum"] == 0
         assert bbox["items"]["maximum"] == 1000
 
-    operation = schema["properties"]["bootstrap_operations"]["items"]
+    operation = reactive["properties"]["bootstrap_operations"]["items"]
     assert operation["additionalProperties"] is False
     assert "safety" not in operation["properties"]
     providers = operation["properties"]["providers"]
@@ -67,6 +72,10 @@ def test_state_bootstrap_schema_is_closed_and_bounded() -> None:
     assert point["properties"]["coordinate_space"]["enum"] == ["logical"]
     assert "effect_hints" in provider["properties"]
     assert "deferred_hints" in provider["properties"]
+    assert all(
+        variant["properties"]["type"]["enum"] != ["run_preset"]
+        for variant in provider["properties"]["locators"]["items"]["anyOf"]
+    )
 
     intent = schema["properties"]["intent_proposal"]["anyOf"][1]
     assert set(intent["properties"]) == {"kind", "phase", "transitions", "completion"}

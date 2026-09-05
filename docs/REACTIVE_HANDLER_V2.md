@@ -4,6 +4,24 @@
 contains an older or unversioned handler is rejected; create a fresh state
 workspace instead of migrating it.
 
+The page handler is only one execution backend. The state bootstrap response
+first chooses exactly one top-level route:
+
+```text
+execution
+  reactive_2d    -> reactive page handler
+  invoke_tool    -> registered tool, dispatched before the page handler
+  cannot_handle  -> explicit stop
+```
+
+`scene_mode` describes the observed surface; it does not name an executor.
+`reactive_2d` is valid only for `scene_mode=ui_2d`. Registered tools declare
+their own supported scene modes and may target either 2D or 3D surfaces. Tool
+calls own their internal loops and budgets and never consume reactive action
+or repair quotas. A registered tool returns one of `progressed`, `completed`,
+`no_progress`, `failed`, or `aborted`; control then returns to the outer visual
+loop with a fresh screenshot.
+
 ## Model
 
 An operation owns a flat provider library. There are no strategies, stateful
@@ -44,7 +62,6 @@ Supported locators:
 - `point`
 - `region_template`
 - `text_target`
-- `run_preset`
 
 Supported visual probes:
 

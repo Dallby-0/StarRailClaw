@@ -6,6 +6,7 @@ from typing import Any
 from agent.behavior_tree.coord_mapper import CoordinateMapper
 from agent.behavior_tree.vision import VisionEngine
 from state_machine.io import _backup_json, _load_frame, _now_iso, _save_json, _slugify
+from state_machine.execution import execution_from_payload, execution_key, reactive_bootstrap_operations
 from state_machine.logger import FsmRunLogger
 from state_machine.page_handler.store import ensure_page_handler, handler_from_bootstrap, materialize_provider_templates, merge_operation
 from state_machine.page_identity import build_match_clauses, normalize_elements, record_condition_observations
@@ -86,6 +87,10 @@ def try_merge_same_surface(
     if not previous_family or previous_family != current_family:
         _log(logger, f"[fsm][surface] reject predecessor={predecessor_state_id} family={previous_family}->{current_family}", "surface_merge_rejected", predecessor_state_id=predecessor_state_id, reason="family_mismatch")
         return None
+    incoming_execution = execution_from_payload(llm_payload)
+    if execution_key(meta) != (incoming_execution["kind"], str(incoming_execution.get("tool_name") or "")):
+        _log(logger, f"[fsm][surface] reject predecessor={predecessor_state_id} reason=execution_mismatch", "surface_merge_rejected", predecessor_state_id=predecessor_state_id, reason="execution_mismatch")
+        return None
     common = {str(value).strip() for value in llm_payload.get("common_identity", []) if str(value).strip()}
     if not common:
         _log(logger, f"[fsm][surface] reject predecessor={predecessor_state_id} reason=no_common_identity", "surface_merge_rejected", predecessor_state_id=predecessor_state_id, reason="no_common_identity")
@@ -123,9 +128,10 @@ def try_merge_same_surface(
     meta["match_clauses"] = build_match_clauses([
         c for c in meta.get("match_conditions", []) if isinstance(c, dict)
     ])
-    handler = ensure_page_handler(meta)
-    touched = _merge_bootstrap_into_default(handler, llm_payload.get("bootstrap_operations", []))
-    materialize_provider_templates(handler, state_dir, frame_rgb, vision, touched)
+    if incoming_execution["kind"] == "reactive_2d":
+        handler = ensure_page_handler(meta)
+        touched = _merge_bootstrap_into_default(handler, reactive_bootstrap_operations(llm_payload))
+        materialize_provider_templates(handler, state_dir, frame_rgb, vision, touched)
     meta["page_family"] = previous_family
     meta.setdefault("model_info", {})
     if isinstance(meta["model_info"], dict):
