@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,9 @@ from state_machine.screen import _screen_changed, _wait_for_screen_stable
 from state_machine.transition_policy import _defer_unknown_transition, _resolve_transition_after_progress
 from state_machine.visit import ensure_page_visit, start_new_visit
 from state_machine.page_handler.reactive import clear_visit
+
+
+MAX_CONSECUTIVE_TEXT_REENTRIES = 2
 
 
 def _log(logger: FsmRunLogger | None, message: str, event: str = "console", **fields: Any) -> None:
@@ -119,7 +123,20 @@ def _text_fingerprint(match: Any) -> tuple[str, ...]:
         lines = detail.get("ocr_lines")
         if isinstance(lines, list):
             values.extend(str(line).strip() for line in lines if str(line).strip())
-    return tuple(values)
+    return _normalize_fingerprint(values)
+
+
+def _normalize_fingerprint(values: list[str]) -> tuple[str, ...]:
+    normalized: list[str] = []
+    for value in values:
+        text = "".join(
+            char
+            for char in unicodedata.normalize("NFKC", str(value)).strip().casefold()
+            if not unicodedata.category(char).startswith(("P", "S", "Z"))
+        )
+        if text:
+            normalized.append(text)
+    return tuple(normalized)
 
 
 def _effect_has_observable_change(effect_details: list[dict[str, Any]]) -> bool:
@@ -151,6 +168,10 @@ def _element_text_fingerprint(state_meta: dict[str, Any], frame: Any, vision: Vi
     for element in elements:
         if not isinstance(element, dict) or element.get("type") != "text_line":
             continue
+        role = str(element.get("role") or "")
+        instance_like_diagnostic = role == "diagnostic" and str(element.get("stability") or "mid") != "high"
+        if role != "instance" and not instance_like_diagnostic:
+            continue
         rect = element.get("bbox")
         if not (isinstance(rect, list) and len(rect) == 4):
             continue
@@ -161,7 +182,20 @@ def _element_text_fingerprint(state_meta: dict[str, Any], frame: Any, vision: Vi
         values.extend(str(item.get("text") or "").strip() for item in entries if isinstance(item, dict) and str(item.get("text") or "").strip())
         if len(values) >= 4:
             break
-    return tuple(values)
+    return _normalize_fingerprint(values)
+
+
+def _record_text_only_reentry(runtime: dict[str, Any], state_id: str) -> int:
+    previous = str(runtime.get("text_only_reentry_state_id") or "")
+    count = int(runtime.get("text_only_reentry_count", 0) or 0) + 1 if previous == state_id else 1
+    runtime["text_only_reentry_state_id"] = state_id
+    runtime["text_only_reentry_count"] = count
+    return count
+
+
+def _clear_text_only_reentry(runtime: dict[str, Any]) -> None:
+    runtime["text_only_reentry_state_id"] = None
+    runtime["text_only_reentry_count"] = 0
 
 
 def _sample_frames(state_meta: dict[str, Any], current) -> list[Any]:
@@ -248,6 +282,10 @@ def _repair(
         return operation, "invalid_response"
     if response.get("decision") == "give_up":
         return operation, "give_up"
+    if response.get("decision") == "state_misidentified":
+        if response.get("confidence") == "high":
+            return operation, "state_misidentified"
+        return operation, "state_misidentified_unconfirmed"
     patch = {
         "providers": response.get("local_patch", {}).get("providers", []),
         "generalization_candidates": response.get("generalization_candidates", []),
@@ -366,6 +404,23 @@ def run_page_handler(
             runtime["llm_turn_count"] = int(runtime.get("llm_turn_count", 0) or 0) + 1
             _save_json(state_path, state_meta)
             _save_runtime(runtime)
+            if repair_result == "state_misidentified":
+                runtime["last_state_id"] = None
+                runtime["last_transition_ok"] = True
+                runtime["pending_from_state_id"] = state_id
+                runtime["pending_action_id"] = action_id
+                runtime["force_state_resolution"] = True
+                runtime["force_exclude_state_id"] = state_id
+                _save_runtime(runtime)
+                _log(
+                    logger,
+                    f"[fsm][handler] state misidentified state={state_id}; force state resolution",
+                    "state_misidentified",
+                    state_id=state_id,
+                    visit_id=visit_id,
+                    action_id=action_id,
+                )
+                return True, current
             if repair_result != "applied":
                 failures.append({"result": "repair_failed", "reason": repair_result})
                 if repair_result in {"give_up", "duplicate_patch", "no_valid_provider"}:
@@ -417,7 +472,11 @@ def run_page_handler(
         current_match = next((item for item in matches if item.state_id == state_id), None)
         still_current = bool(current_match and current_match.success)
         after_text_fp = _text_fingerprint(current_match)
-        text_progress = bool(before_text_fp and after_text_fp and before_text_fp != after_text_fp)
+        text_progress = bool(changed and before_text_fp and after_text_fp and before_text_fp != after_text_fp)
+        if text_progress:
+            confirmation_matches = matches_provider(post)
+            confirmation_match = next((item for item in confirmation_matches if item.state_id == state_id), None)
+            text_progress = _text_fingerprint(confirmation_match) == after_text_fp
         # Identity conditions intentionally omit volatile instance labels. If
         # the action otherwise looks unverified and leaves us on the same
         # state, use bounded local OCR as a final self-reentry signal.
@@ -429,17 +488,44 @@ def run_page_handler(
         ):
             before_instance_fp = _element_text_fingerprint(state_meta, current, vision)
             after_instance_fp = _element_text_fingerprint(state_meta, post, vision)
-            if before_instance_fp and after_instance_fp and before_instance_fp != after_instance_fp:
+            confirmed_instance_fp = _element_text_fingerprint(state_meta, post, vision) if after_instance_fp else ()
+            if (
+                changed
+                and before_instance_fp
+                and after_instance_fp
+                and before_instance_fp != after_instance_fp
+                and confirmed_instance_fp == after_instance_fp
+            ):
                 before_text_fp = before_instance_fp
                 after_text_fp = after_instance_fp
                 text_progress = True
         known_other = next((item for item in matches if item.success and item.state_id != state_id), None)
         result = "transitioned" if known_other is not None else effect_result
+        effect_progress = _effect_has_observable_change(effect_details)
         if result == "unverified" and still_current and text_progress:
-            # OCR provides the local evidence needed to distinguish a fresh
-            # same-state instance from an ineffective click.
-            result = "confirmed"
-        update_successor_context(cursor, provider, result)
+            reentry_count = _record_text_only_reentry(runtime, state_id)
+            if reentry_count <= MAX_CONSECUTIVE_TEXT_REENTRIES:
+                # OCR provides bounded local evidence for a fresh instance.
+                result = "confirmed"
+            else:
+                text_progress = False
+                failures.append({
+                    "provider_id": provider_id,
+                    "result": "suspect_text_only_reentry",
+                    "count": reentry_count,
+                })
+                _log(
+                    logger,
+                    f"[fsm][handler] text-only reentry limit reached state={state_id} count={reentry_count}",
+                    "page_handler_suspect_reentry",
+                    state_id=state_id,
+                    visit_id=visit_id,
+                    provider_id=provider_id,
+                    count=reentry_count,
+                )
+        elif result in {"confirmed", "transitioned"} and effect_progress:
+            _clear_text_only_reentry(runtime)
+        update_successor_context(cursor, provider, result, effect_details)
         record_provider_result(operation, provider_id, result, visit_id=visit_id)
         promoted_hints: list[str] = []
         if result in {"confirmed", "transitioned"}:
@@ -478,6 +564,7 @@ def run_page_handler(
             logger.event("page_handler_step_result", action_id=action_id, candidates=[summarize_match(item) for item in matches], **episode)
 
         if known_other is not None:
+            _clear_text_only_reentry(runtime)
             nxt = _resolve_transition_after_progress(state_id=state_id, action_id=action_id, matches=matches, graph=graph, runtime=runtime, prefer_reachable_first=prefer_reachable_first, logger=logger, reason_suffix="-reactive-v2")
             if nxt is None:
                 _append_graph_edge(state_id, action_id, known_other.state_id, logger=logger, reason="reactive-v2-observed", confidence="strong")
@@ -485,6 +572,7 @@ def run_page_handler(
                 runtime["last_transition_ok"] = True
             return True, post
         if not still_current:
+            _clear_text_only_reentry(runtime)
             runtime["pending_from_state_id"] = state_id
             runtime["pending_action_id"] = action_id
             return _defer_unknown_transition(runtime=runtime, state_id=state_id, action_id=action_id, logger=logger, frame=post, reason="reactive-v2-unmatched-stable-frame")
@@ -492,7 +580,6 @@ def run_page_handler(
             # A confirmed observable effect with the same matcher is a fresh
             # instance (e.g. repeated cards/dialogs), not a reason to reuse
             # exhausted once-per-visit providers.
-            effect_progress = _effect_has_observable_change(effect_details)
             if text_progress or effect_progress:
                 clear_visit(runtime, visit_id)
                 new_visit = start_new_visit(runtime, state_id, reason="confirmed_self_reentry")

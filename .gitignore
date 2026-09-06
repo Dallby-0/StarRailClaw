@@ -4,6 +4,8 @@ Airtest-master/
 BehaviorTree/
 StateMachineResources/
 StateMachineTasks/
+.venv/
+.pytest-tmp/
 *.pyc
 __pycache__/
 gui_support_for_tests/__pycache__/ocr_test_gui.cpython-311.pyc

@@ -14,7 +14,7 @@ from sr_tools.adb import resolve_target_serial
 from sr_tools.emulator import EmulatorClient
 from state_machine.action_runner import _execute_state_action
 from state_machine.constants import FSM_GRAPH_PATH, UNKNOWN_STABILITY_RETRY_WAIT_S
-from state_machine.disambiguation import _disambiguate_matches, _successful_matches
+from state_machine.disambiguation import _disambiguate_matches, _successful_matches, refine_state_pair
 from state_machine.graph import _append_graph_edge, _append_graph_node
 from state_machine.io import (
     _build_system_prompt_with_experience,
@@ -357,6 +357,21 @@ def run_agent_loop_fsm(
             else:
                 new_state_id, new_state_dir = merged
                 logger.text(f"[fsm] merged_state state_id={new_state_id} dir={new_state_dir}", "state_merged_console", state_id=new_state_id, state_dir=new_state_dir)
+            if force_state_resolution and force_exclude_state_id and new_state_id != force_exclude_state_id:
+                refinement = refine_state_pair(
+                    correct_state_id=new_state_id,
+                    excluded_state_id=force_exclude_state_id,
+                    metas=_iter_state_meta(),
+                    vision=vision,
+                    correct_frame_rgb=frame,
+                    logger=logger,
+                )
+                logger.event(
+                    "forced_resolution_pair_refined",
+                    correct_state_id=new_state_id,
+                    excluded_state_id=force_exclude_state_id,
+                    refinement=refinement,
+                )
             pending_from = runtime.get("pending_from_state_id")
             pending_action = runtime.get("pending_action_id")
             if isinstance(pending_from, str) and pending_from and isinstance(pending_action, str) and pending_action:
@@ -413,6 +428,21 @@ def run_agent_loop_fsm(
             runtime["pending_from_state_id"] = None
             runtime["pending_action_id"] = None
         if force_state_resolution:
+            if best.state_id != force_exclude_state_id:
+                refinement = refine_state_pair(
+                    correct_state_id=best.state_id,
+                    excluded_state_id=force_exclude_state_id,
+                    metas=_iter_state_meta(),
+                    vision=vision,
+                    correct_frame_rgb=frame,
+                    logger=logger,
+                )
+                logger.event(
+                    "forced_resolution_pair_refined",
+                    correct_state_id=best.state_id,
+                    excluded_state_id=force_exclude_state_id,
+                    refinement=refinement,
+                )
             runtime["force_state_resolution"] = False
             runtime["force_exclude_state_id"] = None
         _save_runtime(runtime)

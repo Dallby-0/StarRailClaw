@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +56,56 @@ def _sample_frames(state_dir: Path, meta: dict[str, Any], *, limit: int = 3) -> 
     return frames
 
 
+def _promotable_text_conditions(meta: dict[str, Any]) -> list[dict[str, Any]]:
+    match_conditions = meta.get("match_conditions") if isinstance(meta.get("match_conditions"), list) else []
+    existing_ids = {
+        str(condition.get("id") or "")
+        for condition in match_conditions
+        if isinstance(condition, dict)
+    }
+    out: list[dict[str, Any]] = []
+    for index, element in enumerate(meta.get("elements", []), 1):
+        if not isinstance(element, dict) or element.get("type") != "text_line" or element.get("observable") is False:
+            continue
+        if str(element.get("role") or "") in {"instance", "interaction"}:
+            continue
+        if str(element.get("stability") or "mid") == "low":
+            continue
+        text = str(element.get("text") or "").strip()
+        bbox = element.get("bbox")
+        if not text or not (isinstance(bbox, list) and len(bbox) == 4):
+            continue
+        if any(
+            isinstance(condition, dict)
+            and isinstance(condition.get("source"), dict)
+            and condition["source"].get("kind") == "runtime_pairwise_promotion"
+            and condition["source"].get("element_index") == index - 1
+            for condition in match_conditions
+        ):
+            continue
+        condition_id = f"runtime_text_{index}"
+        suffix = 2
+        while condition_id in existing_ids:
+            condition_id = f"runtime_text_{index}_{suffix}"
+            suffix += 1
+        existing_ids.add(condition_id)
+        out.append({
+            "id": condition_id,
+            "enabled": False,
+            "kind": "text_line_contains",
+            "params": {"text": text, "rect": list(bbox)},
+            "weight": 1.0,
+            "brief": str(element.get("brief") or text),
+            "role": "identity_support",
+            "stability": str(element.get("stability") or "mid"),
+            "discrimination": str(element.get("discrimination") or "mid"),
+            "condition_status": "active",
+            "bbox": list(bbox),
+            "source": {"kind": "runtime_pairwise_promotion", "element_index": index - 1},
+        })
+    return out
+
+
 def _try_exclude_current_from_losers(
     *,
     winner: MatchResult,
@@ -89,6 +140,7 @@ def _try_exclude_current_from_losers(
             and c.get("condition_status", "active") == "active"
             and str(c.get("role") or "") == "identity_support"
         ]
+        disabled.extend(_promotable_text_conditions(loser_meta))
         candidates: list[dict[str, Any]] = []
         for cond in disabled:
             current_ok, _ = _condition_eval(cond, vision, frame_rgb)
@@ -105,16 +157,28 @@ def _try_exclude_current_from_losers(
         # affect a v3 matcher.
         for candidate in sorted(candidates, key=_condition_rank, reverse=True):
             candidate_id = str(candidate.get("id") or "")
-            for clause in clauses:
+            trial_meta = deepcopy(loser_meta)
+            trial_conditions = [
+                condition
+                for condition in trial_meta.get("match_conditions", [])
+                if isinstance(condition, dict)
+            ]
+            if not any(str(condition.get("id") or "") == candidate_id for condition in trial_conditions):
+                trial_conditions.append(deepcopy(candidate))
+            trial_meta["match_conditions"] = trial_conditions
+            trial_clauses = trial_meta.get("match_clauses") if isinstance(trial_meta.get("match_clauses"), list) else []
+            for clause in trial_clauses:
                 if not isinstance(clause, dict) or not isinstance(clause.get("all"), list):
                     continue
                 if candidate_id not in clause["all"]:
                     clause["all"].append(candidate_id)
-            selected = candidate
-            check = _eval_state_match(loser_meta, loser_dir, vision, frame_rgb)
+            check = _eval_state_match(trial_meta, loser_dir, vision, frame_rgb)
             if not check.success:
+                loser_meta.clear()
+                loser_meta.update(trial_meta)
+                selected = candidate
                 break
-        if selected is None or _eval_state_match(loser_meta, loser_dir, vision, frame_rgb).success:
+        if selected is None:
             failures[loser.state_id] = "enabled_candidates_did_not_exclude_current"
             continue
         loser_meta.setdefault("model_info", {})
@@ -152,6 +216,48 @@ def _try_exclude_current_from_losers(
                 failures=failures,
             )
     return strengthened
+
+
+def refine_state_pair(
+    *,
+    correct_state_id: str,
+    excluded_state_id: str,
+    metas: list[tuple[Path, dict[str, Any]]],
+    vision: VisionEngine,
+    correct_frame_rgb,
+    logger: FsmRunLogger | None = None,
+) -> dict[str, dict[str, str]]:
+    """Greedily add one runtime-verified distinguishing condition per direction."""
+    correct_item = _meta_for_state(metas, correct_state_id)
+    excluded_item = _meta_for_state(metas, excluded_state_id)
+    if correct_item is None or excluded_item is None or correct_state_id == excluded_state_id:
+        return {}
+    correct_match = _eval_state_match(correct_item[1], correct_item[0], vision, correct_frame_rgb)
+    excluded_match = _eval_state_match(excluded_item[1], excluded_item[0], vision, correct_frame_rgb)
+    result = {
+        "excluded": _try_exclude_current_from_losers(
+            winner=correct_match,
+            losers=[excluded_match],
+            metas=metas,
+            vision=vision,
+            frame_rgb=correct_frame_rgb,
+            logger=logger,
+        )
+    }
+    excluded_frames = _sample_frames(excluded_item[0], excluded_item[1], limit=1)
+    if excluded_frames:
+        old_frame = excluded_frames[0]
+        old_winner = _eval_state_match(excluded_item[1], excluded_item[0], vision, old_frame)
+        new_loser = _eval_state_match(correct_item[1], correct_item[0], vision, old_frame)
+        result["correct"] = _try_exclude_current_from_losers(
+            winner=old_winner,
+            losers=[new_loser],
+            metas=metas,
+            vision=vision,
+            frame_rgb=old_frame,
+            logger=logger,
+        )
+    return result
 
 
 def _disambiguate_matches(

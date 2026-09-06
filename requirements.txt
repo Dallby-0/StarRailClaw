@@ -1,0 +1,12 @@
+# Core runtime
+numpy
+opencv-python
+requests
+
+# OCR
+onnxruntime
+pponnxcr
+
+# Optional GUI and YOLOE tooling shipped with this repository
+Pillow
+ultralytics

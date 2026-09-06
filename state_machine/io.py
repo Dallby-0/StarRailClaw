@@ -113,6 +113,8 @@ def _ensure_fsm_resources() -> None:
                 "same_external_state_count": 0,
                 "force_state_resolution": False,
                 "force_exclude_state_id": None,
+                "text_only_reentry_state_id": None,
+                "text_only_reentry_count": 0,
                 "intent_runtime": {
                     "active_intent_id": None,
                     "intents": {},

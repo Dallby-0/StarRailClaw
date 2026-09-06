@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from agent.behavior_tree.coord_mapper import CoordinateMapper
-from state_machine.page_handler.runner import run_page_handler
+from state_machine.page_handler.runner import _normalize_fingerprint, run_page_handler
 from state_machine.page_handler.store import handler_from_bootstrap
 
 
@@ -143,7 +143,7 @@ def test_confirmed_same_state_reentry_starts_fresh_visit(tmp_path: Path, monkeyp
             self.condition_results = [{"kind": "text_line_contains", "ocr_lines": [text]}]
 
     emulator = FakeEmulator()
-    calls = iter([Match("页面 A"), Match("页面 B")])
+    calls = iter([Match("页面 A"), Match("页面 B"), Match("页面 B")])
     runtime: dict = {}
     ok, final_frame = run_page_handler(
         emulator=emulator,
@@ -199,3 +199,65 @@ def test_page_handler_rejects_non_reactive_route(tmp_path: Path, monkeypatch) ->
     )
     assert ok is False
     assert emulator.taps == []
+
+
+def test_fingerprint_ignores_ocr_punctuation_noise() -> None:
+    assert _normalize_fingerprint(["事件·", "差分宇宙", "：模拟"]) == ("事件", "差分宇宙", "模拟")
+    assert _normalize_fingerprint(["事件。", "差分宇宙", "模拟"]) == ("事件", "差分宇宙", "模拟")
+
+
+def test_repair_can_force_resolution_of_misidentified_state(tmp_path: Path, monkeypatch) -> None:
+    handler = handler_from_bootstrap([{
+        "operation": "advance",
+        "is_default": True,
+        "providers": [{"provider_id": "click", "locators": [_point(250, 500)]}],
+    }])
+    state_meta = {
+        "state_id": "001",
+        "scene_mode": "ui_2d",
+        "execution": {"kind": "reactive_2d"},
+        "samples": [],
+        "elements": [],
+        "page_handler": handler,
+    }
+    (tmp_path / "state.json").write_text(json.dumps(state_meta), encoding="utf-8")
+    frame = np.zeros((4, 4, 3), dtype=np.uint8)
+    after = np.full((4, 4, 3), 255, dtype=np.uint8)
+    monkeypatch.setattr("state_machine.page_handler.runner._wait_for_screen_stable", lambda *args, **kwargs: after)
+    monkeypatch.setattr("state_machine.page_handler.runner._save_runtime", lambda runtime: None)
+    monkeypatch.setattr("state_machine.page_handler.runner.request_handler_repair", lambda **kwargs: {
+        "decision": "state_misidentified",
+        "confidence": "high",
+        "visible_evidence": ["different title"],
+        "reason": "wrong surface",
+    })
+    def match(text: str):
+        return SimpleNamespace(
+            state_id="001",
+            success=True,
+            condition_results=[{"kind": "text_line_contains", "ocr_lines": [text]}],
+        )
+
+    matches = iter([[match("页面 A")], [match("页面 B")], [match("页面 B")]])
+    runtime: dict = {"text_only_reentry_state_id": "001", "text_only_reentry_count": 2}
+    ok, final_frame = run_page_handler(
+        emulator=FakeEmulator(),
+        mapper=CoordinateMapper(real_w=1280, real_h=720),
+        vision=FakeVision(),
+        state_id="001",
+        state_dir=tmp_path,
+        action_id="operation_main",
+        start_frame=frame,
+        matches_provider=lambda image: next(matches),
+        runtime=runtime,
+        llm=SimpleNamespace(),
+        llm_session_id="test",
+        system_prompt="test",
+        graph={"nodes": [], "edges": []},
+        prefer_reachable_first=False,
+    )
+    assert ok is True
+    assert final_frame is after
+    assert runtime["force_state_resolution"] is True
+    assert runtime["force_exclude_state_id"] == "001"
+    assert runtime["pending_from_state_id"] == "001"

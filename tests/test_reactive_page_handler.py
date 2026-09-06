@@ -26,6 +26,8 @@ from state_machine.page_handler.store import (
     apply_handler_patch,
     ensure_page_handler,
     handler_from_bootstrap,
+    materialize_provider_templates,
+    merge_operation,
     record_provider_result,
 )
 
@@ -114,12 +116,29 @@ def test_successor_is_a_short_bonus_and_unmentioned_provider_is_neutral() -> Non
     assert provider_score(next_provider, cursor, []) == provider_score(neutral, cursor, [])
 
 
-def test_successor_bonus_does_not_override_a_failed_visual_hint() -> None:
+def test_successor_chain_bonus_can_override_one_failed_visual_hint() -> None:
     cursor = cursor_for({}, "001:1", "advance")
     cursor["successor_ids"] = ["next"]
     operation = {"providers": [_provider("next", 0), _provider("neutral", 0)]}
     ranked = rank_providers(operation, cursor, {"next": ["fail"], "neutral": []})
-    assert ranked[0]["provider_id"] == "neutral"
+    assert ranked[0]["provider_id"] == "next"
+
+
+def test_fresh_visit_gives_chain_bonus_to_unreferenced_root_provider() -> None:
+    cursor = cursor_for({}, "001:1", "advance")
+    root = _provider("root", 0, successors=["child"])
+    child = _provider("child", 0)
+    operation = {"providers": [root, child]}
+    ranked = rank_providers(operation, cursor, {"root": ["unknown"], "child": ["pass"]})
+    assert ranked[0]["provider_id"] == "root"
+
+
+def test_successor_bonus_exceeds_stable_visible_unrelated_provider() -> None:
+    cursor = cursor_for({}, "001:1", "advance")
+    cursor["successor_ids"] = ["next"]
+    operation = {"providers": [_provider("next", 0), _provider("visible", 0)]}
+    ranked = rank_providers(operation, cursor, {"next": ["unknown"], "visible": ["pass"]})
+    assert ranked[0]["provider_id"] == "next"
 
 
 def test_successor_context_is_not_set_by_failed_attempt() -> None:
@@ -134,6 +153,17 @@ def test_successor_context_is_not_set_by_failed_attempt() -> None:
     update_successor_context(cursor, provider, "contradicted")
     assert cursor["successor_ids"] == []
     update_successor_context(cursor, provider, "confirmed")
+    assert cursor["successor_ids"] == ["next"]
+
+
+def test_unknown_effect_probe_does_not_block_successor_context() -> None:
+    cursor = cursor_for({}, "001:1", "advance")
+    provider = _provider("first", successors=["next"], effect_hints=[{
+        "id": "effect",
+        "probe": {"id": "missing", "type": "template", "rect": [0, 0, 10, 10], "template_bbox": [0, 0, 5, 5], "coordinate_space": "logical"},
+        "expected": "pass",
+    }])
+    update_successor_context(cursor, provider, "unverified", [{"matched": None}])
     assert cursor["successor_ids"] == ["next"]
 
 
@@ -233,6 +263,39 @@ def test_repair_patch_keeps_local_and_family_candidates_separate() -> None:
     assert providers["old"]["locators"][0]["x"] == 100
 
 
+def test_repair_provider_with_same_click_behavior_reuses_existing_id() -> None:
+    existing = {
+        "operation": "advance",
+        "providers": [_provider("confirm", 10)],
+    }
+    incoming = {
+        "operation": "advance",
+        "providers": [_provider("confirm_second_round", 20)],
+    }
+    merged, touched = merge_operation(existing, incoming)
+    assert [item["provider_id"] for item in merged["providers"]] == ["confirm"]
+    assert touched == {"confirm"}
+
+
+def test_materialize_provider_templates_includes_effect_probes(tmp_path: Path) -> None:
+    provider = _provider("select", effect_hints=[{
+        "id": "selected",
+        "probe": {
+            "id": "selected_probe",
+            "type": "template",
+            "template_bbox": [0, 0, 1, 1],
+            "rect": [0, 0, 2, 2],
+            "coordinate_space": "logical",
+        },
+        "expected": "becomes_pass",
+    }])
+    handler = {"operation_policies": {"advance": {"providers": [provider]}}}
+    materialize_provider_templates(handler, tmp_path, np.zeros((2, 2, 3), dtype=np.uint8), FakeVision(), {"select"})
+    path = Path(provider["effect_hints"][0]["probe"]["template_path"])
+    assert path.name == "reactive_effect_select_1.png"
+    assert path.is_file()
+
+
 def test_family_provider_requires_success_on_two_visits_to_activate() -> None:
     provider = _provider("shared", scope="family", status="canary")
     operation = {"providers": [provider]}
@@ -248,3 +311,12 @@ def test_repair_parser_supports_one_bounded_query_round() -> None:
     }
     repaired = parse_repair_response('{"decision":"repair","local_patch":{"providers":[]},"generalization_candidates":[],"reason":"done"}')
     assert repaired["decision"] == "repair"
+    misidentified = parse_repair_response('{"decision":"state_misidentified","confidence":"high","visible_evidence":["different title"],"reason":"wrong surface"}')
+    assert misidentified == {
+        "decision": "state_misidentified",
+        "confidence": "high",
+        "visible_evidence": ["different title"],
+        "reason": "wrong surface",
+    }
+    unsupported = parse_repair_response('{"decision":"state_misidentified","confidence":"high","visible_evidence":[],"reason":"guess"}')
+    assert unsupported["confidence"] == "low"

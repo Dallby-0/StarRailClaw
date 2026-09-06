@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 from pathlib import Path
 from typing import Any
 
@@ -113,28 +114,54 @@ def _provider_signature(provider: dict[str, Any]) -> tuple[Any, ...]:
     return (str(provider.get("provider_id") or ""),)
 
 
+def _provider_behavior_signature(provider: dict[str, Any]) -> str:
+    locators = provider.get("locators") if isinstance(provider.get("locators"), list) else []
+    point = next((item for item in locators if isinstance(item, dict) and item.get("type") == "point"), None)
+    if point is not None:
+        behavior: Any = {
+            "type": "point",
+            "x": point.get("x"),
+            "y": point.get("y"),
+            "coordinate_space": point.get("coordinate_space"),
+        }
+    else:
+        behavior = [
+            {key: value for key, value in item.items() if key not in {"source", "template_path"}}
+            for item in locators
+            if isinstance(item, dict)
+        ]
+    return json.dumps(behavior, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
 def merge_operation(existing: dict[str, Any] | None, incoming: dict[str, Any]) -> tuple[dict[str, Any], set[str]]:
     if not isinstance(existing, dict):
         return deepcopy(incoming), {str(item.get("provider_id")) for item in incoming.get("providers", []) if isinstance(item, dict)}
     merged = deepcopy(existing)
     providers = merged.get("providers") if isinstance(merged.get("providers"), list) else []
     merged["providers"] = providers
-    by_signature = {_provider_signature(item): item for item in providers if isinstance(item, dict)}
     touched: set[str] = set()
     for provider in incoming.get("providers", []):
         if not isinstance(provider, dict):
             continue
         signature = _provider_signature(provider)
-        previous = by_signature.get(signature)
+        behavior = _provider_behavior_signature(provider)
+        previous = next(
+            (
+                item for item in providers
+                if isinstance(item, dict)
+                and (_provider_signature(item) == signature or _provider_behavior_signature(item) == behavior)
+            ),
+            None,
+        )
         if previous is not None:
             provider = deepcopy(provider)
+            provider["provider_id"] = str(previous.get("provider_id") or provider.get("provider_id") or "")
             provider["success_count"] = int(previous.get("success_count", 0) or 0)
             provider["result_counts"] = dict(previous.get("result_counts") or {})
             provider["successful_visits"] = list(previous.get("successful_visits") or [])
             provider["created_at"] = previous.get("created_at", provider.get("created_at"))
             providers.remove(previous)
         providers.append(deepcopy(provider))
-        by_signature[signature] = providers[-1]
         touched.add(str(provider.get("provider_id") or ""))
     for key in ("intent_scope", "intent_effect", "expected_event", "budgets"):
         if incoming.get(key) is not None:
@@ -234,6 +261,16 @@ def materialize_provider_templates(handler: dict[str, Any], state_dir: Path, fra
                     path = state_dir / f"reactive_hint_{provider['provider_id']}_{index}.png"
                     vision.save_template_from_rect(frame_rgb, bbox, path)
                     hint["template_path"] = str(path)
+            for index, effect in enumerate(provider.get("effect_hints", []), 1):
+                probe = effect.get("probe") if isinstance(effect, dict) else None
+                if not isinstance(probe, dict) or probe.get("type") != "template" or probe.get("template_path"):
+                    continue
+                bbox = probe.get("template_bbox")
+                if not isinstance(bbox, list):
+                    continue
+                path = state_dir / f"reactive_effect_{provider['provider_id']}_{index}.png"
+                vision.save_template_from_rect(frame_rgb, bbox, path)
+                probe["template_path"] = str(path)
 
 
 def append_episode(handler: dict[str, Any], episode: dict[str, Any]) -> None:

@@ -11,14 +11,15 @@ PROVIDER_STATUSES = {"proposed", "canary", "active", "disabled"}
 PROVIDER_SCOPES = {"instance", "family"}
 REPEAT_POLICIES = {"once_per_visit", "after_confirmed_effect"}
 DEFAULT_BUDGETS = {
-    "soft_actions": 6,
-    "hard_actions": 12,
+    "soft_actions": 8,
+    "hard_actions": 16,
     "max_repairs": 2,
     "max_seconds": 180,
     "max_expensive_probes": 2,
 }
 GLOBAL_HARD_ACTIONS = 120
 GLOBAL_HARD_REPAIRS = 20
+CHAIN_BONUS = 72.0
 
 
 def _slug(raw: Any, fallback: str) -> str:
@@ -284,6 +285,8 @@ def reset_run_local_progress(runtime: dict[str, Any]) -> None:
     runtime["reactive_visits"] = {}
     runtime["reactive_total_actions"] = 0
     runtime["reactive_total_repairs"] = 0
+    runtime["text_only_reentry_state_id"] = None
+    runtime["text_only_reentry_count"] = 0
 
 
 def provider_available(provider: dict[str, Any], cursor: dict[str, Any]) -> bool:
@@ -302,7 +305,7 @@ def provider_score(provider: dict[str, Any], cursor: dict[str, Any], hint_result
     score += min(8.0, float(provider.get("success_count", 0) or 0) * 2.0)
     successor_ids = {str(value) for value in cursor.get("successor_ids", [])}
     if str(provider.get("provider_id")) in successor_ids:
-        score += 24.0
+        score += CHAIN_BONUS
     for result in hint_results:
         score += {"pass": 60.0, "unknown": 0.0, "fail": -60.0}.get(result, 0.0)
     return score
@@ -310,10 +313,24 @@ def provider_score(provider: dict[str, Any], cursor: dict[str, Any], hint_result
 
 def rank_providers(operation: dict[str, Any], cursor: dict[str, Any], hint_results: dict[str, list[str]]) -> list[dict[str, Any]]:
     candidates = [item for item in operation.get("providers", []) if isinstance(item, dict) and provider_available(item, cursor)]
+    referenced_ids = {
+        str(successor_id)
+        for item in operation.get("providers", [])
+        if isinstance(item, dict)
+        for successor_id in item.get("successors", [])
+    }
+    fresh_visit = int(cursor.get("total_actions", 0) or 0) == 0 and not cursor.get("attempt_counts")
     return sorted(
         candidates,
         key=lambda item: (
-            -provider_score(item, cursor, hint_results.get(str(item.get("provider_id")), [])),
+            -(
+                provider_score(item, cursor, hint_results.get(str(item.get("provider_id")), []))
+                + (
+                    CHAIN_BONUS
+                    if fresh_visit and str(item.get("provider_id") or "") not in referenced_ids
+                    else 0.0
+                )
+            ),
             str(item.get("provider_id") or ""),
         ),
     )
@@ -340,8 +357,19 @@ def mark_confirmed_effect(cursor: dict[str, Any]) -> None:
     cursor["updated_at"] = _now_iso()
 
 
-def update_successor_context(cursor: dict[str, Any], provider: dict[str, Any], result: str) -> None:
-    usable_unverified = result == "unverified" and not provider.get("effect_hints")
+def update_successor_context(
+    cursor: dict[str, Any],
+    provider: dict[str, Any],
+    result: str,
+    effect_details: list[dict[str, Any]] | None = None,
+) -> None:
+    has_evaluable_effect = any(
+        isinstance(detail, dict) and detail.get("matched") is not None
+        for detail in (effect_details or [])
+    )
+    usable_unverified = result == "unverified" and (
+        not provider.get("effect_hints") or (effect_details is not None and not has_evaluable_effect)
+    )
     if result in {"confirmed", "transitioned"} or usable_unverified:
         cursor["successor_ids"] = [str(value) for value in provider.get("successors", [])]
     else:

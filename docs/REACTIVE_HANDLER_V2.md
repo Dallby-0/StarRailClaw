@@ -42,7 +42,8 @@ operation
 - Locators are ordered fallback methods for finding that action target.
 - Hints are soft visual ranking evidence. `pass > unknown/no hint > fail`.
 - Effect hints are observable post-action hypotheses. They are optional.
-- Successors receive a short-lived bonus after their predecessor runs.
+- Providers not referenced as successors receive a chain bonus on a fresh
+  visit. After an action runs, its successors receive the same bonus.
 - Deferred hints are materialized from the stable frame after their named
   predecessor. They remain provisional until the target provider produces a
   confirmed effect.
@@ -79,7 +80,7 @@ Provider ranking combines:
 
 1. soft visual evidence;
 2. base priority;
-3. a one-step successor bonus;
+3. a chain bonus for fresh-visit roots or the previous action's successors;
 4. activation status and small historical-success bonus;
 5. visit-local attempt suppression.
 
@@ -105,7 +106,8 @@ is deferred to outer state resolution and is not counted as provider success.
 
 ## Repair and generalization
 
-Repair receives:
+Repair first verifies that the current frame still belongs to the believed
+state, then repairs the operation when it does. It receives:
 
 - the current stable full-resolution frame;
 - a contact sheet containing a stored family sample and recent action frames;
@@ -118,6 +120,11 @@ additional query round. It then returns:
 - a local patch for the current instance;
 - zero or more separate family generalization candidates.
 
+A high-confidence `state_misidentified` result returns control to outer state
+resolution with the believed state temporarily excluded. The outer runtime,
+not the repair model, creates a new state when necessary and strengthens the
+old/new matchers using conditions verified against both states' samples.
+
 Equivalent repair patches stop the loop. Family candidates cannot be point-only
 and must resolve using their dynamic locators on both the current frame and a
 stored, visually distinct family sample. Accepted candidates start as `canary`.
@@ -127,8 +134,8 @@ They become `active` only after confirmed success on two distinct visits.
 
 Defaults are intentionally fixed and small:
 
-- repair after 6 actions without a confirmed effect;
-- at most 12 actions per visit;
+- repair after 8 actions without a confirmed effect;
+- at most 16 actions per visit;
 - at most 2 repairs per visit;
 - at most 180 seconds per visit;
 - at most 120 reactive actions and 20 repairs per process run.

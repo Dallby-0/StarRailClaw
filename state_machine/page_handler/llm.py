@@ -42,6 +42,20 @@ def parse_repair_response(text: str) -> dict[str, Any] | None:
     decision = str(payload.get("decision") or "").strip().lower()
     if decision == "give_up":
         return {"decision": decision, "reason": str(payload.get("reason") or "")[:500]}
+    if decision == "state_misidentified":
+        confidence = str(payload.get("confidence") or "low").strip().lower()
+        if confidence not in {"high", "mid", "low"}:
+            confidence = "low"
+        evidence = payload.get("visible_evidence") if isinstance(payload.get("visible_evidence"), list) else []
+        evidence = [str(value)[:300] for value in evidence[:8] if str(value).strip()]
+        if confidence == "high" and not evidence:
+            confidence = "low"
+        return {
+            "decision": decision,
+            "confidence": confidence,
+            "visible_evidence": evidence,
+            "reason": str(payload.get("reason") or "")[:500],
+        }
     if decision == "query":
         queries = payload.get("image_queries") if isinstance(payload.get("image_queries"), list) else []
         cell_ids = [str(item.get("cell_id") or "") for item in queries if isinstance(item, dict) and str(item.get("cell_id") or "")]
@@ -127,20 +141,30 @@ def _repair_context(
     return {
         "mode": "REACTIVE_HANDLER_V2_REPAIR",
         "instruction": (
-            "Repair only the current operation. The first image is the current full-resolution stable frame; "
+            "First decide whether the current frame is still the believed interaction state, then repair only if it is. "
+            "The first image is the current full-resolution stable frame; "
             "the second is a chronological contact sheet described by frame_manifest. "
-            "Return either a bounded image query, give_up, or a repair. A repair should add the smallest local provider set "
+            "Return a bounded image query, state_misidentified, give_up, or a repair. A repair should add the smallest local provider set "
             "that can advance the current instance. When two or more variants reveal a real shared visual invariant, also "
             "propose a separate family-scoped generalization candidate. Never replace a working instance provider and never "
             "generalize by averaging coordinates. Core providers must remain domain-neutral. All persisted points and rectangles "
             "use 1000x1000 logical coordinates. A point locator must explicitly say coordinate_space=logical. "
             "Hints are soft ranking evidence. Effect hints are observable hypotheses, not promises. Deferred hints describe "
-            "features that can only be materialized after a predecessor provider. Do not output safety classifications."
+            "features that can only be materialized after a predecessor provider. If the current frame is clearly a different "
+            "interaction state, return state_misidentified only with high confidence and visible evidence. If uncertain, query "
+            "the stored_family_sample cell before deciding. Do not propose state match conditions or a new state payload here. "
+            "Do not output safety classifications."
         ),
         "state": {
             "state_id": state_meta.get("state_id"),
             "page_family": state_meta.get("page_family"),
             "description": str(state_meta.get("description") or "")[:300],
+            "weak_match": bool((state_meta.get("model_info") or {}).get("weak_match", False)),
+            "active_match_condition_briefs": [
+                str(condition.get("brief") or "")[:160]
+                for condition in state_meta.get("match_conditions", [])
+                if isinstance(condition, dict) and condition.get("enabled", False)
+            ][:8],
         },
         "effective_command": command,
         "handler": handler_summary(handler),
@@ -149,11 +173,13 @@ def _repair_context(
         "frame_manifest": manifest,
         "query_budget": {"max_cells": MAX_QUERY_CELLS, "one_query_round": True},
         "output_schema": {
-            "decision": "query|repair|give_up",
+            "decision": "query|repair|state_misidentified|give_up",
             "image_queries": [{"cell_id": "id from frame_manifest"}],
             "local_patch": {"providers": ["provider objects"]},
             "generalization_candidates": ["provider objects with a visual invariant, or empty"],
             "reason": "short string",
+            "confidence": "high|mid|low; required for state_misidentified",
+            "visible_evidence": ["visible reason current frame differs from believed state"],
             "provider_object": {
                 "provider_id": "stable domain-neutral id",
                 "base_priority": 0,
@@ -225,7 +251,7 @@ def request_handler_repair(
             if not requested:
                 continue
             query_text = json.dumps({
-                "instruction": "These are the requested full-resolution cells. Now return decision=repair or decision=give_up; no more queries.",
+                "instruction": "These are the requested full-resolution cells. Now return decision=repair, state_misidentified, or give_up; no more queries. state_misidentified requires high confidence and visible evidence.",
                 "cells": requested,
             }, ensure_ascii=False)
             query_message = (
