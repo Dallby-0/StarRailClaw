@@ -16,6 +16,7 @@ from state_machine.action_runner import _execute_state_action
 from state_machine.constants import FSM_GRAPH_PATH, UNKNOWN_STABILITY_RETRY_WAIT_S
 from state_machine.disambiguation import _disambiguate_matches, _successful_matches, refine_state_pair
 from state_machine.graph import _append_graph_edge, _append_graph_node
+from state_machine.merge import _try_merge_ambiguous_states
 from state_machine.io import (
     _build_system_prompt_with_experience,
     _ensure_fsm_resources,
@@ -372,6 +373,20 @@ def run_agent_loop_fsm(
                     excluded_state_id=force_exclude_state_id,
                     refinement=refinement,
                 )
+                if force_exclude_state_id not in refinement.get("excluded", {}):
+                    excluded_match = next((item for item in matches if item.state_id == force_exclude_state_id), None)
+                    winner_item = _meta_for_state(_iter_state_meta(), new_state_id)
+                    winner_match = _eval_state_match(winner_item[1], winner_item[0], vision, frame) if winner_item is not None else None
+                    if excluded_match is not None and winner_match is not None:
+                        merged = _try_merge_ambiguous_states(
+                            winner=winner_match,
+                            losers=[excluded_match],
+                            metas=_iter_state_meta(),
+                            vision=vision,
+                            frame_rgb=frame,
+                            logger=logger,
+                        )
+                        logger.event("forced_resolution_merge_fallback", winner_state_id=new_state_id, excluded_state_id=force_exclude_state_id, merged=sorted(merged))
             pending_from = runtime.get("pending_from_state_id")
             pending_action = runtime.get("pending_action_id")
             if isinstance(pending_from, str) and pending_from and isinstance(pending_action, str) and pending_action:
@@ -443,6 +458,18 @@ def run_agent_loop_fsm(
                     excluded_state_id=force_exclude_state_id,
                     refinement=refinement,
                 )
+                if force_exclude_state_id not in refinement.get("excluded", {}):
+                    excluded_match = next((item for item in matches if item.state_id == force_exclude_state_id), None)
+                    if excluded_match is not None:
+                        merged = _try_merge_ambiguous_states(
+                            winner=best,
+                            losers=[excluded_match],
+                            metas=_iter_state_meta(),
+                            vision=vision,
+                            frame_rgb=frame,
+                            logger=logger,
+                        )
+                        logger.event("forced_resolution_merge_fallback", winner_state_id=best.state_id, excluded_state_id=force_exclude_state_id, merged=sorted(merged))
             runtime["force_state_resolution"] = False
             runtime["force_exclude_state_id"] = None
         _save_runtime(runtime)

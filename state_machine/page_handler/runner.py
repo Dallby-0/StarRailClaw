@@ -499,7 +499,14 @@ def run_page_handler(
                 before_text_fp = before_instance_fp
                 after_text_fp = after_instance_fp
                 text_progress = True
-        known_other = next((item for item in matches if item.success and item.state_id != state_id), None)
+        # A second successful matcher is ambiguity, not evidence of a
+        # transition.  The current state must first stop matching; otherwise
+        # an ineffective click can be recorded as a successful transition and
+        # poison the graph with alternating self/other edges.
+        known_other = next(
+            (item for item in matches if item.success and item.state_id != state_id),
+            None,
+        ) if not still_current else None
         result = "transitioned" if known_other is not None else effect_result
         effect_progress = _effect_has_observable_change(effect_details)
         if result == "unverified" and still_current and text_progress:

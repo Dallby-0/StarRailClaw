@@ -92,7 +92,12 @@ def _try_merge_ambiguous_states(
         winner_type = _normalize_page_type(winner_meta.get("page_family") or _state_page_type(winner_meta))
         loser_type = _normalize_page_type(loser_meta.get("page_family") or _state_page_type(loser_meta))
         reason = ""
-        if not winner_type or winner_type != loser_type:
+        same_reactive_surface = (
+            execution_key(winner_meta)[0] == "reactive_2d"
+            and execution_key(loser_meta)[0] == "reactive_2d"
+            and str(winner_meta.get("scene_mode") or "") == str(loser_meta.get("scene_mode") or "")
+        )
+        if not winner_type or (winner_type != loser_type and not same_reactive_surface):
             reason = "different_or_missing_page_family"
         if not reason and execution_key(winner_meta) != execution_key(loser_meta):
             reason = "different_execution_route"
@@ -152,7 +157,29 @@ def _try_merge_ambiguous_states(
         winner_meta.setdefault("model_info", {})
         if isinstance(winner_meta["model_info"], dict):
             winner_meta["model_info"]["weak_match"] = weak_match
-            winner_meta["model_info"].setdefault("merged_state_ids", []).append(loser.state_id)
+        merged_ids: list[str] = []
+        merged_names: list[str] = []
+        for source_meta, source_id in ((winner_meta, winner.state_id), (loser_meta, loser.state_id)):
+            source_history = source_meta.get("merge_history") if isinstance(source_meta.get("merge_history"), dict) else {}
+            for value in source_history.get("state_ids", []):
+                value = str(value or "")
+                if value and value not in merged_ids:
+                    merged_ids.append(value)
+            for value in source_history.get("state_names", []):
+                value = str(value or "")
+                if value and value not in merged_names:
+                    merged_names.append(value)
+            if source_id and source_id not in merged_ids:
+                merged_ids.append(source_id)
+            source_name = str(source_meta.get("slug") or source_meta.get("display_name") or source_id)
+            if source_name and source_name not in merged_names:
+                merged_names.append(source_name)
+        winner_meta["merge_history"] = {
+            "state_ids": merged_ids,
+            "state_names": merged_names,
+            "reason": "indistinguishable_reactive_surface",
+            "updated_at": _now_iso(),
+        }
         winner_meta["updated_at"] = _now_iso()
         _save_json(winner_dir / "state.json", winner_meta)
 

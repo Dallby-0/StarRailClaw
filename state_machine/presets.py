@@ -177,9 +177,11 @@ def _run_find_and_interact_with_next_object(
                 print(f"[preset][find_and_interact_with_next_object] state_changed before_action from={state_id}, treat as done")
                 return True
             emulator.swipe(mx, my, mx, my, duration_ms=800)
-            time.sleep(1)
+            time.sleep(0.5)
             emulator.tap(ix, iy)
-            time.sleep(1)
+            time.sleep(0.5)
+            emulator.tap(ax, ay)
+            time.sleep(0.5)
             print(f"[preset][find_and_interact_with_next_object] action_step={step_idx + 1}/10 move=({mx},{my}) interact=({ix},{iy})")
 
         print("[preset][find_and_interact_with_next_object] idle=5s")

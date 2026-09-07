@@ -227,14 +227,14 @@ def refine_state_pair(
     correct_frame_rgb,
     logger: FsmRunLogger | None = None,
 ) -> dict[str, dict[str, str]]:
-    """Greedily add one runtime-verified distinguishing condition per direction."""
+    """Greedily add one runtime-verified condition to exclude the wrong state."""
     correct_item = _meta_for_state(metas, correct_state_id)
     excluded_item = _meta_for_state(metas, excluded_state_id)
     if correct_item is None or excluded_item is None or correct_state_id == excluded_state_id:
         return {}
     correct_match = _eval_state_match(correct_item[1], correct_item[0], vision, correct_frame_rgb)
     excluded_match = _eval_state_match(excluded_item[1], excluded_item[0], vision, correct_frame_rgb)
-    result = {
+    return {
         "excluded": _try_exclude_current_from_losers(
             winner=correct_match,
             losers=[excluded_match],
@@ -244,20 +244,6 @@ def refine_state_pair(
             logger=logger,
         )
     }
-    excluded_frames = _sample_frames(excluded_item[0], excluded_item[1], limit=1)
-    if excluded_frames:
-        old_frame = excluded_frames[0]
-        old_winner = _eval_state_match(excluded_item[1], excluded_item[0], vision, old_frame)
-        new_loser = _eval_state_match(correct_item[1], correct_item[0], vision, old_frame)
-        result["correct"] = _try_exclude_current_from_losers(
-            winner=old_winner,
-            losers=[new_loser],
-            metas=metas,
-            vision=vision,
-            frame_rgb=old_frame,
-            logger=logger,
-        )
-    return result
 
 
 def _disambiguate_matches(

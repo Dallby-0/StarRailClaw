@@ -123,7 +123,8 @@ additional query round. It then returns:
 A high-confidence `state_misidentified` result returns control to outer state
 resolution with the believed state temporarily excluded. The outer runtime,
 not the repair model, creates a new state when necessary and strengthens the
-old/new matchers using conditions verified against both states' samples.
+excluded state's matcher with conditions verified against its positive samples
+and the current screen. The newly selected state is left unchanged.
 
 Equivalent repair patches stop the loop. Family candidates cannot be point-only
 and must resolve using their dynamic locators on both the current frame and a
