@@ -28,6 +28,7 @@ from state_machine.page_handler.reactive import (
     GLOBAL_HARD_ACTIONS,
     GLOBAL_HARD_REPAIRS,
     cursor_for,
+    effective_repair_limit,
     mark_confirmed_effect,
     normalized_patch_hash,
     normalize_budgets,
@@ -280,6 +281,7 @@ def _repair(
     )
     if response is None:
         return operation, "invalid_response"
+    cursor["progress_assessment"] = str(response.get("progress_assessment") or "unknown")
     if response.get("decision") == "give_up":
         return operation, "give_up"
     if response.get("decision") == "state_misidentified":
@@ -379,8 +381,9 @@ def run_page_handler(
             ranked = rank_providers(operation, cursor, hint_results)
         needs_repair = not ranked or int(cursor.get("actions_since_repair", 0) or 0) >= budgets["soft_actions"]
         if needs_repair:
-            if int(cursor.get("repair_count", 0) or 0) >= budgets["max_repairs"]:
-                _log(logger, "[fsm][handler] repair budget exhausted", "page_handler_no_strategy", state_id=state_id, visit_id=visit_id, operation=command.operation, failed_attempts=failures[-12:])
+            repair_limit = effective_repair_limit(cursor, budgets["max_repairs"])
+            if int(cursor.get("repair_count", 0) or 0) >= repair_limit:
+                _log(logger, "[fsm][handler] repair budget exhausted", "page_handler_no_strategy", state_id=state_id, visit_id=visit_id, operation=command.operation, repair_limit=repair_limit, progress_assessment=cursor.get("progress_assessment"), failed_attempts=failures[-12:])
                 return False, current
             cursor["repair_count"] = int(cursor.get("repair_count", 0) or 0) + 1
             runtime["reactive_total_repairs"] = int(runtime.get("reactive_total_repairs", 0) or 0) + 1
@@ -536,10 +539,10 @@ def run_page_handler(
         record_provider_result(operation, provider_id, result, visit_id=visit_id)
         promoted_hints: list[str] = []
         if result in {"confirmed", "transitioned"}:
-            had_repair = int(cursor.get("repair_count", 0) or 0) > 0
+            cleared_repairs = int(cursor.get("repair_count", 0) or 0)
             mark_confirmed_effect(cursor)
-            if had_repair:
-                runtime["reactive_total_repairs"] = max(0, int(runtime.get("reactive_total_repairs", 0) or 0) - 1)
+            if cleared_repairs:
+                runtime["reactive_total_repairs"] = max(0, int(runtime.get("reactive_total_repairs", 0) or 0) - cleared_repairs)
             promoted_hints = promote_materialized_hints(provider, cursor)
             event = provider.get("emits_on_success") if isinstance(provider.get("emits_on_success"), dict) else None
             if not event and not provider.get("successors") and command.expected_event:

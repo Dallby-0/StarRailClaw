@@ -25,6 +25,19 @@ from state_machine.page_handler.store import handler_summary
 MAX_QUERY_CELLS = 2
 
 
+def _progress_assessment(payload: dict[str, Any]) -> str:
+    value = str(payload.get("progress_assessment") or "unknown").strip().lower()
+    return value if value in {"progressing", "stalled", "unknown"} else "unknown"
+
+
+def _with_progress_assessment(result: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    # Older responses remain parse-compatible; callers treat a missing
+    # assessment as unknown and retain the conservative budget.
+    if "progress_assessment" in payload:
+        result["progress_assessment"] = _progress_assessment(payload)
+    return result
+
+
 def _log(logger: FsmRunLogger | None, message: str, event: str = "console", **fields: Any) -> None:
     if logger is None:
         print(message)
@@ -41,7 +54,7 @@ def parse_repair_response(text: str) -> dict[str, Any] | None:
         return None
     decision = str(payload.get("decision") or "").strip().lower()
     if decision == "give_up":
-        return {"decision": decision, "reason": str(payload.get("reason") or "")[:500]}
+        return _with_progress_assessment({"decision": decision, "reason": str(payload.get("reason") or "")[:500]}, payload)
     if decision == "state_misidentified":
         confidence = str(payload.get("confidence") or "low").strip().lower()
         if confidence not in {"high", "mid", "low"}:
@@ -50,18 +63,18 @@ def parse_repair_response(text: str) -> dict[str, Any] | None:
         evidence = [str(value)[:300] for value in evidence[:8] if str(value).strip()]
         if confidence == "high" and not evidence:
             confidence = "low"
-        return {
+        return _with_progress_assessment({
             "decision": decision,
             "confidence": confidence,
             "visible_evidence": evidence,
             "reason": str(payload.get("reason") or "")[:500],
-        }
+        }, payload)
     if decision == "query":
         queries = payload.get("image_queries") if isinstance(payload.get("image_queries"), list) else []
         cell_ids = [str(item.get("cell_id") or "") for item in queries if isinstance(item, dict) and str(item.get("cell_id") or "")]
         if not cell_ids:
             return None
-        return {"decision": decision, "image_queries": cell_ids[:MAX_QUERY_CELLS], "reason": str(payload.get("reason") or "")[:500]}
+        return _with_progress_assessment({"decision": decision, "image_queries": cell_ids[:MAX_QUERY_CELLS], "reason": str(payload.get("reason") or "")[:500]}, payload)
     if decision != "repair" or not isinstance(payload.get("local_patch"), dict):
         return None
     local_patch = payload["local_patch"]
@@ -70,12 +83,12 @@ def parse_repair_response(text: str) -> dict[str, Any] | None:
     candidates = payload.get("generalization_candidates")
     if candidates is not None and not isinstance(candidates, list):
         return None
-    return {
+    return _with_progress_assessment({
         "decision": decision,
         "local_patch": {"providers": local_patch["providers"]},
         "generalization_candidates": candidates or [],
         "reason": str(payload.get("reason") or "")[:500],
-    }
+    }, payload)
 
 
 def _make_contact_sheet(history: list[dict[str, Any]]) -> tuple[np.ndarray, list[dict[str, Any]], dict[str, Any]]:
@@ -141,7 +154,10 @@ def _repair_context(
     return {
         "mode": "REACTIVE_HANDLER_V2_REPAIR",
         "instruction": (
-            "First decide whether the current frame is still the believed interaction state, then repair only if it is. "
+            "First decide whether the previous operations are normally advancing a multi-step interaction or are stalled, "
+            "and return progress_assessment=progressing|stalled|unknown on every decision. progressing means the chronological "
+            "frames and operation records show meaningful forward changes even though the requested operation is not complete. "
+            "Then decide whether the current frame is still the believed interaction state, and repair only if it is. "
             "The first image is the current full-resolution stable frame; "
             "the second is a chronological contact sheet described by frame_manifest. "
             "Return a bounded image query, state_misidentified, give_up, or a repair. A repair should add the smallest local provider set "
@@ -174,6 +190,7 @@ def _repair_context(
         "query_budget": {"max_cells": MAX_QUERY_CELLS, "one_query_round": True},
         "output_schema": {
             "decision": "query|repair|state_misidentified|give_up",
+            "progress_assessment": "progressing|stalled|unknown; required on every decision",
             "image_queries": [{"cell_id": "id from frame_manifest"}],
             "local_patch": {"providers": ["provider objects"]},
             "generalization_candidates": ["provider objects with a visual invariant, or empty"],
@@ -251,7 +268,7 @@ def request_handler_repair(
             if not requested:
                 continue
             query_text = json.dumps({
-                "instruction": "These are the requested full-resolution cells. Now return decision=repair, state_misidentified, or give_up; no more queries. state_misidentified requires high confidence and visible evidence.",
+                "instruction": "These are the requested full-resolution cells. Now return decision=repair, state_misidentified, or give_up; no more queries. Include progress_assessment=progressing|stalled|unknown. state_misidentified requires high confidence and visible evidence.",
                 "cells": requested,
             }, ensure_ascii=False)
             query_message = (

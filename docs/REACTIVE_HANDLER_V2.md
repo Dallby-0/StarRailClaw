@@ -137,7 +137,9 @@ Defaults are intentionally fixed and small:
 
 - repair after 8 actions without a confirmed effect;
 - at most 16 actions per visit;
-- at most 2 repairs per visit;
+- at most 2 repairs per visit while stalled or uncertain; when the repair model
+  confirms that a multi-step interaction is progressing, up to 8 repairs per
+  visit are allowed within the existing action, time, and process hard limits;
 - at most 180 seconds per visit;
 - at most 120 reactive actions and 20 repairs per process run.
 

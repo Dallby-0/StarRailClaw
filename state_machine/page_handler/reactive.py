@@ -19,6 +19,7 @@ DEFAULT_BUDGETS = {
 }
 GLOBAL_HARD_ACTIONS = 120
 GLOBAL_HARD_REPAIRS = 20
+PROGRESSING_MAX_REPAIRS = 8
 CHAIN_BONUS = 72.0
 
 
@@ -258,6 +259,12 @@ def initial_cursor(*, visit_id: str, operation: str, now_monotonic: float = 0.0)
         "history": [],
         "updated_at": _now_iso(),
     }
+
+
+def effective_repair_limit(cursor: dict[str, Any], configured_limit: int) -> int:
+    if str(cursor.get("progress_assessment") or "") == "progressing":
+        return max(int(configured_limit), PROGRESSING_MAX_REPAIRS)
+    return int(configured_limit)
 
 
 def cursor_for(runtime: dict[str, Any], visit_id: str, operation: str, *, now_monotonic: float = 0.0) -> dict[str, Any]:
