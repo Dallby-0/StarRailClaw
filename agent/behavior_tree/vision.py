@@ -73,6 +73,34 @@ class VisionEngine:
         cy = oy + max_loc[1] + tpl.shape[0] // 2
         return True, (cx, cy), max_val
 
+    def match_appearance_template(
+        self,
+        frame_rgb: np.ndarray,
+        template_path: Path,
+        rect: list[int] | None,
+        threshold: float = 0.88,
+    ) -> tuple[bool, tuple[int, int] | None, float]:
+        """Match a learned UI state using both structure and color."""
+        if not template_path.is_file():
+            return False, None, 0.0
+        crop = self.crop_rect(frame_rgb, rect)
+        tpl_bgr = cv2.imread(str(template_path), cv2.IMREAD_COLOR)
+        if tpl_bgr is None:
+            return False, None, 0.0
+        tpl = cv2.cvtColor(tpl_bgr, cv2.COLOR_BGR2RGB)
+        if crop.shape[0] < tpl.shape[0] or crop.shape[1] < tpl.shape[1]:
+            return False, None, 0.0
+        result = sr_vision.match_template_luma_color_fused(crop, tpl, color_weight=0.5)
+        similarity = float(result.similarity)
+        if similarity < threshold:
+            return False, None, similarity
+        ox, oy = 0, 0
+        if rect is not None:
+            ox, oy, _, _ = self.mapper.rect_to_real(rect)
+        height, width = tpl.shape[:2]
+        point = (ox + result.top_left[0] + width // 2, oy + result.top_left[1] + height // 2)
+        return True, point, similarity
+
     def ocr(self, frame_rgb: np.ndarray, rect: list[int] | None, white_text: bool = False) -> list[dict[str, Any]]:
         real_rect = self._real_area(frame_rgb, rect)
         if self.log_ocr_calls and not self._ocr_backend_logged:

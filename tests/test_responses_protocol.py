@@ -70,8 +70,10 @@ def test_state_bootstrap_schema_is_closed_and_bounded() -> None:
     assert provider["additionalProperties"] is False
     point = provider["properties"]["locators"]["items"]["anyOf"][0]
     assert point["properties"]["coordinate_space"]["enum"] == ["logical"]
-    assert "effect_hints" in provider["properties"]
-    assert "deferred_hints" in provider["properties"]
+    assert "effects" in provider["properties"]
+    assert "guards" in provider["properties"]
+    assert "watches" in provider["properties"]
+    assert "deferred_hints" not in provider["properties"]
     assert all(
         variant["properties"]["type"]["enum"] != ["run_preset"]
         for variant in provider["properties"]["locators"]["items"]["anyOf"]

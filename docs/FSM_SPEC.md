@@ -1,6 +1,6 @@
 # FSM Spec
 
-> 注意：本文的 action、preset 和 page-handler 章节描述已删除的旧实现，不再是运行时契约。当前状态使用顶层 `execution` 在注册工具与仅支持 2D 的 `reactive_handler.v2` 之间分发；权威规范见 `REACTIVE_HANDLER_V2.md`。旧状态文件不会迁移。
+> 注意：本文的 action、preset 和 page-handler 章节描述已删除的旧实现，不再是运行时契约。当前状态使用顶层 `execution` 在注册工具与仅支持 2D 的 `reactive_handler.v3.1` 之间分发；权威规范见 `REACTIVE_HANDLER_V3.md`。旧状态文件不会迁移。
 
 本文档描述当前 `state_machine/` 实现所支持的 FSM 运行时规范。范围只包含状态机核心：资源文件、状态模型、匹配、动作、状态图、状态学习、合并、修复、同页局部流、预置动作和日志。GUI、具体 LLM client、ADB/模拟器底层实现不在本文档范围内。
 

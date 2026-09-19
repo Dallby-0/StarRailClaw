@@ -9,7 +9,7 @@ from state_machine.page_handler.reactive import normalize_operation, normalize_p
 from state_machine.time_utils import now_iso as _now_iso
 
 
-HANDLER_SCHEMA_VERSION = "reactive_handler.v2"
+HANDLER_SCHEMA_VERSION = "reactive_handler.v3.1"
 TRACE_LIMIT = 40
 
 
@@ -55,11 +55,11 @@ def ensure_page_handler(meta: dict[str, Any]) -> dict[str, Any]:
     if version != HANDLER_SCHEMA_VERSION:
         raise ValueError(
             f"unsupported page handler schema {version or '<missing>'!r}; "
-            "create a fresh state workspace for reactive_handler.v2"
+            "create a fresh state workspace for reactive_handler.v3.1"
         )
     policies = raw.get("operation_policies")
     if not isinstance(policies, dict):
-        raise ValueError("reactive_handler.v2 operation_policies must be an object")
+        raise ValueError("reactive_handler.v3.1 operation_policies must be an object")
     normalized: dict[str, dict[str, Any]] = {}
     for index, (name, policy) in enumerate(policies.items(), 1):
         operation = normalize_operation(policy, index=index)
@@ -133,6 +133,76 @@ def _provider_behavior_signature(provider: dict[str, Any]) -> str:
     return json.dumps(behavior, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _click_region(provider: dict[str, Any]) -> list[int] | None:
+    locator = next((item for item in provider.get("locators", []) if isinstance(item, dict) and item.get("type") == "click_region"), None)
+    return locator.get("rect") if isinstance(locator, dict) and isinstance(locator.get("rect"), list) else None
+
+
+def _region_overlap(left: list[int], right: list[int]) -> float:
+    x1, y1 = max(left[0], right[0]), max(left[1], right[1])
+    x2, y2 = min(left[2], right[2]), min(left[3], right[3])
+    intersection = max(0, x2 - x1) * max(0, y2 - y1)
+    smaller = min((left[2] - left[0]) * (left[3] - left[1]), (right[2] - right[0]) * (right[3] - right[1]))
+    return float(intersection) / float(max(1, smaller))
+
+
+def _semantic_mergeable(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    if str(left.get("operation_key") or "") != str(right.get("operation_key") or ""):
+        return False
+    left_rect, right_rect = _click_region(left), _click_region(right)
+    if left_rect is None or right_rect is None or _region_overlap(left_rect, right_rect) < 0.8:
+        return False
+    for key in ("successors", "effects"):
+        a, b = left.get(key) or [], right.get(key) or []
+        if a and b and a != b:
+            return False
+    return True
+
+
+def _merge_semantic_provider(previous: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    merged = deepcopy(incoming)
+    merged["provider_id"] = str(previous.get("provider_id") or incoming.get("provider_id") or "")
+    merged["base_priority"] = max(int(previous.get("base_priority", 0) or 0), int(incoming.get("base_priority", 0) or 0))
+    status_rank = {"disabled": -1, "proposed": 0, "canary": 1, "active": 2}
+    merged["status"] = max((str(previous.get("status") or "proposed"), str(incoming.get("status") or "proposed")), key=lambda value: status_rank.get(value, -1))
+    merged["success_count"] = int(previous.get("success_count", 0) or 0)
+    merged["result_counts"] = dict(previous.get("result_counts") or {})
+    merged["successful_visits"] = list(previous.get("successful_visits") or [])
+    merged["created_at"] = previous.get("created_at", incoming.get("created_at"))
+    for key in ("watches", "effects", "successors"):
+        if not merged.get(key):
+            merged[key] = deepcopy(previous.get(key) or [])
+    locators = [deepcopy(item) for item in previous.get("locators", [])]
+    for locator in incoming.get("locators", []):
+        if locator.get("type") != "click_region":
+            if locator not in locators:
+                locators.append(deepcopy(locator))
+            continue
+        existing = next((item for item in locators if item.get("type") == "click_region"), None)
+        if existing is None:
+            locators.append(deepcopy(locator))
+            continue
+        known = {tuple(item.get("point", [])) for item in existing.get("candidate_points", [])}
+        for candidate in locator.get("candidate_points", []):
+            if tuple(candidate.get("point", [])) not in known:
+                existing.setdefault("candidate_points", []).append(deepcopy(candidate))
+        existing["candidate_points"] = existing.get("candidate_points", [])[:4]
+    merged["locators"] = locators[:4]
+    group = f"{merged.get('operation_key')}_variants"
+    guards: list[dict[str, Any]] = []
+    known_guards: set[str] = set()
+    for guard in list(previous.get("guards", [])) + list(incoming.get("guards", [])):
+        signature = json.dumps({key: value for key, value in guard.items() if key not in {"id", "status", "evidence", "group"}}, ensure_ascii=False, sort_keys=True)
+        if signature in known_guards:
+            continue
+        item = deepcopy(guard)
+        item["group"] = group
+        guards.append(item)
+        known_guards.add(signature)
+    merged["guards"] = guards[:6]
+    return merged
+
+
 def merge_operation(existing: dict[str, Any] | None, incoming: dict[str, Any]) -> tuple[dict[str, Any], set[str]]:
     if not isinstance(existing, dict):
         return deepcopy(incoming), {str(item.get("provider_id")) for item in incoming.get("providers", []) if isinstance(item, dict)}
@@ -140,32 +210,37 @@ def merge_operation(existing: dict[str, Any] | None, incoming: dict[str, Any]) -
     providers = merged.get("providers") if isinstance(merged.get("providers"), list) else []
     merged["providers"] = providers
     touched: set[str] = set()
+    provider_id_map: dict[str, str] = {}
     for provider in incoming.get("providers", []):
         if not isinstance(provider, dict):
             continue
+        incoming_id = str(provider.get("provider_id") or "")
         signature = _provider_signature(provider)
-        behavior = _provider_behavior_signature(provider)
         previous = next(
             (
                 item for item in providers
                 if isinstance(item, dict)
-                and (_provider_signature(item) == signature or _provider_behavior_signature(item) == behavior)
+                and (_provider_signature(item) == signature or _semantic_mergeable(item, provider))
             ),
             None,
         )
         if previous is not None:
-            provider = deepcopy(provider)
-            provider["provider_id"] = str(previous.get("provider_id") or provider.get("provider_id") or "")
-            provider["success_count"] = int(previous.get("success_count", 0) or 0)
-            provider["result_counts"] = dict(previous.get("result_counts") or {})
-            provider["successful_visits"] = list(previous.get("successful_visits") or [])
-            provider["created_at"] = previous.get("created_at", provider.get("created_at"))
+            semantic_merge = _provider_signature(previous) != signature
+            if semantic_merge:
+                archive = merged.setdefault("provider_archive", [])
+                archive.append({"reason": "semantic_region_merge", "merged_into": previous.get("provider_id"), "provider": deepcopy(provider)})
+                del archive[:-8]
+            provider = _merge_semantic_provider(previous, provider)
             providers.remove(previous)
         providers.append(deepcopy(provider))
-        touched.add(str(provider.get("provider_id") or ""))
+        merged_id = str(provider.get("provider_id") or "")
+        provider_id_map[incoming_id] = merged_id
+        touched.add(merged_id)
     for key in ("intent_scope", "intent_effect", "expected_event", "budgets"):
         if incoming.get(key) is not None:
             merged[key] = deepcopy(incoming[key])
+    if isinstance(incoming.get("entry_providers"), list):
+        merged["entry_providers"] = [provider_id_map.get(str(value), str(value)) for value in incoming["entry_providers"]]
     return merged, touched
 
 
@@ -251,17 +326,17 @@ def materialize_provider_templates(handler: dict[str, Any], state_dir: Path, fra
                 path = state_dir / f"reactive_locator_{provider['provider_id']}_{index}.png"
                 vision.save_template_from_rect(frame_rgb, bbox, path)
                 locator["template_path"] = str(path)
-            for collection in ("hints", "deferred_hints"):
-                for index, hint in enumerate(provider.get(collection, []), 1):
-                    if not isinstance(hint, dict) or hint.get("type") != "template" or hint.get("template_path"):
+            for collection in ("guards",):
+                for index, guard in enumerate(provider.get(collection, []), 1):
+                    if not isinstance(guard, dict) or guard.get("type") != "template" or guard.get("template_path"):
                         continue
-                    bbox = hint.get("template_bbox")
-                    if not isinstance(bbox, list) or collection == "deferred_hints":
+                    bbox = guard.get("template_bbox")
+                    if not isinstance(bbox, list):
                         continue
                     path = state_dir / f"reactive_hint_{provider['provider_id']}_{index}.png"
                     vision.save_template_from_rect(frame_rgb, bbox, path)
-                    hint["template_path"] = str(path)
-            for index, effect in enumerate(provider.get("effect_hints", []), 1):
+                    guard["template_path"] = str(path)
+            for index, effect in enumerate(provider.get("effects", []), 1):
                 probe = effect.get("probe") if isinstance(effect, dict) else None
                 if not isinstance(probe, dict) or probe.get("type") != "template" or probe.get("template_path"):
                     continue
@@ -291,7 +366,7 @@ def record_provider_result(operation: dict[str, Any], provider_id: str, result: 
     counts = provider.get("result_counts") if isinstance(provider.get("result_counts"), dict) else {}
     provider["result_counts"] = counts
     counts[result] = int(counts.get(result, 0) or 0) + 1
-    if result in {"confirmed", "transitioned"}:
+    if result in {"confirmed", "transitioned", "confirmed_by_successor"}:
         visits = provider.get("successful_visits") if isinstance(provider.get("successful_visits"), list) else []
         provider["successful_visits"] = visits
         if visit_id not in visits:
@@ -314,6 +389,7 @@ def handler_summary(handler: dict[str, Any], *, limit_trace: int = 8) -> dict[st
             "intent_scope": policy.get("intent_scope"),
             "intent_effect": policy.get("intent_effect"),
             "budgets": policy.get("budgets"),
+            "entry_providers": policy.get("entry_providers", []),
             "providers": [
                 {
                     "provider_id": item.get("provider_id"),
@@ -321,14 +397,15 @@ def handler_summary(handler: dict[str, Any], *, limit_trace: int = 8) -> dict[st
                     "status": item.get("status"),
                     "base_priority": item.get("base_priority"),
                     "locators": item.get("locators", []),
-                    "hints": item.get("hints", []),
-                    "deferred_hints": item.get("deferred_hints", []),
-                    "effect_hints": item.get("effect_hints", []),
+                    "guards": item.get("guards", []),
+                    "watches": item.get("watches", []),
+                    "effects": item.get("effects", []),
                     "successors": item.get("successors", []),
                     "result_counts": item.get("result_counts", {}),
                 }
                 for item in policy.get("providers", []) if isinstance(item, dict)
             ],
+            "provider_archive": policy.get("provider_archive", [])[-8:],
         }
     trace = handler.get("episode_trace") if isinstance(handler.get("episode_trace"), list) else []
     return {

@@ -23,44 +23,58 @@ def _probe_key(probe: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def evaluate_hint(
-    hint: dict[str, Any],
+def evaluate_guard(
+    guard: dict[str, Any],
     frame_rgb,
     vision: VisionEngine,
     cache: dict[str, dict[str, Any]],
     *,
     allow_expensive: bool,
 ) -> dict[str, Any]:
-    key = _probe_key(hint)
+    key = _probe_key(guard)
     if key in cache:
         return cache[key]
-    kind = str(hint.get("type") or "")
+    kind = str(guard.get("type") or "")
     if kind == "text" and not allow_expensive:
         return {"result": "unknown", "reason": "expensive_probe_deferred"}
     try:
         if kind == "template":
-            path = Path(str(hint.get("template_path") or ""))
+            path = Path(str(guard.get("template_path") or ""))
             if not path.is_file():
                 result = {"result": "unknown", "reason": "template_not_materialized"}
             else:
-                ok, point, similarity = vision.match_template(
+                matcher = (
+                    getattr(vision, "match_appearance_template", vision.match_template)
+                    if guard.get("learned_from_watch")
+                    else vision.match_template
+                )
+                ok, point, similarity = matcher(
                     frame_rgb,
                     path,
-                    hint.get("rect") if isinstance(hint.get("rect"), list) else None,
-                    threshold=float(hint.get("threshold", 0.82)),
+                    guard.get("rect") if isinstance(guard.get("rect"), list) else None,
+                    threshold=float(guard.get("threshold", 0.82)),
                 )
                 result = {"result": "pass" if ok else "fail", "point": point, "similarity": similarity}
         elif kind == "line_count":
-            detected = vision.detect_text_lines(frame_rgb, hint.get("rect"))
+            detected = vision.detect_text_lines(frame_rgb, guard.get("rect"))
             if not detected.get("available"):
                 result = {"result": "unknown", "reason": "detector_unavailable"}
             else:
                 count = int(detected.get("line_count", 0) or 0)
-                passed = int(hint.get("min", 0) or 0) <= count <= int(hint.get("max", 0) or 0)
-                result = {"result": "pass" if passed else "fail", "line_count": count}
+                target = int(guard.get("target", 1) or 1)
+                tolerance = max(0, int(guard.get("tolerance", 1) or 0))
+                distance = abs(count - target)
+                if count <= 0:
+                    result = {"result": "fail", "strength": 1.0, "line_count": count}
+                elif distance == 0:
+                    result = {"result": "pass", "strength": 1.0, "line_count": count}
+                elif distance <= tolerance:
+                    result = {"result": "pass", "strength": 0.7, "line_count": count}
+                else:
+                    result = {"result": "pass", "strength": 0.25, "line_count": count}
         elif kind == "text":
-            entries = vision.ocr_blocks(frame_rgb, hint.get("rect"), white_text=False)
-            needles = [str(value) for value in hint.get("texts", [])]
+            entries = vision.ocr_blocks(frame_rgb, guard.get("rect"), white_text=False)
+            needles = [str(value) for value in guard.get("texts", [])]
             matched = next((entry for entry in entries if any(needle in str(entry.get("text") or "") for needle in needles)), None)
             result = {
                 "result": "pass" if matched is not None else "fail",
@@ -68,20 +82,24 @@ def evaluate_hint(
             }
         else:
             result = {"result": "unknown", "reason": "unsupported_hint"}
-    except Exception as exc:  # noqa: BLE001 - a soft hint must not abort an action
+    except Exception as exc:  # noqa: BLE001 - a soft guard must not abort an action
         result = {"result": "unknown", "reason": f"{type(exc).__name__}: {exc}"}
     cache[key] = result
     return result
 
 
-def provider_hints(provider: dict[str, Any], cursor: dict[str, Any]) -> list[dict[str, Any]]:
-    hints = [dict(item) for item in provider.get("hints", []) if isinstance(item, dict)]
-    materialized = cursor.get("materialized_hints") if isinstance(cursor.get("materialized_hints"), dict) else {}
-    hints.extend(dict(item) for item in materialized.get(str(provider.get("provider_id")), []) if isinstance(item, dict))
-    return hints
+def provider_guards(provider: dict[str, Any]) -> list[dict[str, Any]]:
+    return [dict(item) for item in provider.get("guards", []) if isinstance(item, dict)]
 
 
-def evaluate_provider_hints(
+def _effect_probe_result(detail: dict[str, Any]) -> str:
+    result = str(detail.get("result") or "unknown")
+    if result == "pass" and "strength" in detail and float(detail.get("strength", 0.0) or 0.0) < 0.7:
+        return "fail"
+    return result
+
+
+def evaluate_provider_guards(
     provider: dict[str, Any],
     cursor: dict[str, Any],
     frame_rgb,
@@ -90,16 +108,30 @@ def evaluate_provider_hints(
     *,
     allow_expensive: bool,
 ) -> tuple[list[str], list[dict[str, Any]]]:
-    details = [evaluate_hint(hint, frame_rgb, vision, cache, allow_expensive=allow_expensive) for hint in provider_hints(provider, cursor)]
+    del cursor
+    details = [evaluate_guard(guard, frame_rgb, vision, cache, allow_expensive=allow_expensive) for guard in provider_guards(provider)]
     return [str(item.get("result") or "unknown") for item in details], details
 
 
-def resolve_provider(provider: dict[str, Any], frame_rgb, vision: VisionEngine) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+def resolve_provider(provider: dict[str, Any], frame_rgb, vision: VisionEngine, cursor: dict[str, Any] | None = None) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     failures: list[dict[str, Any]] = []
     for index, locator in enumerate(provider.get("locators", [])):
         if not isinstance(locator, dict):
             continue
         kind = str(locator.get("type") or "")
+        if kind == "click_region":
+            attempted = (cursor or {}).get("locator_attempts", {}).get(str(provider.get("provider_id") or ""), [])
+            if len(attempted) >= 2:
+                failures.append({"locator_index": index, "locator_type": kind, "reason": "visit_point_limit"})
+                continue
+            candidates = [item for item in locator.get("candidate_points", []) if isinstance(item, dict)]
+            candidates = sorted(candidates, key=lambda item: (-int(item.get("successes", 0) or 0), int(item.get("no_effects", 0) or 0)))
+            chosen = next((item for item in candidates if item.get("point") not in attempted), None)
+            if chosen is None:
+                failures.append({"locator_index": index, "locator_type": kind, "reason": "all_points_attempted"})
+                continue
+            point = chosen["point"]
+            return {"type": "click", "x": int(point[0]), "y": int(point[1]), "coordinate_space": "logical", "brief": str(provider.get("brief") or "")}, {"locator_index": index, "locator_type": kind, "candidate_point": list(point)}
         if kind == "point":
             action = {
                 "type": "click",
@@ -157,11 +189,11 @@ def resolve_provider(provider: dict[str, Any], frame_rgb, vision: VisionEngine) 
 def capture_effect_baseline(provider: dict[str, Any], frame_rgb, vision: VisionEngine) -> dict[str, str]:
     cache: dict[str, dict[str, Any]] = {}
     baseline: dict[str, str] = {}
-    for effect in provider.get("effect_hints", []):
+    for effect in provider.get("effects", []):
         if not isinstance(effect, dict) or not isinstance(effect.get("probe"), dict):
             continue
-        detail = evaluate_hint(effect["probe"], frame_rgb, vision, cache, allow_expensive=True)
-        baseline[str(effect.get("id") or "")] = str(detail.get("result") or "unknown")
+        detail = evaluate_guard(effect["probe"], frame_rgb, vision, cache, allow_expensive=True)
+        baseline[str(effect.get("id") or "")] = _effect_probe_result(detail)
     return baseline
 
 
@@ -171,7 +203,7 @@ def evaluate_effect(
     frame_rgb,
     vision: VisionEngine,
 ) -> tuple[str, list[dict[str, Any]]]:
-    effects = [item for item in provider.get("effect_hints", []) if isinstance(item, dict) and isinstance(item.get("probe"), dict)]
+    effects = [item for item in provider.get("effects", []) if isinstance(item, dict) and isinstance(item.get("probe"), dict)]
     if not effects:
         return "unverified", []
     cache: dict[str, dict[str, Any]] = {}
@@ -180,8 +212,8 @@ def evaluate_effect(
     for effect in effects:
         effect_id = str(effect.get("id") or "")
         before = baseline.get(effect_id, "unknown")
-        after_detail = evaluate_hint(effect["probe"], frame_rgb, vision, cache, allow_expensive=True)
-        after = str(after_detail.get("result") or "unknown")
+        after_detail = evaluate_guard(effect["probe"], frame_rgb, vision, cache, allow_expensive=True)
+        after = _effect_probe_result(after_detail)
         expected = str(effect.get("expected") or "pass")
         if before == "unknown" or after == "unknown":
             matched: bool | None = None
@@ -197,65 +229,6 @@ def evaluate_effect(
     if not outcomes:
         return "unverified", details
     return ("confirmed" if all(outcomes) else "contradicted"), details
-
-
-def materialize_deferred_hints(
-    operation: dict[str, Any],
-    predecessor_id: str,
-    frame_rgb,
-    state_dir: Path,
-    vision: VisionEngine,
-    cursor: dict[str, Any],
-) -> list[dict[str, Any]]:
-    materialized = cursor.get("materialized_hints") if isinstance(cursor.get("materialized_hints"), dict) else {}
-    cursor["materialized_hints"] = materialized
-    created: list[dict[str, Any]] = []
-    safe_visit = "".join(ch if ch.isalnum() else "_" for ch in str(cursor.get("visit_id") or "visit"))
-    for provider in operation.get("providers", []):
-        if not isinstance(provider, dict):
-            continue
-        provider_id = str(provider.get("provider_id") or "")
-        target = materialized.setdefault(provider_id, [])
-        known = {str(item.get("id") or "") for item in target if isinstance(item, dict)}
-        for hint in provider.get("deferred_hints", []):
-            if not isinstance(hint, dict) or str(hint.get("materialize_after") or "") != predecessor_id:
-                continue
-            if str(hint.get("id") or "") in known:
-                continue
-            provisional = dict(hint)
-            provisional["status"] = "provisional"
-            provisional["source_provider_id"] = predecessor_id
-            if provisional.get("type") == "template" and not provisional.get("template_path"):
-                bbox = provisional.get("template_bbox")
-                if not isinstance(bbox, list):
-                    continue
-                path = state_dir / f"reactive_provisional_{safe_visit}_{provider_id}_{provisional['id']}.png"
-                vision.save_template_from_rect(frame_rgb, bbox, path)
-                provisional["template_path"] = str(path)
-            target.append(provisional)
-            created.append({"provider_id": provider_id, "hint": provisional})
-    return created
-
-
-def promote_materialized_hints(provider: dict[str, Any], cursor: dict[str, Any]) -> list[str]:
-    materialized = cursor.get("materialized_hints") if isinstance(cursor.get("materialized_hints"), dict) else {}
-    provider_id = str(provider.get("provider_id") or "")
-    pending = materialized.get(provider_id) if isinstance(materialized.get(provider_id), list) else []
-    hints = provider.get("hints") if isinstance(provider.get("hints"), list) else []
-    provider["hints"] = hints
-    known = {str(item.get("id") or "") for item in hints if isinstance(item, dict)}
-    promoted: list[str] = []
-    for raw in pending:
-        if not isinstance(raw, dict) or str(raw.get("id") or "") in known:
-            continue
-        hint = {key: value for key, value in raw.items() if key not in {"materialize_after", "source_provider_id"}}
-        hint["status"] = "confirmed"
-        hints.append(hint)
-        known.add(str(hint.get("id") or ""))
-        promoted.append(str(hint.get("id") or ""))
-    if promoted:
-        materialized.pop(provider_id, None)
-    return promoted
 
 
 def execute_action(

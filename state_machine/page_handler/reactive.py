@@ -7,7 +7,7 @@ from typing import Any
 from state_machine.time_utils import now_iso as _now_iso
 
 
-PROVIDER_STATUSES = {"proposed", "canary", "active", "disabled"}
+PROVIDER_STATUSES = {"proposed", "canary", "active", "disabled", "superseded"}
 PROVIDER_SCOPES = {"instance", "family"}
 REPEAT_POLICIES = {"once_per_visit", "after_confirmed_effect"}
 DEFAULT_BUDGETS = {
@@ -78,6 +78,27 @@ def normalize_locator(raw: Any) -> dict[str, Any] | None:
             "coordinate_space": "logical",
             "source": str(raw.get("source") or "bootstrap"),
         }
+    if kind == "click_region":
+        if str(raw.get("coordinate_space") or "") != "logical":
+            return None
+        rect = _rect(raw.get("rect"))
+        if rect is None:
+            return None
+        point = raw.get("preferred_point")
+        if isinstance(point, (list, tuple)) and len(point) == 2:
+            preferred = [max(rect[0], min(rect[2] - 1, int(point[0]))), max(rect[1], min(rect[3] - 1, int(point[1])))]
+        else:
+            preferred = [(rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2]
+        candidates: list[dict[str, Any]] = []
+        for item in (raw.get("candidate_points") if isinstance(raw.get("candidate_points"), list) else [])[:4]:
+            candidate = item.get("point") if isinstance(item, dict) else item
+            if not isinstance(candidate, (list, tuple)) or len(candidate) != 2:
+                continue
+            candidate = [max(rect[0], min(rect[2] - 1, int(candidate[0]))), max(rect[1], min(rect[3] - 1, int(candidate[1])))]
+            candidates.append({"point": candidate, "successes": _bounded_int(item.get("successes", 0) if isinstance(item, dict) else 0, 0, 0, 100000), "no_effects": _bounded_int(item.get("no_effects", 0) if isinstance(item, dict) else 0, 0, 0, 100000), "source": str(item.get("source") or "learned") if isinstance(item, dict) else "learned"})
+        if not any(item["point"] == preferred for item in candidates):
+            candidates.insert(0, {"point": preferred, "successes": 0, "no_effects": 0, "source": "preferred"})
+        return {"type": kind, "rect": rect, "preferred_point": preferred, "candidate_points": candidates[:4], "coordinate_space": "logical"}
     if kind == "region_template":
         if str(raw.get("coordinate_space") or "") != "logical":
             return None
@@ -106,7 +127,7 @@ def normalize_locator(raw: Any) -> dict[str, Any] | None:
     return None
 
 
-def normalize_hint(raw: Any, *, deferred: bool = False, index: int = 1) -> dict[str, Any] | None:
+def normalize_guard(raw: Any, *, index: int = 1) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
     kind = str(raw.get("type") or raw.get("kind") or "").strip()
@@ -114,10 +135,10 @@ def normalize_hint(raw: Any, *, deferred: bool = False, index: int = 1) -> dict[
         kind = "text"
     if kind in {"template_present", "region_template"}:
         kind = "template"
-    hint: dict[str, Any] = {
-        "id": _slug(raw.get("id"), f"hint_{index}"),
+    guard: dict[str, Any] = {
+        "id": _slug(raw.get("id"), f"guard_{index}"),
         "type": kind,
-        "status": "deferred" if deferred else str(raw.get("status") or "confirmed"),
+        "status": str(raw.get("status") or "active"),
     }
     if str(raw.get("coordinate_space") or "") != "logical":
         return None
@@ -127,21 +148,21 @@ def normalize_hint(raw: Any, *, deferred: bool = False, index: int = 1) -> dict[
         texts = [str(value).strip() for value in texts if str(value or "").strip()]
         if rect is None or not texts:
             return None
-        hint.update({"rect": rect, "texts": texts[:6], "cost": "ocr"})
+        guard.update({"rect": rect, "texts": texts[:6], "cost": "ocr"})
     elif kind == "line_count":
         rect = _rect(raw.get("rect"))
         if rect is None:
             return None
-        minimum = _bounded_int(raw.get("min", raw.get("minimum", 1)), 1, 0, 100)
-        maximum = _bounded_int(raw.get("max", raw.get("maximum", minimum)), minimum, minimum, 100)
-        hint.update({"rect": rect, "min": minimum, "max": maximum, "cost": "detection"})
+        target = _bounded_int(raw.get("target", raw.get("min", 1)), 1, 0, 100)
+        tolerance = _bounded_int(raw.get("tolerance", 1), 1, 0, 10)
+        guard.update({"rect": rect, "target": target, "tolerance": tolerance, "cost": "detection"})
     elif kind == "template":
         rect = _rect(raw.get("rect") or raw.get("search_rect"))
         bbox = _rect(raw.get("template_bbox") or raw.get("bbox"))
         path = str(raw.get("template_path") or "").strip()
         if not path and bbox is None:
             return None
-        hint.update({
+        guard.update({
             "rect": rect,
             "template_bbox": bbox,
             "template_path": path,
@@ -150,19 +171,44 @@ def normalize_hint(raw: Any, *, deferred: bool = False, index: int = 1) -> dict[
         })
     else:
         return None
-    hint["coordinate_space"] = "logical"
-    if deferred:
-        predecessor = str(raw.get("materialize_after") or "").strip()
-        if not predecessor:
-            return None
-        hint["materialize_after"] = _slug(predecessor, predecessor)
-    return hint
+    guard["coordinate_space"] = "logical"
+    guard["group"] = _slug(raw.get("group"), str(guard["id"]))
+    if guard["status"] not in {"provisional", "active"}:
+        guard["status"] = "provisional"
+    if isinstance(raw.get("evidence"), dict):
+        evidence = raw["evidence"]
+        guard["evidence"] = {
+            "positive_visits": [str(value) for value in evidence.get("positive_visits", [])][-8:],
+            "negative_checks": _bounded_int(evidence.get("negative_checks", 0), 0, 0, 1000),
+            "false_positive_count": _bounded_int(evidence.get("false_positive_count", 0), 0, 0, 1000),
+        }
+    if raw.get("learned_from_watch"):
+        guard["learned_from_watch"] = _slug(raw.get("learned_from_watch"), "watch")
+    return guard
+
+
+def normalize_watch(raw: Any, *, index: int = 1) -> dict[str, Any] | None:
+    if not isinstance(raw, dict) or str(raw.get("coordinate_space") or "") != "logical":
+        return None
+    rect = _rect(raw.get("rect"))
+    modalities = raw.get("modalities") if isinstance(raw.get("modalities"), list) else [raw.get("modality")]
+    modalities = [str(value) for value in modalities if str(value) == "appearance"]
+    if rect is None or not modalities:
+        return None
+    after_provider = _slug(raw.get("after_provider"), "") if raw.get("after_provider") else ""
+    return {
+        "id": _slug(raw.get("id"), f"watch_{index}"),
+        "rect": rect,
+        "modalities": modalities,
+        "after_provider": after_provider or None,
+        "coordinate_space": "logical",
+    }
 
 
 def normalize_effect_hint(raw: Any, *, index: int = 1) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
-    probe = normalize_hint(raw.get("probe") if isinstance(raw.get("probe"), dict) else raw, index=index)
+    probe = normalize_guard(raw.get("probe") if isinstance(raw.get("probe"), dict) else raw, index=index)
     if probe is None:
         return None
     expected = str(raw.get("expected") or "pass")
@@ -186,14 +232,15 @@ def normalize_provider(raw: Any, *, index: int = 1, default_priority: int = 0) -
     repeat = str(raw.get("repeat_policy") or "once_per_visit")
     provider: dict[str, Any] = {
         "provider_id": provider_id,
+        "operation_key": _slug(raw.get("operation_key"), provider_id),
         "status": status if status in PROVIDER_STATUSES else "proposed",
         "scope": scope if scope in PROVIDER_SCOPES else "instance",
         "base_priority": _bounded_int(raw.get("base_priority", default_priority), default_priority, -100, 100),
         "repeat_policy": repeat if repeat in REPEAT_POLICIES else "once_per_visit",
         "locators": locators,
-        "hints": [hint for i, item in enumerate(raw.get("hints") if isinstance(raw.get("hints"), list) else [], 1) if (hint := normalize_hint(item, index=i)) is not None],
-        "deferred_hints": [hint for i, item in enumerate(raw.get("deferred_hints") if isinstance(raw.get("deferred_hints"), list) else [], 1) if (hint := normalize_hint(item, deferred=True, index=i)) is not None],
-        "effect_hints": [hint for i, item in enumerate(raw.get("effect_hints") if isinstance(raw.get("effect_hints"), list) else [], 1) if (hint := normalize_effect_hint(item, index=i)) is not None],
+        "guards": [guard for i, item in enumerate(raw.get("guards") if isinstance(raw.get("guards"), list) else [], 1) if (guard := normalize_guard(item, index=i)) is not None],
+        "watches": [watch for i, item in enumerate(raw.get("watches") if isinstance(raw.get("watches"), list) else [], 1) if (watch := normalize_watch(item, index=i)) is not None],
+        "effects": [effect for i, item in enumerate(raw.get("effects") if isinstance(raw.get("effects"), list) else [], 1) if (effect := normalize_effect_hint(item, index=i)) is not None],
         "successors": [_slug(value, "") for value in raw.get("successors", []) if _slug(value, "")][:4] if isinstance(raw.get("successors"), list) else [],
         "emits_on_success": dict(raw.get("emits_on_success") or {}),
         "brief": str(raw.get("brief") or raw.get("label") or ""),
@@ -237,7 +284,9 @@ def normalize_operation(raw: Any, *, index: int = 1) -> dict[str, Any] | None:
         "intent_scope": str(raw.get("intent_scope") or "intent_specific"),
         "intent_effect": str(raw.get("intent_effect") or "none"),
         "expected_event": str(raw.get("expected_event") or "") or None,
+        "entry_providers": [_slug(value, "") for value in raw.get("entry_providers", []) if _slug(value, "")][:4] if isinstance(raw.get("entry_providers"), list) else [],
         "providers": providers,
+        "provider_archive": [deepcopy(item) for item in raw.get("provider_archive", []) if isinstance(item, dict)][-8:] if isinstance(raw.get("provider_archive"), list) else [],
         "budgets": normalize_budgets(raw.get("budgets")),
     }
 
@@ -254,7 +303,6 @@ def initial_cursor(*, visit_id: str, operation: str, now_monotonic: float = 0.0)
         "confirmed_effect_epoch": 0,
         "last_provider_id": None,
         "successor_ids": [],
-        "materialized_hints": {},
         "repair_hashes": [],
         "history": [],
         "updated_at": _now_iso(),
@@ -297,7 +345,7 @@ def reset_run_local_progress(runtime: dict[str, Any]) -> None:
 
 
 def provider_available(provider: dict[str, Any], cursor: dict[str, Any]) -> bool:
-    if str(provider.get("status")) == "disabled":
+    if str(provider.get("status")) in {"disabled", "superseded"}:
         return False
     count = int((cursor.get("attempt_counts") or {}).get(str(provider.get("provider_id")), 0) or 0)
     if count == 0:
@@ -305,42 +353,53 @@ def provider_available(provider: dict[str, Any], cursor: dict[str, Any]) -> bool
     return str(provider.get("repeat_policy")) == "after_confirmed_effect" and int(cursor.get("confirmed_effect_epoch", 0) or 0) >= count
 
 
-def provider_score(provider: dict[str, Any], cursor: dict[str, Any], hint_results: list[str]) -> float:
-    score = float(provider.get("base_priority", 0) or 0)
+def provider_score_components(provider: dict[str, Any], cursor: dict[str, Any], guard_details: list[Any], *, entry_bonus: bool = False) -> dict[str, float]:
+    components = {"base": float(provider.get("base_priority", 0) or 0), "status": 0.0, "history": 0.0, "successor": 0.0, "entry": CHAIN_BONUS if entry_bonus else 0.0, "guards": 0.0}
     status = str(provider.get("status") or "proposed")
-    score += {"active": 12.0, "canary": 4.0, "proposed": 0.0}.get(status, -1000.0)
-    score += min(8.0, float(provider.get("success_count", 0) or 0) * 2.0)
+    components["status"] = {"active": 12.0, "canary": 4.0, "proposed": 0.0}.get(status, -1000.0)
+    components["history"] = min(8.0, float(provider.get("success_count", 0) or 0) * 2.0)
     successor_ids = {str(value) for value in cursor.get("successor_ids", [])}
     if str(provider.get("provider_id")) in successor_ids:
-        score += CHAIN_BONUS
-    for result in hint_results:
-        score += {"pass": 60.0, "unknown": 0.0, "fail": -60.0}.get(result, 0.0)
-    return score
+        components["successor"] = CHAIN_BONUS
+    guards = [item for item in provider.get("guards", []) if isinstance(item, dict)]
+    grouped: dict[str, list[float]] = {}
+    for index, detail in enumerate(guard_details):
+        status = str(guards[index].get("status") or "provisional") if index < len(guards) else "provisional"
+        weight = 60.0 if status == "active" else 12.0
+        result = str(detail.get("result") or "unknown") if isinstance(detail, dict) else str(detail)
+        strength = float(detail.get("strength", 1.0) or 0.0) if isinstance(detail, dict) else 1.0
+        value = {"pass": weight * strength, "unknown": 0.0, "fail": -weight * strength}.get(result, 0.0)
+        group = str(guards[index].get("group") or guards[index].get("id") or index) if index < len(guards) else str(index)
+        grouped.setdefault(group, []).append(value)
+    components["guards"] = max(-60.0, min(60.0, sum(max(values) for values in grouped.values())))
+    return components
 
 
-def rank_providers(operation: dict[str, Any], cursor: dict[str, Any], hint_results: dict[str, list[str]]) -> list[dict[str, Any]]:
+def provider_score(provider: dict[str, Any], cursor: dict[str, Any], guard_details: list[Any]) -> float:
+    return sum(provider_score_components(provider, cursor, guard_details).values())
+
+
+def rank_provider_details(operation: dict[str, Any], cursor: dict[str, Any], guard_details: dict[str, list[Any]]) -> list[dict[str, Any]]:
     candidates = [item for item in operation.get("providers", []) if isinstance(item, dict) and provider_available(item, cursor)]
-    referenced_ids = {
-        str(successor_id)
-        for item in operation.get("providers", [])
-        if isinstance(item, dict)
-        for successor_id in item.get("successors", [])
-    }
-    fresh_visit = int(cursor.get("total_actions", 0) or 0) == 0 and not cursor.get("attempt_counts")
-    return sorted(
-        candidates,
-        key=lambda item: (
-            -(
-                provider_score(item, cursor, hint_results.get(str(item.get("provider_id")), []))
-                + (
-                    CHAIN_BONUS
-                    if fresh_visit and str(item.get("provider_id") or "") not in referenced_ids
-                    else 0.0
-                )
-            ),
-            str(item.get("provider_id") or ""),
-        ),
-    )
+    fresh = int(cursor.get("total_actions", 0) or 0) == 0 and not cursor.get("attempt_counts")
+    entries = {str(value) for value in operation.get("entry_providers", [])}
+    if not entries:
+        referenced = {str(value) for item in candidates for value in item.get("successors", [])}
+        entries = {str(item.get("provider_id")) for item in candidates if item.get("successors") and str(item.get("provider_id")) not in referenced}
+    if fresh and entries:
+        entry_candidates = [item for item in candidates if str(item.get("provider_id") or "") in entries]
+        if entry_candidates:
+            candidates = entry_candidates
+    ranked: list[dict[str, Any]] = []
+    for provider in candidates:
+        provider_id = str(provider.get("provider_id") or "")
+        components = provider_score_components(provider, cursor, guard_details.get(provider_id, []), entry_bonus=fresh and provider_id in entries)
+        ranked.append({"provider": provider, "provider_id": provider_id, "score": sum(components.values()), "components": components})
+    return sorted(ranked, key=lambda item: (-item["score"], item["provider_id"]))
+
+
+def rank_providers(operation: dict[str, Any], cursor: dict[str, Any], guard_details: dict[str, list[Any]]) -> list[dict[str, Any]]:
+    return [item["provider"] for item in rank_provider_details(operation, cursor, guard_details)]
 
 
 def record_attempt(cursor: dict[str, Any], provider: dict[str, Any], *, executed: bool = True) -> None:
@@ -375,7 +434,7 @@ def update_successor_context(
         for detail in (effect_details or [])
     )
     usable_unverified = result == "unverified" and (
-        not provider.get("effect_hints") or (effect_details is not None and not has_evaluable_effect)
+        not provider.get("effects") or (effect_details is not None and not has_evaluable_effect)
     )
     if result in {"confirmed", "transitioned"} or usable_unverified:
         cursor["successor_ids"] = [str(value) for value in provider.get("successors", [])]

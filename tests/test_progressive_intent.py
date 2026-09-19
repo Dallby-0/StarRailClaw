@@ -11,12 +11,13 @@ from state_machine.protocol import parse_state_payload
 def _provider(provider_id: str, x: int = 500, y: int = 500) -> dict:
     return {
         "provider_id": provider_id,
+        "operation_key": provider_id,
         "base_priority": 50,
         "repeat_policy": "once_per_visit",
         "locators": [{"type": "point", "x": x, "y": y, "coordinate_space": "logical", "source": "bootstrap"}],
-        "hints": [],
-        "deferred_hints": [],
-        "effect_hints": [],
+        "guards": [],
+        "watches": [],
+        "effects": [],
         "successors": [],
         "emits_on_success": {"type": "advanced"},
         "brief": "advance",
@@ -31,6 +32,7 @@ def _operation(name: str, *, default: bool = False, scope: str = "intent_specifi
         "intent_effect": "advance",
         "expected_event": "advanced",
         "intent_routes": routes or [],
+        "entry_providers": [f"{name}_provider"],
         "providers": [_provider(f"{name}_provider")],
     }
 
@@ -148,7 +150,7 @@ def test_child_intent_resumes_parent() -> None:
     assert active_intent(runtime)["intent_id"] == parent["intent_id"]
 
 
-def test_state_payload_requires_v2_provider_shape() -> None:
+def test_state_payload_requires_v3_1_provider_shape() -> None:
     payload = {
         "page_summary": "generic surface",
         "slug": "generic_surface",

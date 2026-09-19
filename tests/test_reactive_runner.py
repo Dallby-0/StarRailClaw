@@ -16,10 +16,16 @@ def _point(x: int, y: int) -> dict:
 
 
 def _line_probe() -> dict:
-    return {"id": "ready", "type": "line_count", "rect": [0, 0, 100, 100], "min": 2, "max": 2, "coordinate_space": "logical"}
+    return {"id": "ready", "type": "line_count", "rect": [0, 0, 100, 100], "target": 2, "tolerance": 0, "coordinate_space": "logical"}
 
 
 class FakeVision:
+    mapper = CoordinateMapper(real_w=4, real_h=4)
+
+    def crop_rect(self, frame, rect):
+        del rect
+        return frame
+
     def detect_text_lines(self, frame, rect):
         del rect
         return {"available": True, "line_count": int(frame[0, 0, 0]), "lines": []}
@@ -41,7 +47,7 @@ class FakeEmulator:
         self.taps.append((x, y))
 
 
-def test_two_provider_chain_runs_locally_and_promotes_deferred_hint(tmp_path: Path, monkeypatch) -> None:
+def test_two_provider_chain_runs_locally_and_learns_watch_guards(tmp_path: Path, monkeypatch) -> None:
     handler = handler_from_bootstrap([{
         "operation": "advance",
         "is_default": True,
@@ -53,22 +59,14 @@ def test_two_provider_chain_runs_locally_and_promotes_deferred_hint(tmp_path: Pa
                 "provider_id": "first",
                 "base_priority": 80,
                 "locators": [_point(250, 500)],
-                "effect_hints": [{"id": "first_effect", "probe": _line_probe(), "expected": "becomes_pass"}],
                 "successors": ["second"],
+                "watches": [{"id": "state", "rect": [0, 0, 1000, 1000], "modalities": ["appearance"], "after_provider": "second", "coordinate_space": "logical"}],
             },
             {
                 "provider_id": "second",
                 "base_priority": 40,
                 "locators": [_point(750, 800)],
-                "deferred_hints": [{
-                    "id": "second_visible",
-                    "type": "template",
-                    "template_bbox": [100, 100, 200, 200],
-                    "rect": [50, 50, 250, 250],
-                    "coordinate_space": "logical",
-                    "materialize_after": "first",
-                }],
-                "effect_hints": [{"id": "second_effect", "probe": _line_probe(), "expected": "pass"}],
+                "effects": [{"id": "second_effect", "probe": _line_probe(), "expected": "pass"}],
                 "successors": [],
             },
         ],
@@ -108,10 +106,10 @@ def test_two_provider_chain_runs_locally_and_promotes_deferred_hint(tmp_path: Pa
     assert emulator.taps == [(320, 360), (960, 576)]
     persisted = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
     providers = {item["provider_id"]: item for item in persisted["page_handler"]["operation_policies"]["advance"]["providers"]}
-    assert providers["first"]["result_counts"] == {"confirmed": 1}
+    assert providers["first"]["result_counts"] == {"unverified": 1, "confirmed_by_successor": 1}
     assert providers["second"]["result_counts"] == {"confirmed": 1}
-    assert providers["second"]["hints"][0]["id"] == "second_visible"
-    assert providers["second"]["hints"][0]["status"] == "confirmed"
+    assert providers["first"]["guards"][0]["status"] == "provisional"
+    assert providers["second"]["guards"][0]["status"] == "provisional"
 
 
 def test_confirmed_same_state_reentry_starts_fresh_visit(tmp_path: Path, monkeypatch) -> None:
@@ -125,7 +123,7 @@ def test_confirmed_same_state_reentry_starts_fresh_visit(tmp_path: Path, monkeyp
             "provider_id": "next",
             "base_priority": 80,
             "locators": [_point(250, 500)],
-            "effect_hints": [{"id": "changed", "probe": _line_probe(), "expected": "becomes_pass"}],
+            "effects": [{"id": "changed", "probe": _line_probe(), "expected": "becomes_pass"}],
         }],
     }])
     state_meta = {"state_id": "001", "scene_mode": "ui_2d", "execution": {"kind": "reactive_2d"}, "samples": [], "page_handler": handler}

@@ -17,12 +17,11 @@ from state_machine.logger import FsmRunLogger, summarize_match
 from state_machine.page_handler.actions import (
     capture_effect_baseline,
     evaluate_effect,
-    evaluate_provider_hints,
+    evaluate_provider_guards,
     execute_action,
-    materialize_deferred_hints,
-    promote_materialized_hints,
     resolve_provider,
 )
+from state_machine.page_handler.guard_learning import observe_successful_transition
 from state_machine.page_handler.llm import request_handler_repair
 from state_machine.page_handler.reactive import (
     GLOBAL_HARD_ACTIONS,
@@ -32,6 +31,7 @@ from state_machine.page_handler.reactive import (
     mark_confirmed_effect,
     normalized_patch_hash,
     normalize_budgets,
+    rank_provider_details,
     rank_providers,
     record_attempt,
     update_successor_context,
@@ -81,7 +81,7 @@ def _cursor_summary(cursor: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in cursor.items() if key != "history"}
 
 
-def _provider_hint_results(
+def _provider_guard_results(
     operation: dict[str, Any],
     cursor: dict[str, Any],
     frame,
@@ -94,15 +94,15 @@ def _provider_hint_results(
         if not isinstance(provider, dict):
             continue
         provider_id = str(provider.get("provider_id") or "")
-        values, info = evaluate_provider_hints(provider, cursor, frame, vision, cache, allow_expensive=False)
+        values, info = evaluate_provider_guards(provider, cursor, frame, vision, cache, allow_expensive=False)
         results[provider_id] = values
         details[provider_id] = info
 
-    preliminary = rank_providers(operation, cursor, results)
+    preliminary = rank_providers(operation, cursor, details)
     expensive_limit = normalize_budgets(operation.get("budgets"))["max_expensive_probes"]
     for provider in preliminary[:expensive_limit]:
         provider_id = str(provider.get("provider_id") or "")
-        values, info = evaluate_provider_hints(provider, cursor, frame, vision, cache, allow_expensive=True)
+        values, info = evaluate_provider_guards(provider, cursor, frame, vision, cache, allow_expensive=True)
         results[provider_id] = values
         details[provider_id] = info
     return results, details
@@ -355,8 +355,9 @@ def run_page_handler(
     if prior_frames:
         history.append(_history_item(prior_frames[0], "family_sample", kind="stored_family_sample", provider_id=None))
     history.append(_history_item(current, "entry", kind="entry", provider_id=None))
+    pending_transition: dict[str, Any] | None = None
 
-    _log(logger, f"[fsm][handler] enter state={state_id} visit={visit_id} operation={command.operation}", "page_handler_enter", state_id=state_id, visit_id=visit_id, action_id=action_id, command=command.to_dict(), intent=intent_projection(intent), entry_context=entry_context or {"mode": "normal"}, schema="reactive_handler.v2")
+    _log(logger, f"[fsm][handler] enter state={state_id} visit={visit_id} operation={command.operation}", "page_handler_enter", state_id=state_id, visit_id=visit_id, action_id=action_id, command=command.to_dict(), intent=intent_projection(intent), entry_context=entry_context or {"mode": "normal"}, schema="reactive_handler.v3.1")
 
     while True:
         elapsed = time.monotonic() - float(cursor.get("started_monotonic", 0.0) or 0.0)
@@ -373,12 +374,14 @@ def run_page_handler(
             _log(logger, f"[fsm][handler] hard stop reason={hard_reason}", "page_handler_hard_limit", state_id=state_id, visit_id=visit_id, operation=command.operation, reason=hard_reason, cursor=_cursor_summary(cursor))
             return False, current
 
-        hint_results: dict[str, list[str]] = {}
-        hint_details: dict[str, list[dict[str, Any]]] = {}
+        guard_results: dict[str, list[str]] = {}
+        guard_details: dict[str, list[dict[str, Any]]] = {}
         ranked: list[dict[str, Any]] = []
         if isinstance(operation, dict):
-            hint_results, hint_details = _provider_hint_results(operation, cursor, current, vision)
-            ranked = rank_providers(operation, cursor, hint_results)
+            guard_results, guard_details = _provider_guard_results(operation, cursor, current, vision)
+            ranking = rank_provider_details(operation, cursor, guard_details)
+            ranked = [item["provider"] for item in ranking]
+            _log(logger, "[fsm][handler] provider ranking", "page_handler_provider_ranking", ranking=[{key: value for key, value in item.items() if key != "provider"} for item in ranking])
         needs_repair = not ranked or int(cursor.get("actions_since_repair", 0) or 0) >= budgets["soft_actions"]
         if needs_repair:
             repair_limit = effective_repair_limit(cursor, budgets["max_repairs"])
@@ -437,17 +440,20 @@ def run_page_handler(
         before_match = next((item for item in before_matches if item.state_id == state_id), None)
         before_text_fp = _text_fingerprint(before_match)
         baseline = capture_effect_baseline(provider, current, vision)
-        action, action_info = resolve_provider(provider, current, vision)
+        action, action_info = resolve_provider(provider, current, vision, cursor)
         if action is None:
             record_attempt(cursor, provider, executed=False)
             record_provider_result(operation, provider_id, "resolver_miss", visit_id=visit_id)
-            failure = {"provider_id": provider_id, "result": "resolver_miss", "hint_results": hint_details.get(provider_id, []), "resolver": action_info}
+            failure = {"provider_id": provider_id, "result": "resolver_miss", "guard_results": guard_details.get(provider_id, []), "resolver": action_info}
             failures.append(failure)
             append_episode(handler, {"state_id": state_id, "visit_id": visit_id, "operation": command.operation, **failure})
             _save_json(state_path, state_meta)
             continue
 
         record_attempt(cursor, provider)
+        if action_info.get("locator_type") == "click_region" and isinstance(action_info.get("candidate_point"), list):
+            locator_attempts = cursor.setdefault("locator_attempts", {})
+            locator_attempts.setdefault(provider_id, []).append(action_info["candidate_point"])
         runtime["reactive_total_actions"] = int(runtime.get("reactive_total_actions", 0) or 0) + 1
         executed = execute_action(
             emulator=emulator,
@@ -470,7 +476,6 @@ def run_page_handler(
         post = _wait_for_screen_stable(emulator, logger=logger, label="page-handler-reactive", event="page_handler_stability_check", max_checks=3)
         changed, diff_score = _screen_changed(current, post)
         effect_result, effect_details = evaluate_effect(provider, baseline, post, vision)
-        materialized = materialize_deferred_hints(operation, provider_id, post, state_dir, vision, cursor)
         matches = matches_provider(post)
         current_match = next((item for item in matches if item.state_id == state_id), None)
         still_current = bool(current_match and current_match.success)
@@ -537,17 +542,78 @@ def run_page_handler(
             _clear_text_only_reentry(runtime)
         update_successor_context(cursor, provider, result, effect_details)
         record_provider_result(operation, provider_id, result, visit_id=visit_id)
-        promoted_hints: list[str] = []
+        learned_guards: list[dict[str, Any]] = []
         if result in {"confirmed", "transitioned"}:
             cleared_repairs = int(cursor.get("repair_count", 0) or 0)
             mark_confirmed_effect(cursor)
             if cleared_repairs:
                 runtime["reactive_total_repairs"] = max(0, int(runtime.get("reactive_total_repairs", 0) or 0) - cleared_repairs)
-            promoted_hints = promote_materialized_hints(provider, cursor)
+            try:
+                learned_guards = observe_successful_transition(
+                    operation,
+                    provider,
+                    current,
+                    post,
+                    visit_id=visit_id,
+                    state_dir=state_dir,
+                    vision=vision,
+                )
+            except Exception as exc:  # noqa: BLE001 - learning must not invalidate a successful action
+                learned_guards = [{"error": f"{type(exc).__name__}: {exc}"}]
+                _log(
+                    logger,
+                    f"[fsm][handler] guard learning failed provider={provider_id}: {exc}",
+                    "page_handler_guard_learning_failed",
+                    provider_id=provider_id,
+                    error_type=type(exc).__name__,
+                )
+            if pending_transition is not None and provider_id in pending_transition["successor_ids"]:
+                predecessor = pending_transition["provider"]
+                try:
+                    learned_guards.extend(observe_successful_transition(
+                        operation,
+                        predecessor,
+                        pending_transition["before"],
+                        pending_transition["after"],
+                        visit_id=visit_id,
+                        state_dir=state_dir,
+                        vision=vision,
+                    ))
+                    record_provider_result(operation, str(predecessor.get("provider_id") or ""), "confirmed_by_successor", visit_id=visit_id)
+                    if isinstance(pending_transition.get("candidate"), dict):
+                        pending_transition["candidate"]["successes"] = int(pending_transition["candidate"].get("successes", 0) or 0) + 1
+                except Exception as exc:  # noqa: BLE001
+                    learned_guards.append({"backfill_error": f"{type(exc).__name__}: {exc}"})
+                pending_transition = None
             event = provider.get("emits_on_success") if isinstance(provider.get("emits_on_success"), dict) else None
             if not event and not provider.get("successors") and command.expected_event:
                 event = {"type": command.expected_event}
             reduce_intent_event(runtime, event)
+        elif result == "unverified" and changed and provider.get("watches") and provider.get("successors"):
+            pending_transition = {
+                "provider": provider,
+                "provider_id": provider_id,
+                "successor_ids": [str(value) for value in provider.get("successors", [])],
+                "before": current,
+                "after": post,
+            }
+
+        if action_info.get("locator_type") == "click_region" and isinstance(action_info.get("candidate_point"), list):
+            locator_index = int(action_info.get("locator_index", 0) or 0)
+            locators = provider.get("locators", [])
+            locator = locators[locator_index] if 0 <= locator_index < len(locators) else None
+            candidate = next((item for item in (locator or {}).get("candidate_points", []) if item.get("point") == action_info["candidate_point"]), None)
+            if candidate is not None:
+                if pending_transition is not None and pending_transition.get("provider_id") == provider_id:
+                    pending_transition["candidate"] = candidate
+                if result in {"confirmed", "transitioned"}:
+                    candidate["successes"] = int(candidate.get("successes", 0) or 0) + 1
+                elif not changed:
+                    candidate["no_effects"] = int(candidate.get("no_effects", 0) or 0) + 1
+                    remaining = [item for item in locator.get("candidate_points", []) if item.get("point") not in cursor.get("locator_attempts", {}).get(provider_id, [])]
+                    if remaining and len(cursor.get("locator_attempts", {}).get(provider_id, [])) < 2:
+                        attempts = cursor.get("attempt_counts", {})
+                        attempts[provider_id] = max(0, int(attempts.get(provider_id, 1) or 1) - 1)
         episode = {
             "state_id": state_id,
             "visit_id": visit_id,
@@ -558,8 +624,7 @@ def run_page_handler(
             "changed": changed,
             "diff_score": diff_score,
             "still_current": still_current,
-            "materialized_hints": materialized,
-            "promoted_hints": promoted_hints,
+            "learned_guards": learned_guards,
             "text_fingerprint_before": before_text_fp,
             "text_fingerprint_after": after_text_fp,
             "text_progress": text_progress,
@@ -575,9 +640,9 @@ def run_page_handler(
 
         if known_other is not None:
             _clear_text_only_reentry(runtime)
-            nxt = _resolve_transition_after_progress(state_id=state_id, action_id=action_id, matches=matches, graph=graph, runtime=runtime, prefer_reachable_first=prefer_reachable_first, logger=logger, reason_suffix="-reactive-v2")
+            nxt = _resolve_transition_after_progress(state_id=state_id, action_id=action_id, matches=matches, graph=graph, runtime=runtime, prefer_reachable_first=prefer_reachable_first, logger=logger, reason_suffix="-reactive-v3.1")
             if nxt is None:
-                _append_graph_edge(state_id, action_id, known_other.state_id, logger=logger, reason="reactive-v2-observed", confidence="strong")
+                _append_graph_edge(state_id, action_id, known_other.state_id, logger=logger, reason="reactive-v3.1-observed", confidence="strong")
                 runtime["last_state_id"] = known_other.state_id
                 runtime["last_transition_ok"] = True
             return True, post
@@ -585,7 +650,7 @@ def run_page_handler(
             _clear_text_only_reentry(runtime)
             runtime["pending_from_state_id"] = state_id
             runtime["pending_action_id"] = action_id
-            return _defer_unknown_transition(runtime=runtime, state_id=state_id, action_id=action_id, logger=logger, frame=post, reason="reactive-v2-unmatched-stable-frame")
+            return _defer_unknown_transition(runtime=runtime, state_id=state_id, action_id=action_id, logger=logger, frame=post, reason="reactive-v3.1-unmatched-stable-frame")
         if result == "confirmed" and not provider.get("successors"):
             # A confirmed observable effect with the same matcher is a fresh
             # instance (e.g. repeated cards/dialogs), not a reason to reuse

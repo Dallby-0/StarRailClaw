@@ -152,7 +152,7 @@ def _repair_context(
     manifest: list[dict[str, Any]],
 ) -> dict[str, Any]:
     return {
-        "mode": "REACTIVE_HANDLER_V2_REPAIR",
+        "mode": "REACTIVE_HANDLER_V3_1_REPAIR",
         "instruction": (
             "First decide whether the previous operations are normally advancing a multi-step interaction or are stalled, "
             "and return progress_assessment=progressing|stalled|unknown on every decision. progressing means the chronological "
@@ -165,8 +165,11 @@ def _repair_context(
             "propose a separate family-scoped generalization candidate. Never replace a working instance provider and never "
             "generalize by averaging coordinates. Core providers must remain domain-neutral. All persisted points and rectangles "
             "use 1000x1000 logical coordinates. A point locator must explicitly say coordinate_space=logical. "
-            "Hints are soft ranking evidence. Effect hints are observable hypotheses, not promises. Deferred hints describe "
-            "features that can only be materialized after a predecessor provider. If the current frame is clearly a different "
+            "Every provider needs a stable operation_key. Prefer click_region with a bounded semantic action area and preferred_point. "
+            "Guards are soft ranking evidence and effects are observable hypotheses, not promises. For a multi-step UI chain, "
+            "add a bounded appearance watch to the predecessor over a region whose before state identifies that provider and whose "
+            "after state identifies after_provider (or its unique successor). Runtime extracts and validates templates; do not choose "
+            "template thresholds or learned template boxes. If the current frame is clearly a different "
             "interaction state, return state_misidentified only with high confidence and visible evidence. If uncertain, query "
             "the stored_family_sample cell before deciding. Do not propose state match conditions or a new state payload here. "
             "Do not output safety classifications."
@@ -199,20 +202,22 @@ def _repair_context(
             "visible_evidence": ["visible reason current frame differs from believed state"],
             "provider_object": {
                 "provider_id": "stable domain-neutral id",
+                "operation_key": "stable semantic operation key",
                 "base_priority": 0,
                 "repeat_policy": "once_per_visit|after_confirmed_effect",
                 "locators": [
                     {"type": "point", "x": 0, "y": 0, "coordinate_space": "logical", "source": "bootstrap|verified"},
+                    {"type": "click_region", "rect": [0, 0, 0, 0], "preferred_point": [0, 0], "coordinate_space": "logical"},
                     {"type": "region_template", "template_bbox": [0, 0, 0, 0], "search_rect": [0, 0, 0, 0], "threshold": 0.82, "coordinate_space": "logical"},
                     {"type": "text_target", "rect": [0, 0, 0, 0], "texts": ["visible text"], "coordinate_space": "logical"},
                 ],
-                "hints": [
-                    {"id": "id", "type": "template", "template_bbox": [0, 0, 0, 0], "rect": [0, 0, 0, 0], "coordinate_space": "logical"},
-                    {"id": "id", "type": "text", "rect": [0, 0, 0, 0], "texts": ["text"], "coordinate_space": "logical"},
-                    {"id": "id", "type": "line_count", "rect": [0, 0, 0, 0], "min": 1, "max": 2, "coordinate_space": "logical"},
+                "guards": [
+                    {"id": "id", "group": "equivalent variant group", "type": "template", "template_bbox": [0, 0, 0, 0], "rect": [0, 0, 0, 0], "coordinate_space": "logical"},
+                    {"id": "id", "group": "equivalent variant group", "type": "text", "rect": [0, 0, 0, 0], "texts": ["text"], "coordinate_space": "logical"},
+                    {"id": "id", "group": "equivalent variant group", "type": "line_count", "rect": [0, 0, 0, 0], "target": 3, "tolerance": 1, "coordinate_space": "logical"},
                 ],
-                "deferred_hints": [{"id": "id", "type": "template|text|line_count", "materialize_after": "provider_id", "rect": [0, 0, 0, 0], "template_bbox": [0, 0, 0, 0], "coordinate_space": "logical"}],
-                "effect_hints": [{"id": "id", "probe": {"id": "id", "type": "template|text|line_count"}, "expected": "pass|becomes_pass|becomes_fail"}],
+                "watches": [{"id": "id", "rect": [0, 0, 0, 0], "modalities": ["appearance"], "after_provider": "provider_id", "coordinate_space": "logical"}],
+                "effects": [{"id": "id", "probe": {"id": "id", "type": "template|text|line_count"}, "expected": "pass|becomes_pass|becomes_fail"}],
                 "successors": ["provider_id"],
                 "emits_on_success": {"type": "optional event"},
                 "brief": "short description",

@@ -88,13 +88,13 @@ LLM_FSM_PROMPT_BASE = """你是视觉驱动游戏自动化的状态标注器和�
   - 工具与 reactive 是并列执行器。选择 invoke_tool 时不得再输出 reactive providers。
 - bootstrap_operations: 仅存在于 execution.kind=reactive_2d。每项表示一种稳定操作语义及其 reactive providers，而不是无条件宏。
   - operation 使用简短、稳定、领域无关的语义名；同一 page_family 的连续页内步骤复用同一个完整目标 operation。
-  - 每个 provider 表达一个可独立观察和结算的动作。明显的短链可在一次输出中给出多个 provider，并用 successors 表达短期后继先验。
+  - 每个 provider 表达一个可独立观察和结算的动作，并提供稳定 operation_key。明显的短链可在一次输出中给出多个 provider，并用 successors 表达短期后继先验；operation 用 entry_providers 声明入口。
   - runtime 在每个动作后重新截图和评估，不会把 providers 当作无条件连点序列。
-  - locators 按顺序 fallback。point 必须显式声明 coordinate_space=logical，所有点和矩形均为 1000x1000 逻辑坐标。
-  - hints 是软排序证据，通常满足 > 无法判断/无 hint > 不满足；hint 失败不能直接证明动作无效。
-  - 文本识别成本高，text hint/locator 应限制在较小区域；只需要文字行数时优先使用区域 line_count hint。
-  - effect_hints 只描述动作后的可观测假设；没有稳定可观测效果时保持空数组。
-  - 只有前驱动作后才会出现的特征放入 deferred_hints，并通过 materialize_after 引用前驱 provider_id。
+  - locators 按顺序 fallback。优先用 click_region 表达等效点击区域和 preferred_point；point 必须显式声明 coordinate_space=logical，所有点和矩形均为 1000x1000 逻辑坐标。
+  - guards 是软排序证据，通常满足 > 无法判断/无 guard > 不满足；guard 失败不能直接证明动作无效。
+  - 文本识别成本高，text guard/locator 应限制在较小区域；只需要文字行数时优先使用区域 line_count guard。
+  - effects 只描述动作后的可观测假设；没有稳定可观测效果时保持空数组。
+  - 多步交互使用 watches 指定有限外观区域；runtime 从成功动作的 before/after 差分学习当前 provider 与 after_provider 的 guard。
   - 禁止在 core provider 中写入特定业务对象、固定选项数量或其他只适用于单一场景的规则。
   - intent_scope 只能是 intent_invariant 或 intent_specific。只有纯提示/透明阻塞弹窗才使用 intent_invariant。
   - intent_effect 只能是 preserve、advance、complete 或 none。

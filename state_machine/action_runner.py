@@ -94,7 +94,7 @@ def _execute_state_action(
         _log(logger, f"[fsm][controller] invalid execution kind={execution_kind} scene={scene_mode}", "controller_invalid_execution", state_id=state_id, action_id=action_id, execution=execution, scene_mode=scene_mode)
         raise SystemExit(1)
 
-    controller = {"type": "page_handler", "source": "reactive_handler.v2"}
+    controller = {"type": "page_handler", "source": "reactive_handler.v3.1"}
     _log(logger, f"[fsm][controller] state={state_id} type=page_handler", "controller_start", state_id=state_id, action_id=action_id, controller=controller)
     local_ok, local_frame = run_page_handler(
         emulator=emulator,
